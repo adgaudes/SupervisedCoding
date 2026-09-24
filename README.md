@@ -10,6 +10,41 @@ Estensione Pi per il coding supervisionato. Obiettivi, in ordine di priorità:
 
 Il **supervisore** (il modello attivo in Pi) esplora, pianifica, delega, verifica e accetta. I **worker** (Claude Code CLI, Gemini CLI) implementano. L’estensione sceglie i modelli, controlla i crediti e gestisce i failover.
 
+## Installazione
+
+Pi Agent scopre automaticamente ogni estensione presente come sottocartella di `~/.pi/agent/extensions/` (su Windows `%USERPROFILE%\.pi\agent\extensions\`): non serve registrarla altrove.
+
+Requisiti: [Pi Agent](https://github.com/earendil-works) già installato e Node.js ≥ 22.16 (usato da Pi per eseguire l'estensione).
+
+```bash
+# macOS / Linux
+git clone https://github.com/adgaudes/SupervisedCoding.git ~/.pi/agent/extensions/SupervisedCoding
+
+# Windows (PowerShell)
+git clone https://github.com/adgaudes/SupervisedCoding.git "$env:USERPROFILE\.pi\agent\extensions\SupervisedCoding"
+```
+
+(La repo è privata: `git clone` chiederà l'autenticazione GitHub, oppure usa `gh repo clone adgaudes/SupervisedCoding`.)
+
+Il nome della cartella determina il nome del comando (`/SupervisedCoding`): non rinominarla dopo il primo uso, altrimenti le sessioni già create restano legate al vecchio nome (vedi nota più sotto sulle sessioni pregresse).
+
+Poi, dentro la cartella clonata:
+
+```bash
+cd ~/.pi/agent/extensions/SupervisedCoding
+npm install   # solo per test/typecheck in sviluppo; non richiesto per il funzionamento in Pi
+```
+
+Le dipendenze runtime (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `typebox`) sono fornite dall'host Pi Agent stesso e non vanno installate separatamente.
+
+Infine avvia o riavvia Pi Agent: la nuova estensione viene caricata automaticamente all'avvio. Se Pi è già in esecuzione, un `/reload` (o il riavvio della sessione) la rende disponibile. Verifica con:
+
+```text
+/SupervisedCoding on
+```
+
+che deve rispondere controllando i crediti disponibili e scegliendo il supervisore.
+
 ## Uso
 
 ```text
