@@ -90,6 +90,7 @@ function makeHost(repo: string) {
 		modelRegistry: {
 			find: (provider: string, id: string) => models[`${provider}/${id}`],
 			hasConfiguredAuth: () => true,
+			isUsingOAuth: (model: any) => model.provider === "openai-codex",
 			streamSimple: (model: any, context: any) => ({
 				result: async () => {
 					apiCalls.push({ model: model.id, content: context.messages[0].content });

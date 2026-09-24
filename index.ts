@@ -181,10 +181,12 @@ interface SupervisorMetrics {
 }
 
 type UsageRole = "implement" | "correct" | "review" | "consult" | "probe";
+type Billing = "subscription" | "api" | "unknown";
 
 interface ModelUsage {
 	worker: string;
 	model: string;
+	billing?: Billing;
 	runs: number;
 	input: number;
 	output: number;
@@ -258,6 +260,8 @@ interface RunResult {
 	limit?: LimitReading;
 	/** Raw Claude Code `rate_limit_info` (rateLimitType, errorCode, windows) from the last rate_limit_event. */
 	limitInfo?: Record<string, any>;
+	/** How the run is paid: a subscription (plan usage) or a pay-per-use API key. */
+	billing?: Billing;
 	timedOut: boolean;
 }
 
@@ -893,6 +897,7 @@ async function runClaude(
 	let httpStatus: number | undefined;
 	let limit: LimitReading | undefined;
 	let limitInfo: Record<string, any> | undefined;
+	let billing: Billing = "unknown";
 	const outcome = await runProcess(resolveClaudeCommand(config.workerCommand), [...config.workerCommandArgs, ...claudeArgs(config, candidate, mode, resumeSessionId)], prompt, cwd, signal, timeoutMs, (line) => {
 		if (!line.trim()) return;
 		let event: Record<string, any>;
@@ -903,6 +908,7 @@ async function runClaude(
 		}
 		if (event.type === "system" && event.subtype === "init") {
 			sessionId = typeof event.session_id === "string" ? event.session_id : sessionId;
+			if (typeof event.apiKeySource === "string") billing = event.apiKeySource === "none" ? "subscription" : "api";
 		} else if (event.type === "rate_limit_event") {
 			limit = readClaudeRateLimit(event.rate_limit_info) ?? limit;
 			if (event.rate_limit_info && typeof event.rate_limit_info === "object") limitInfo = event.rate_limit_info;
@@ -944,6 +950,7 @@ async function runClaude(
 		signal: { text: failureText, errorCode, httpStatus, rateLimitRejected: limit?.status === "exhausted" },
 		limit,
 		limitInfo,
+		billing,
 		timedOut: outcome.timedOut,
 	};
 }
@@ -972,6 +979,7 @@ async function runGemini(cwd: string, config: Config, candidate: WorkerCandidate
 		costUsd: 0,
 		usage: measured.usage,
 		signal: { text: `${errorMessage ?? ""}\n${outcome.exitCode !== 0 ? outcome.stderr : ""}`, httpStatus, errorCode: typeof parsed?.error?.status === "string" ? parsed.error.status : undefined },
+		billing: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY ? "api" : "subscription",
 		timedOut: outcome.timedOut,
 	};
 }
@@ -1069,7 +1077,8 @@ async function runApiReview(ctx: ExtensionContext, candidate: WorkerCandidate, r
 		if (signal?.aborted) throw new Error("API review aborted.");
 		const output = message.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n").trim();
 		const errorMessage = message.stopReason === "error" || message.stopReason === "aborted" ? message.errorMessage ?? (timedOut ? `API review timed out after ${Math.round(timeoutMs / 60_000)} minutes.` : "API review failed.") : undefined;
-		return { ...base, exitCode: errorMessage ? 1 : 0, output, errorMessage, costUsd: numberField(message.usage?.cost?.total), usage: message.usage, signal: { text: errorMessage ?? "" }, timedOut, turns: output ? 1 : 0 };
+		const billing: Billing = ctx.modelRegistry.isUsingOAuth(model) ? "subscription" : "api";
+		return { ...base, exitCode: errorMessage ? 1 : 0, output, errorMessage, costUsd: numberField(message.usage?.cost?.total), usage: message.usage, signal: { text: errorMessage ?? "" }, timedOut, turns: output ? 1 : 0, billing };
 	} finally {
 		if (timer) clearTimeout(timer);
 		signal?.removeEventListener("abort", onAbort);
@@ -1272,6 +1281,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const key = `${result.worker}:${result.model || "default"}`;
 		const entry = (metrics.byModel[key] ??= { worker: result.worker, model: result.model || "default", runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 });
 		entry.runs++;
+		if (result.billing) entry.billing = result.billing;
 		entry.input += usage?.input ?? 0;
 		entry.output += usage?.output ?? 0;
 		entry.cacheRead += usage?.cacheRead ?? 0;
@@ -1491,7 +1501,36 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const { cost, estimated } = estimate(item);
 			lines.push(row(label, `${item.runs} run${item.runs === 1 ? "" : "s"}`, item, money(cost, estimated)));
 		}
-		lines.push(`  Total: ${fmt(grand)} tokens · ${money(supervisorCost + workerCost)} (supervisor ${pct(supervisorTotal)}, workers/reviewers ${pct(workerTotal)})`);
+		lines.push(`  Total: ${fmt(grand)} tokens · ${money(supervisorCost + workerCost)} API-equivalent (supervisor ${pct(supervisorTotal)}, workers/reviewers ${pct(workerTotal)})`);
+
+		// What is really paid: pay-per-use API keys cost money per token; subscriptions consume plan limits instead.
+		const supervisorBilling = (key: string): Billing => {
+			const [provider, ...rest] = key.split("/");
+			const model = ctx.modelRegistry.find(provider, rest.join("/"));
+			return model ? (ctx.modelRegistry.isUsingOAuth(model) ? "subscription" : "api") : "unknown";
+		};
+		let paid = 0;
+		const paidModels: string[] = [];
+		const planModels: string[] = [];
+		for (const [key, item] of supervisors) {
+			const billing = supervisorBilling(key);
+			if (billing === "subscription") planModels.push(key);
+			else {
+				paid += item.costUsd;
+				paidModels.push(`${key} ${money(item.costUsd)}`);
+			}
+		}
+		for (const item of workerRows) {
+			const label = item.worker === "claude" ? `Claude ${item.model}` : item.worker === "api" ? `API ${item.model}` : `Gemini CLI ${item.model}`;
+			const { cost, estimated } = estimate(item);
+			if (item.billing === "subscription") planModels.push(label);
+			else {
+				paid += cost;
+				paidModels.push(`${label} ${money(cost, estimated)}${item.billing === "unknown" || !item.billing ? " (billing unknown)" : ""}`);
+			}
+		}
+		lines.push(`Real spend on pay-per-use APIs: ${money(paid)}${paidModels.length ? ` (${paidModels.join(", ")})` : ""}`);
+		if (planModels.length) lines.push(`On subscriptions (no per-token charge, they use plan limits): ${planModels.join(", ")}`);
 
 		const roleNames: Record<string, string> = { implement: "implementation", correct: "self-correction", review: "independent review", consult: "consultation", probe: "credit probes" };
 		const roles = [`supervisor ${pct(supervisorTotal)}`, ...Object.entries(metrics.byRole).sort((a, b) => b[1].tokens - a[1].tokens).map(([role, item]) => `${roleNames[role] ?? role} ${pct(item.tokens)}`)];
@@ -1516,7 +1555,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		lines.push(`Quality: ${metrics.delegations} delegations (${completed} completed, ${metrics.failedDelegations} failed) · ${metrics.autoVerifiedDelegations} auto-verified, ${metrics.firstPassDelegations} green at the first attempt, ${metrics.correctionRounds} correction rounds · reviews: ${verdicts || "none"}`);
 		lines.push(`Routing: failovers workers ${metrics.providerFailovers}, supervisor ${metrics.supervisorFailovers} · flagship asked ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved) · consultations ${metrics.readOnlyConsultations} · resumed sessions ${metrics.resumedDelegations} · checks run ${metrics.verifications}`);
 		if (completed > 0) lines.push(`Average per completed delegation: ${fmt(Math.round(grand / completed))} tokens · ${money((supervisorCost + workerCost) / completed)}`);
-		lines.push("Costs are API-equivalent: on subscriptions (Claude Code, Codex) the real cost is the plan usage shown above; ~ = estimated from Pi's price list.");
+		lines.push("Per-model costs are API-equivalent; for subscriptions the real cost is the plan usage above. ~ = estimated from Pi's price list.");
 		return lines;
 	}
 
@@ -2181,7 +2220,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				// The supervisor reviews the change right here instead of spending extra turns on supervisor_git.
 				const resultDiff = afterAll.available ? await scopedDiff(ctx.cwd, allowedPaths, 12_000) : "";
 				const diffSection = resultDiff && !resultDiff.includes("[Diff truncated") ? `DIFF (allowed paths vs HEAD)\n\`\`\`diff\n${resultDiff}\n\`\`\`` : resultDiff ? "DIFF: too large to include; inspect it with supervisor_git (diff-stat first)." : "";
-				const verificationLine = verifyCommands.length ? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""}\n` : "Automatic verification: none (no allowlisted command in VERIFY); run_verification before accepting.\n";
+				const verificationLine = verifyCommands.length
+					? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""} — already run by the extension on the final code: ${verifyCommands.join(", ")}. Do not re-run these; use run_verification only for other checks.\n`
+					: "Automatic verification: none (no allowlisted command in VERIFY); run_verification before accepting.\n";
 				const text = truncateUtf8([
 					`${candidateLabel(implementer)} (${profileName}) ${failed ? "failed" : "completed"}.\n${safetyLine}${changedLine}${verificationLine}${usageLine}`,
 					outcome.primaryOutput,
