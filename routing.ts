@@ -1,5 +1,5 @@
 /** Deterministic task assessment and conservative, evidence-based model selection. No model calls. */
-import { outcomeQuality, type OutcomeRecord } from "./learning.ts";
+import { DEFAULT_TUNING, outcomeQuality, type OutcomeRecord } from "./learning.ts";
 import type { Effort } from "./learning.ts";
 
 export const TASK_KINDS = ["general", "mechanical", "docs", "tests", "feature", "bugfix", "refactor", "architecture", "security", "concurrency", "migration"] as const;
@@ -37,13 +37,46 @@ export interface RoutingCandidate { worker: string; model: string; effort?: stri
 export interface RoutingDecision<T> { candidates: T[]; reason: string }
 
 /**
- * No random exploration on user work. Reordering uses only accepted, test-verified tasks from this
- * repository and kind, at the configured effort. Distinct tasks, rather than correction attempts, count.
- * High-risk profiles retain their configured quality order. Cost comparisons need both candidates measured.
+ * No random exploration on user work. The configured order is the starting quality judgement; evidence from this
+ * repository and task kind changes it in two ways only. Escalation (any profile): a first candidate with poor
+ * quality at its highest effort yields to the next one that is not struggling. Savings (small/medium only):
+ * a candidate at least 20% cheaper moves ahead after enough accepted, test-verified, first-pass tasks, measured
+ * for both. Distinct tasks, rather than correction attempts, count.
  */
 export function routeWithEvidence<T extends RoutingCandidate>(candidates: T[], outcomes: OutcomeRecord[], repo: string, profile: Profile, kind: TaskKind, minSamples = 20, now = Date.now()): RoutingDecision<T> {
 	const unchanged = { candidates: [...candidates], reason: "configured quality order (insufficient comparable verified evidence)" };
-	if (!["small", "medium"].includes(profile) || candidates.length < 2) return unchanged;
+	if (candidates.length < 2) return unchanged;
+	// Escalation (every profile, because it protects quality): learning first raises a model's effort; a model that
+	// still performs poorly at its highest effort, or that has no effort to raise, yields to the next candidate.
+	const struggling = (candidate: T) => {
+		const tasks = new Map<string, OutcomeRecord[]>();
+		for (const item of outcomes) {
+			if (item.evidenceVersion !== 2 || item.repo !== repo || item.profile !== profile || (item.taskKind ?? "general") !== kind || item.worker !== candidate.worker || item.model !== candidate.model || now - item.at > 90 * 86400_000) continue;
+			if (candidate.effort && item.effort !== "max") continue;
+			const list = tasks.get(item.taskId) ?? [];
+			tasks.delete(item.taskId);
+			tasks.set(item.taskId, [...list, item]);
+		}
+		const scores = [...tasks.values()]
+			.map((items) => items.map(outcomeQuality).filter((value): value is number => value !== undefined))
+			.filter((values) => values.length)
+			.map((values) => Math.min(...values))
+			.slice(-DEFAULT_TUNING.window);
+		if (scores.length < DEFAULT_TUNING.raiseMinSamples) return undefined;
+		const mean = scores.reduce((sum, value) => sum + value, 0) / scores.length;
+		return mean < DEFAULT_TUNING.raiseBelowQuality ? { mean, n: scores.length } : undefined;
+	};
+	const poor = struggling(candidates[0]);
+	if (poor) {
+		const next = candidates.findIndex((candidate, index) => index > 0 && !struggling(candidate));
+		if (next > 0) {
+			return {
+				candidates: [candidates[next], ...candidates.filter((_, index) => index !== next)],
+				reason: `${candidates[0].model} reached quality ${poor.mean.toFixed(2)} over ${poor.n} tasks of this kind at its highest effort; escalated to ${candidates[next].model}`,
+			};
+		}
+	}
+	if (!["small", "medium"].includes(profile)) return unchanged;
 	const stats = (candidate: T) => {
 		const tasks = new Map<string, OutcomeRecord[]>();
 		for (const item of outcomes) {

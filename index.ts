@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -80,15 +80,20 @@ const assessmentSchema = Type.Object({
 type WorkerEffort = "low" | "medium" | "high" | "xhigh" | "max";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ExecutionProfileName = (typeof PROFILE_NAMES)[number];
-/** "api" = a read-only reviewer called directly through a Pi provider (no CLI fixed prompt overhead). */
-type WorkerKind = "claude" | "gemini" | "api";
+/**
+ * claude = Claude Code CLI; gemini = Gemini CLI; pi = any model configured in Pi, run through Pi's own CLI
+ * (GPT, Gemini or any other provider: every model can implement or review); api = a read-only reviewer called
+ * directly through a Pi provider (no CLI fixed prompt overhead).
+ */
+type WorkerKind = "claude" | "gemini" | "pi" | "api";
+type SessionWorker = "claude" | "gemini" | "pi";
 
 interface WorkerCandidate {
 	worker: WorkerKind;
 	/** Claude model id, or Gemini model id ("" = Gemini CLI default routing). */
 	model: string;
 	effort?: WorkerEffort;
-	/** Pi provider, for "api" reviewers only. */
+	/** Pi provider, for "pi" workers and "api" reviewers. */
 	provider?: string;
 	maxTurns?: number;
 	maxBudgetUsd?: number;
@@ -105,6 +110,12 @@ interface Config {
 	workerCommandArgs: string[];
 	geminiCommand: string;
 	geminiCommandArgs: string[];
+	/** Pi's CLI for "pi" workers ("pi" = the Pi installation running this extension). */
+	piCommand: string;
+	piCommandArgs: string[];
+	/** Tools of a "pi" implementer and of a "pi" read-only reviewer (Pi has no per-command shell allowlist). */
+	piWorkerTools: string[];
+	piReadOnlyTools: string[];
 	/** Read-only reviews through a Pi provider API; the Gemini CLI remains the fallback. null disables it. */
 	reviewApi: { provider: string; model: string; reasoning: ThinkingLevel } | null;
 	/** Run the guide's VERIFY commands before and after each delegation and let the worker fix regressions. */
@@ -217,7 +228,7 @@ interface ModelUsage {
 }
 
 interface WorkerSession {
-	worker?: "claude" | "gemini";
+	worker?: SessionWorker;
 	sessionId: string;
 	cwd: string;
 	allowedPaths: string[];
@@ -347,25 +358,35 @@ const EMPTY_METRICS: SupervisorMetrics = {
 	failedDelegations: 0,
 };
 
+/**
+ * Starting quality order per profile (config.json normally overrides it). Claude Code leads where its harness
+ * matters (per-command shell permissions, so the worker can run the tests itself); GPT through Pi follows on a
+ * different subscription, so a Claude limit never stops the work; learning escalates or reorders with evidence.
+ */
 const DEFAULT_WORKER_CHAINS: Record<ExecutionProfileName, WorkerCandidate[]> = {
 	small: [
 		{ worker: "claude", model: "claude-sonnet-5", effort: "medium" },
+		{ worker: "pi", provider: "openai-codex", model: "gpt-6-sol", effort: "medium" },
 		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "low" },
 	],
 	medium: [
 		{ worker: "claude", model: "claude-sonnet-5", effort: "high" },
+		{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "high" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "medium" },
 		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 	],
 	large: [
 		{ worker: "claude", model: "claude-opus-5-5", effort: "high" },
+		{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" },
 		{ worker: "claude", model: "claude-sonnet-5", effort: "xhigh" },
 		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 	],
 	critical: [
 		{ worker: "claude", model: "claude-fable-5-1", effort: "xhigh" },
+		{ worker: "pi", provider: "openai-codex", model: "gpt-6-astra", effort: "xhigh" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "xhigh" },
+		{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" },
 		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 		{ worker: "claude", model: "claude-sonnet-5", effort: "max" },
 	],
@@ -401,8 +422,9 @@ function loadConfig(): Config {
 	const workerChains = Object.fromEntries(PROFILE_NAMES.map((name) => [name, chainsSource[name]?.length ? chainsSource[name] : DEFAULT_WORKER_CHAINS[name]])) as Record<ExecutionProfileName, WorkerCandidate[]>;
 	for (const [name, chain] of Object.entries(workerChains)) {
 		for (const candidate of chain) {
-			if (candidate.worker !== "claude" && candidate.worker !== "gemini") throw new Error(`Invalid worker '${String(candidate.worker)}' in workerChains.${name} (${configPath}).`);
+			if (candidate.worker !== "claude" && candidate.worker !== "gemini" && candidate.worker !== "pi") throw new Error(`Invalid worker '${String(candidate.worker)}' in workerChains.${name} (${configPath}).`);
 			if (candidate.worker === "claude" && !candidate.model) throw new Error(`Claude candidates need a model in workerChains.${name} (${configPath}).`);
+			if (candidate.worker === "pi" && (!candidate.provider || !candidate.model)) throw new Error(`Pi candidates need a provider and a model in workerChains.${name} (${configPath}).`);
 		}
 	}
 	const requestedDefault = raw.defaultExecutionProfile ?? raw.defaultBudgetProfile;
@@ -449,6 +471,11 @@ function loadConfig(): Config {
 		workerCommandArgs: raw.workerCommandArgs ?? [],
 		geminiCommand: raw.geminiCommand ?? "gemini",
 		geminiCommandArgs: raw.geminiCommandArgs ?? [],
+		piCommand: raw.piCommand ?? "pi",
+		piCommandArgs: raw.piCommandArgs ?? [],
+		// No shell by default: Pi cannot restrict it to the verification commands, and the extension runs VERIFY itself.
+		piWorkerTools: raw.piWorkerTools ?? ["read", "edit", "write", "grep", "find", "ls"],
+		piReadOnlyTools: raw.piReadOnlyTools ?? ["read", "grep", "find", "ls"],
 		reviewApi: raw.reviewApi === null ? null : { provider: "google", model: "gemini-3.1-pro-preview", reasoning: "high", ...raw.reviewApi },
 		autoVerify: raw.autoVerify ?? true,
 		maxCorrectionRounds: raw.maxCorrectionRounds ?? 2,
@@ -1093,6 +1120,106 @@ async function runGemini(cwd: string, config: Config, candidate: WorkerCandidate
 	};
 }
 
+/**
+ * Pi's CLI as node + script (a `.cmd` shim cannot be spawned without a shell on Windows). "pi" resolves to the
+ * managed installation that runs this extension, as Pi's own launcher does.
+ */
+function resolvePiInvocation(configured: string): { command: string; prefix: string[] } {
+	if (configured !== "pi") return { command: configured, prefix: [] };
+	try {
+		const installRoot = process.env.PI_MANAGED_INSTALL_ROOT ?? path.join(os.homedir(), ".pi", "agent", "install");
+		const version = fs.readFileSync(path.join(installRoot, "current-version"), "utf8").trim();
+		const packageDir = path.join(installRoot, "releases", version, "node_modules", "@earendil-works", "pi-coding-agent");
+		const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bin?: string | Record<string, string> };
+		const bin = typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.pi;
+		if (bin && fs.existsSync(path.join(packageDir, bin))) return { command: process.execPath, prefix: [path.join(packageDir, bin)] };
+	} catch {
+		// Not a managed installation: fall back to the command on PATH.
+	}
+	return { command: "pi", prefix: [] };
+}
+
+/**
+ * One run of any Pi model through Pi's CLI in JSON mode. The session ID is chosen here, so a correction or a
+ * retry resumes it with --session-id. Pi has no turn limit flag: the extension counts turns and stops the run.
+ * Extensions (this one included), skills and context files are disabled: the prompt carries the repository rules.
+ */
+async function runPi(cwd: string, config: Config, candidate: WorkerCandidate, mode: "edit" | "readonly", prompt: string, resumeSessionId: string | undefined, signal: AbortSignal | undefined, timeoutMs: number, billing: Billing, onProgress?: (text: string) => void): Promise<RunResult> {
+	const invocation = resolvePiInvocation(config.piCommand);
+	const sessionId = resumeSessionId ?? randomUUID();
+	const tools = mode === "edit" ? config.piWorkerTools : config.piReadOnlyTools;
+	const args = [
+		...invocation.prefix, ...config.piCommandArgs,
+		"--mode", "json", "--model", `${candidate.provider}/${candidate.model}`,
+		...(candidate.effort ? ["--thinking", candidate.effort] : []),
+		"--no-extensions", "--no-skills", "--no-context-files", "--no-approve",
+		"--tools", tools.join(","),
+		"--session-dir", path.join(path.dirname(learningPath), "pi-sessions"),
+		"--session-id", sessionId,
+		"Carry out the instructions above.",
+	];
+	const turnLimit = new AbortController();
+	const combined = signal ? AbortSignal.any([signal, turnLimit.signal]) : turnLimit.signal;
+	let output = "";
+	let turns = 0;
+	let costUsd = 0;
+	let stopReason: string | undefined;
+	let errorMessage: string | undefined;
+	let retryError: string | undefined;
+	let model = candidate.model;
+	const usages: Usage[] = [];
+	const outcome = await runProcess(invocation.command, args, prompt, cwd, combined, timeoutMs, (line) => {
+		let event: Record<string, any>;
+		try {
+			event = JSON.parse(line.replace(/\r$/, "")) as Record<string, any>;
+		} catch {
+			return; // Pi reserves stdout for JSONL; anything else is noise.
+		}
+		if (event.type === "turn_start") {
+			turns++;
+			if (candidate.maxTurns && turns > candidate.maxTurns) turnLimit.abort();
+		} else if (event.type === "auto_retry_end" && event.success === false) {
+			retryError = typeof event.finalError === "string" ? event.finalError : retryError;
+		} else if (event.type === "message_end" && event.message?.role === "assistant") {
+			const message = event.message as Record<string, any>;
+			if (message.usage && typeof message.usage === "object") usages.push(message.usage as Usage);
+			costUsd += numberField(message.usage?.cost?.total);
+			if (typeof message.model === "string") model = message.model;
+			stopReason = typeof message.stopReason === "string" ? message.stopReason : stopReason;
+			errorMessage = stopReason === "error" || stopReason === "aborted" ? String(message.errorMessage || stopReason) : undefined;
+			const text = (Array.isArray(message.content) ? message.content : []).filter((part: { type?: string }) => part.type === "text").map((part: { text?: string }) => part.text ?? "").join("\n").trim();
+			if (text) {
+				output = text;
+				onProgress?.(text);
+			}
+		}
+	}, { maxBytes: config.maxProcessOutputBytes });
+	const turnLimitHit = turnLimit.signal.aborted && !signal?.aborted;
+	if (turnLimitHit) errorMessage = `Pi worker stopped at the turn limit (${candidate.maxTurns} turns).`;
+	else if (outcome.aborted) errorMessage = "Pi worker aborted.";
+	if (outcome.timedOut) errorMessage = `Pi timed out after ${Math.round(timeoutMs / 60_000)} minutes.${errorMessage ? ` ${errorMessage}` : ""}`;
+	if (!errorMessage && outcome.exitCode !== 0) errorMessage = retryError ?? (outcome.stderr.trim() || "Pi CLI failed.");
+	const failureText = `${errorMessage ?? ""}\n${outcome.exitCode !== 0 ? outcome.stderr : ""}`;
+	return {
+		worker: "pi",
+		provider: candidate.provider,
+		model,
+		exitCode: errorMessage ? outcome.exitCode || 1 : outcome.exitCode,
+		output,
+		stderr: outcome.stderr,
+		errorMessage,
+		stopReason,
+		turns,
+		sessionId,
+		costUsd,
+		usage: combineUsage(usages),
+		signal: { text: failureText },
+		billing,
+		timedOut: outcome.timedOut,
+		limitHit: turnLimitHit ? "turns" : undefined,
+	};
+}
+
 function runFailed(result: RunResult): boolean {
 	return result.exitCode !== 0 || Boolean(result.errorMessage) || result.timedOut;
 }
@@ -1127,13 +1254,26 @@ function modelDisplayName(ctx: ExtensionContext, provider: string, model: string
 function candidateLabel(candidate: WorkerCandidate): string {
 	if (candidate.worker === "claude") return `Claude ${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}`;
 	if (candidate.worker === "api") return `${candidate.provider} API ${candidate.model}`;
+	if (candidate.worker === "pi") return `Pi ${candidate.provider}/${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}`;
 	return `Gemini ${candidate.model || "default"}`;
 }
 
+/** Model family, derived from the model id (one provider may serve several families, e.g. through Pi). */
+function modelFamily(candidate: WorkerCandidate): string {
+	const id = candidate.model.toLowerCase();
+	if (/claude|opus|sonnet|haiku|fable/.test(id)) return "anthropic";
+	if (/gpt|codex|^od/.test(id)) return "openai";
+	if (/gemini/.test(id)) return "google";
+	return candidate.provider ?? candidate.worker;
+}
+
+type ConsultReviewer = "auto" | "claude" | "gpt" | "gemini";
+const CONSULT_FAMILIES: Record<Exclude<ConsultReviewer, "auto">, string> = { claude: "anthropic", gpt: "openai", gemini: "google" };
+
 function workerHealthKeys(candidate: WorkerCandidate): string[] {
 	if (candidate.worker === "claude") return ["claude-cli", `claude-cli:${claudeFamily(candidate.model)}`, `claude-cli:model:${candidate.model}`];
-	// API reviewers share the Pi provider account (and its credits) with the supervisor.
-	if (candidate.worker === "api") return [`pi:${candidate.provider}`, `pi:model:${candidate.provider}/${candidate.model}`];
+	// Pi workers and API reviewers share the Pi provider account (and its credits) with the supervisor.
+	if (candidate.worker === "api" || candidate.worker === "pi") return [`pi:${candidate.provider}`, `pi:model:${candidate.provider}/${candidate.model}`];
 	return ["gemini-cli", `gemini-cli:model:${candidate.model || "default"}`];
 }
 
@@ -1250,7 +1390,7 @@ interface ImplementationSpec {
 	/** Supervisor override of the profile's Claude effort for this delegation. */
 	effort?: WorkerEffort;
 	resumeSessionId?: string;
-	resumeWorker?: "claude" | "gemini";
+	resumeWorker?: SessionWorker;
 	resumeModel?: string;
 	assessment?: TaskAssessment;
 	candidates?: WorkerCandidate[];
@@ -1364,6 +1504,16 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	}
 
 	const cooldownMs = () => config.exhaustedCooldownMinutes * 60_000;
+	/** A "pi" worker or reviewer: only models Pi knows and can authenticate; billing as Pi reports it for that model. */
+	async function runPiWorker(ctx: ExtensionContext, candidate: WorkerCandidate, mode: "edit" | "readonly", prompt: string, resumeSessionId: string | undefined, signal: AbortSignal | undefined, timeoutMs: number, onProgress?: (text: string) => void): Promise<RunResult> {
+		const model = ctx.modelRegistry.find(candidate.provider ?? "", candidate.model);
+		if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+			const errorMessage = `model not available in Pi: ${candidate.provider}/${candidate.model}`;
+			return { worker: "pi", provider: candidate.provider, model: candidate.model, exitCode: 1, output: "", stderr: "", errorMessage, turns: 0, costUsd: 0, signal: { text: errorMessage, httpStatus: 404 }, timedOut: false };
+		}
+		return runPi(ctx.cwd, config, candidate, mode, prompt, resumeSessionId, signal, timeoutMs, ctx.modelRegistry.isUsingOAuth(model) ? "subscription" : "api", onProgress);
+	}
+
 	/** Minutes → milliseconds; 0 stays 0 ("no timeout" for runProcess). */
 	const minutes = (value: number) => (value > 0 ? value * 60_000 : 0);
 
@@ -1501,7 +1651,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	function recordWorkerHealth(candidate: WorkerCandidate, result: RunResult, kind: FailureKind | undefined): void {
 		const now = Date.now();
 		const source = `${candidateLabel(candidate)} run`;
-		const providerKey = candidate.worker === "claude" ? "claude-cli" : candidate.worker === "api" ? `pi:${candidate.provider}` : "gemini-cli";
+		const providerKey = candidate.worker === "claude" ? "claude-cli" : candidate.worker === "api" || candidate.worker === "pi" ? `pi:${candidate.provider}` : "gemini-cli";
 		const accountKey = candidate.worker === "claude" ? claudeLimitKey(result.limitInfo, candidate.model) : providerKey;
 		if (result.limit) applyReading(health, accountKey, result.limit, source, cooldownMs(), now);
 		if (!kind) {
@@ -1578,7 +1728,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const instructions = '[CORRECTION ROUND ' + round + '] Checks now failing:\n' + failures + '\nFix the cause only inside the allowlist. Never weaken, skip or delete tests. Preserve correct work. If the requirements are ambiguous, stop and explain.';
 		const chain = [implementer, ...config.workerChains[spec.profileName].filter(item => item.worker !== implementer.worker || item.model !== implementer.model)];
 		const diff = spec.checkpoint ? (await changesSince(ctx.cwd, spec.allowedPaths, spec.checkpoint, config.maxDiffBytes)).diff : await scopedDiff(ctx.cwd, spec.allowedPaths, config.maxDiffBytes);
-		return executeImplementation(ctx, { ...spec, candidates: chain, guide: spec.guide + '\n\n' + instructions, resumeSessionId: sessionId, resumeWorker: implementer.worker as 'claude' | 'gemini', resumeModel: implementer.model, role: 'correct', resumePrompt: instructions, handoff: '[CURRENT WORK]\n' + diff + '\n\n' + instructions }, signal);
+		return executeImplementation(ctx, { ...spec, candidates: chain, guide: spec.guide + '\n\n' + instructions, resumeSessionId: sessionId, resumeWorker: implementer.worker as SessionWorker, resumeModel: implementer.model, role: 'correct', resumePrompt: instructions, handoff: '[CURRENT WORK]\n' + diff + '\n\n' + instructions }, signal);
 	}
 
 	/** What learning knows about this repository, for the supervisor at planning time. */
@@ -1589,7 +1739,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const hint = profileHint(profileStats(learning, repo), profile);
 		if (hint) lines.push(`Learning: ${hint}`);
 		const adjusted = config.workerChains[profile]
-			.filter((item) => item.worker === "claude" && item.effort)
+			.filter((item) => item.worker !== "gemini" && item.effort)
 			.map((item) => ({ item, effort: config.learning.autoTuneEffort ? effectiveEffort(learning, profile, item.model, item.effort as Effort, repo, taskPacket?.assessment?.kind) : item.effort }))
 			.filter(({ item, effort }) => effort !== item.effort)
 			.map(({ item, effort }) => `${item.model} ${item.effort}→${effort}`);
@@ -1731,10 +1881,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return lines;
 	}
 
-	/** Every Claude candidate with a configured effort is a calibration target. */
+	/** Every candidate with a configured effort (Claude --effort, Pi --thinking) is a calibration target. */
 	function tuningTargets(repo?: string, kind?: string): Array<{ profile: string; model: string; configured: Effort; repo?: string; kind?: string }> {
 		return PROFILE_NAMES.flatMap((profile) => config.workerChains[profile]
-			.filter((item) => item.worker === "claude" && item.effort)
+			.filter((item) => item.worker !== "gemini" && item.effort)
 			.map((item) => ({ profile, model: item.model, configured: item.effort as Effort, repo, kind })));
 	}
 
@@ -1803,9 +1953,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			// Effort: the supervisor's explicit override, else what learning calibrated for this profile/model, else config.json.
 			const baseEffort = taskEffort(spec.profileName, spec.assessment, configured.effort);
 			const learnedEffort = config.learning.enabled && config.learning.autoTuneEffort && !spec.candidates ? effectiveEffort(learning, spec.profileName, configured.model, baseEffort, repo, spec.assessment?.kind) : baseEffort;
-			const candidate: WorkerCandidate = { ...configured, maxTurns: config.workerMaxTurns[spec.profileName], ...(configured.worker === "claude" ? { effort: resolveEffort(spec.effort, learnedEffort, spec.profileName) } : {}) };
+			const candidate: WorkerCandidate = { ...configured, maxTurns: config.workerMaxTurns[spec.profileName], ...(configured.worker !== "gemini" ? { effort: resolveEffort(spec.effort, learnedEffort, spec.profileName) } : {}) };
 			const label = candidateLabel(candidate);
-			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.worker === "claude" ? "anthropic" : "google", candidate.model)))) {
+			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.provider ?? (candidate.worker === "claude" ? "anthropic" : "google"), candidate.model)))) {
 				attempts.push({ label, ok: false, detail: "declined: flagship not authorized" });
 				continue;
 			}
@@ -1823,11 +1973,15 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				stoppedBy = budgetExceeded();
 				if (stoppedBy) break;
 				if (activeBudget && config.delegationBudgetUsd > 0) candidate.maxBudgetUsd = Math.max(0.001, config.delegationBudgetUsd - activeBudget.spent);
+				const fullPrompt = `${handoff ? `${handoff}\n\n` : ""}${basePrompt}`;
+				// Gemini in auto_edit mode and Pi without bash cannot run commands: they must not claim checks passed.
+				const workerNotes = `\n\n[WORKER NOTES]\nEdit only the allowlisted paths and preserve pre-existing changes. Never stage, commit, push, merge, change branches, or rewrite Git history. If shell tools are unavailable, do not claim checks passed: the extension runs the VERIFY commands after you finish; list any other verification the supervisor should run.`;
 				if (candidate.worker === "claude") {
-					result = await runClaude(ctx.cwd, config, candidate, "edit", `${handoff ? `${handoff}\n\n` : ""}${basePrompt}`, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
+					result = await runClaude(ctx.cwd, config, candidate, "edit", fullPrompt, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
+				} else if (candidate.worker === "pi") {
+					result = await runPiWorker(ctx, candidate, "edit", `${fullPrompt}${workerNotes}`, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
 				} else {
-					const geminiPrompt = `${handoff ? `${handoff}\n\n` : ""}${basePrompt}\n\n[GEMINI WORKER NOTES]\nEdit only the allowlisted paths and preserve pre-existing changes. Never stage, commit, push, merge, change branches, or rewrite Git history. If shell tools are unavailable in this mode, do not claim checks passed: list the exact verification commands the supervisor must run.`;
-					result = await runGemini(ctx.cwd, config, candidate, geminiPrompt, "auto_edit", signal, minutes(config.workerTimeoutMinutes), resumeId);
+					result = await runGemini(ctx.cwd, config, candidate, `${fullPrompt}${workerNotes}`, "auto_edit", signal, minutes(config.workerTimeoutMinutes), resumeId);
 				}
 				recordRun(result, spec.role ?? "implement");
 				usage.push(result.usage);
@@ -1926,7 +2080,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					? await runClaude(ctx.cwd, config, candidate, "readonly", prompt, undefined, signal, minutes(config.consultTimeoutMinutes))
 					: candidate.worker === "api"
 						? await runApiReview(ctx, candidate, config.reviewApi?.reasoning ?? "high", prompt, material ?? "", signal, minutes(config.consultTimeoutMinutes), config.reviewMaxTokens)
-						: await runGemini(ctx.cwd, config, candidate, prompt, "plan", signal, minutes(config.consultTimeoutMinutes));
+						: candidate.worker === "pi"
+							? await runPiWorker(ctx, candidate, "readonly", prompt, undefined, signal, minutes(config.consultTimeoutMinutes))
+							: await runGemini(ctx.cwd, config, candidate, prompt, "plan", signal, minutes(config.consultTimeoutMinutes));
 				recordRun(result, options.role ?? "consult");
 				usage.push(result.usage);
 				if (signal?.aborted) throw new Error("Review aborted.");
@@ -1951,39 +2107,41 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return { failed: failed || violations.length > 0, text, reviewer, attempts, usage, violations, gitAvailable: before.available && after.available, verdict: failed ? "none" : parseVerdict(text) };
 	}
 
-	/** Non-flagship reviewers of one family, strongest profile chains first, one entry per model. Flagships are for implementation only. */
-	function reviewers(worker: WorkerKind, profiles: ExecutionProfileName[]): WorkerCandidate[] {
+	/**
+	 * Every non-flagship model of the given profiles' chains (strongest profile first), one entry per worker and
+	 * model, whatever its family: any model can review. The API reviewer comes first (no CLI overhead; it is used
+	 * only when the review material is complete). Flagships are for implementation only.
+	 */
+	function reviewPool(profiles: ExecutionProfileName[]): WorkerCandidate[] {
 		const seen = new Set<string>();
-		const result: WorkerCandidate[] = [];
+		const result: WorkerCandidate[] = config.reviewApi ? [{ worker: "api", provider: config.reviewApi.provider, model: config.reviewApi.model }] : [];
 		for (const profile of profiles) {
 			for (const item of config.workerChains[profile]) {
-				if (item.worker !== worker || isFlagship(item.model) || seen.has(item.model)) continue;
-				seen.add(item.model);
+				const key = `${item.worker}:${item.provider ?? ""}:${item.model}`;
+				if (isFlagship(item.model) || seen.has(key)) continue;
+				seen.add(key);
 				result.push(item);
 			}
 		}
-		if (worker === "claude") return result;
-		const cli: WorkerCandidate[] = result.length ? result : [{ worker: "gemini", model: "gemini-3.1-pro-preview" }];
-		// Same model family through the API first (no CLI fixed overhead); the CLI stays as fallback and for large inputs.
-		return config.reviewApi ? [{ worker: "api", provider: config.reviewApi.provider, model: config.reviewApi.model }, ...cli] : cli;
+		return result;
 	}
 
 	/**
-	 * Independent review. large: Claude read-only, a different model first (cheap, no Gemini fixed overhead).
-	 * critical: a different model family first, because cross-family review catches different mistakes.
+	 * Independent review: models of another family first (they catch different mistakes), then other models of the
+	 * implementer's family, and the implementer's own model only as a last resort. Within each group the configured
+	 * order holds. Families are derived from the model, never assigned to a role.
 	 */
 	function reviewOrder(implementer: WorkerCandidate, profile: ExecutionProfileName): WorkerCandidate[] {
-		const claude = reviewers("claude", [profile, "large", "critical"]);
-		const gemini = reviewers("gemini", [profile, "large", "critical"]);
-		const order = implementer.worker === "gemini" || profile !== "critical" ? [...claude, ...gemini] : [...gemini, ...claude];
-		// The implementer's own model reviews only as a last resort, after every other model of either family.
-		return [...order.filter((item) => item.model !== implementer.model), ...order.filter((item) => item.model === implementer.model)];
+		const family = modelFamily(implementer);
+		const rank = (item: WorkerCandidate) => (item.model === implementer.model ? 2 : modelFamily(item) === family ? 1 : 0);
+		return [...reviewPool([profile, "large", "critical"])].sort((a, b) => rank(a) - rank(b));
 	}
 
-	function consultOrder(reviewer: "auto" | WorkerKind, profileName: ExecutionProfileName): WorkerCandidate[] {
-		const claude = reviewers("claude", [profileName, "large"]);
-		const gemini = reviewers("gemini", [profileName, "large"]);
-		return reviewer === "gemini" ? [...gemini, ...claude] : [...claude, ...gemini];
+	function consultOrder(reviewer: ConsultReviewer, profileName: ExecutionProfileName): WorkerCandidate[] {
+		const pool = reviewPool([profileName, "large"]);
+		if (reviewer === "auto") return pool;
+		const wanted = CONSULT_FAMILIES[reviewer];
+		return [...pool].sort((a, b) => Number(modelFamily(b) === wanted) - Number(modelFamily(a) === wanted));
 	}
 
 	// ── Supervisor (Pi model) selection ────────────────────────────────────────────────────────────
@@ -2344,12 +2502,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "consult_readonly",
 		label: "Read-only consultation",
-		description: "Independent read-only coding analysis. Claude read-only (no Edit/Write/Bash) is cheaper; Gemini gives a different model family but has a large fixed prompt overhead. Unavailable/out-of-credit reviewers are skipped automatically. Use for architecture, risk, test strategy, hard debugging, or implementation review — not routine summaries.",
+		description: "Independent read-only coding analysis by a Claude, GPT or Gemini model without edit or shell tools. Ask for a family different from the one that wrote the code when independence matters. Unavailable/out-of-credit reviewers are skipped automatically. Use for architecture, risk, test strategy, hard debugging, or implementation review — not routine summaries.",
 		parameters: Type.Object({
 			purpose: StringEnum(["architecture", "risk-review", "test-strategy", "debugging", "implementation-review"] as const),
 			question: Type.String({ description: "Narrow, decision-oriented question. Include known evidence; do not ask for a generic repository summary." }),
 			paths: Type.Array(Type.String({ description: "Repository-relative paths to inspect" }), { minItems: 1 }),
-			reviewer: Type.Optional(StringEnum(["auto", "claude", "gemini"] as const, { description: "Preferred reviewer family; the other family is used if it is out of credits. Default auto (Claude first)." })),
+			reviewer: Type.Optional(StringEnum(["auto", "claude", "gpt", "gemini"] as const, { description: "Preferred reviewer family; the others follow if it is unavailable or out of credits. Default auto: the configured order." })),
 			profile: Type.Optional(StringEnum(PROFILE_NAMES, { description: "Model/effort chain for Claude reviewers; stronger for higher risk." })),
 		}),
 		async execute(_id, params, signal, _update, ctx) {

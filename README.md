@@ -8,7 +8,9 @@ Estensione Pi per il coding supervisionato. Obiettivi, in ordine di priorità:
 4. il minor consumo di token possibile, ma **mai** a scapito della qualità;
 5. la velocità è sempre secondaria.
 
-Il **supervisore** (il modello attivo in Pi) esplora, pianifica, delega, verifica e accetta. I **worker** (Claude Code CLI, Gemini CLI) implementano. L’estensione sceglie i modelli, controlla i crediti e gestisce i failover.
+Il **supervisore** (il modello attivo in Pi) esplora, pianifica, delega, verifica e accetta. I **worker** implementano, i **revisori** controllano. L’estensione sceglie i modelli, controlla i crediti e gestisce i failover.
+
+**Nessun modello ha un ruolo fisso.** Claude, GPT e Gemini possono supervisionare, implementare e rivedere; chi fa cosa dipende dal task (vedi [Come si scelgono modello ed effort](#come-si-scelgono-modello-ed-effort)). I worker girano con tre strumenti: Claude Code CLI (modelli Claude), Gemini CLI e la CLI di Pi stessa, che esegue **qualsiasi modello configurato in Pi** (per esempio i GPT dell’abbonamento OpenAI Codex).
 
 ## Installazione
 
@@ -104,14 +106,34 @@ L’estensione non riaddestra i modelli, ma impara dai **propri risultati**. I d
 
 `/SupervisedCoding learning` mostra statistiche, efforts calibrati e lezioni. Con `learning forget <id>` si toglie una lezione, con `learning reset` si azzera tutto.
 
-## Profili: modello ed effort per ogni situazione
+## Come si scelgono modello ed effort
 
-| Profilo | Quando | Supervisore (effort) | Worker (in ordine) | Review indipendente |
+La decisione è divisa: **il supervisore** (un modello) classifica il task, **l’estensione** sceglie modelli ed effort con regole deterministiche.
+
+1. **Classificazione.** Il supervisore sceglie profilo e assessment (tipo, rischio, incertezza, portata); le regole dell’assessment possono solo alzare il profilo. Il supervisore del primo turno si sceglie prima di conoscere il task: è il primo modello disponibile di `supervisorChain`, oggi **GPT-5.5**. GPT-6 Astra lo precede solo con autorizzazione nei task critical; se GPT-5.5 esaurisce i crediti si passa al successivo della catena.
+2. **Idoneità e ordine iniziale.** Per ogni profilo `workerChains` elenca i modelli idonei, di qualsiasi famiglia, in ordine di qualità, ognuno con il suo effort. È un giudizio iniziale, non una misura: vale finché mancano evidenze nel repository.
+3. **Filtri a ogni scelta.** Crediti: i modelli esauriti vengono saltati, quelli oltre il 97% della quota vanno in fondo. Autorizzazione per i modelli di punta. Il revisore è sempre un modello diverso dall’implementatore, prima di un’altra famiglia. Dentro un task supervisore e implementatore restano gli stessi, salvo guasti del provider.
+4. **Effort.** Parte da `config.json`. Un task small meccanico o di documentazione, a basso rischio, scende a `low`. Il supervisore può alzarlo per una delega. L’apprendimento lo alza quando la qualità cala e lo abbassa, prudentemente, dopo lunghe serie pulite (vedi [Apprendimento](#apprendimento)).
+5. **Modello più forte (escalation).** Se il primo modello va male anche al suo effort più alto, o non ha un effort da alzare, su almeno 4 task dello stesso tipo nel repository, passa davanti il primo candidato che non è in difficoltà. Vale per tutti i profili.
+6. **Risparmio.** Solo per small/medium, un modello passa davanti se costa almeno il 20% in meno con qualità misurata equivalente (vedi [Apprendimento](#apprendimento)).
+
+Il risultato di ogni delega riporta il motivo dell’ordine usato (`Routing: …`).
+
+## Profili: ordine iniziale
+
+| Profilo | Quando | Effort supervisore | Worker (ordine iniziale) | Review indipendente |
 |---|---|---|---|---|
-| small | modifica locale o meccanica | medium | Sonnet 5 medium → Gemini → Opus 5.5 low | no |
-| medium | lavoro normale, multi-file | medium | Sonnet 5 high → Opus 5.5 medium → Gemini | no |
-| large | architettura, debugging difficile | high | Opus 5.5 high → Sonnet 5 xhigh → Gemini | Claude read-only, modello diverso |
-| critical | sicurezza, concorrenza, migrazioni, complessità eccezionale | xhigh | **Fable 5.1 xhigh** (con autorizzazione) → Opus 5.5 xhigh → Gemini → Sonnet 5 max | famiglia diversa: Gemini via API (poi CLI), poi Claude |
+| small | modifica locale o meccanica | medium | Sonnet 5 medium → GPT-6 Sol medium → Gemini 3.1 Pro → Opus 5.5 low | no |
+| medium | lavoro normale, multi-file | medium | Sonnet 5 high → GPT-5.5 high → Opus 5.5 medium → Gemini 3.1 Pro | no |
+| large | architettura, debugging difficile | high | Opus 5.5 high → GPT-5.5 xhigh → Sonnet 5 xhigh → Gemini 3.1 Pro | sì |
+| critical | sicurezza, concorrenza, migrazioni, complessità eccezionale | xhigh | **Fable 5.1 xhigh** → **GPT-6 Astra xhigh** (entrambi con autorizzazione) → Opus 5.5 xhigh → GPT-5.5 xhigh → Gemini 3.1 Pro → Sonnet 5 max | sì |
+
+Perché quest’ordine:
+- **Claude davanti** dove conta lo strumento: Claude Code permette di autorizzare solo i comandi di verifica, quindi il worker esegue i test da solo prima di consegnare.
+- **Il secondo è quasi sempre un GPT**, su un abbonamento diverso: se finisce la finestra Claude, che è condivisa da Sonnet e Opus, il lavoro continua senza fermarsi.
+- **GPT-6 Sol nei task small:** costa meno di GPT-5.5 ($2/$10 contro $5/$30 per milione di token, secondo il catalogo di Pi). Non ci sono misure sulla sua qualità: è l’apprendimento a confermarlo o a scavalcarlo.
+
+**Revisori:** tutti i modelli non di punta delle catene del profilo e dei profili superiori. Prima quelli di un’altra famiglia rispetto all’implementatore, poi gli altri della stessa famiglia, e il modello dell’implementatore solo per ultimo. Il revisore API (`reviewApi`) viene provato per primo nella sua famiglia, perché costa meno, ma solo con materiale completo.
 
 - L’effort del supervisore segue il profilo del task su cui sta lavorando. Un task non finito (pianificato o fallito) lo conserva nel prompt successivo. Un task già implementato ma non accettato, o messo in pausa, no: il nuovo prompt riparte da `default` (`medium`) finché il supervisore non delega o riprende un task. `complete_task` lo riporta a `default`.
 - `supervisorProfiles` (vuoto di default) può indicare supervisori preferiti per un profilo. Attenzione: ogni cambio di modello del supervisore rilegge l’intera conversazione senza cache del prompt; conviene usarlo solo dopo averne misurato il vantaggio. `complete_task` non cambia mai modello prima della risposta finale.
@@ -143,6 +165,7 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 | Claude Code | `rate_limit_event` a ogni chiamata (finestre 5h/7 giorni, reset, modelli fuori piano) + sonda Haiku all’attivazione |
 | Supervisore Pi (Codex, Anthropic, Google) | header di limite nelle risposte + sonda minima all’attivazione, solo sul supervisore che verrebbe scelto (mai di punta) |
 | Gemini CLI | solo dagli errori (nessuna API di saldo) |
+| Worker e revisori via Pi (es. GPT) | dagli errori; condividono lo stato dell’account con il supervisore dello stesso provider |
 
 - Le sonde partono solo se l’ultima lettura ha più di `probeTtlMinutes` (15) minuti; `credits refresh` le forza. Ogni sonda è limitata a `probeMaxTokens` e compare nei consumi di `status`.
 - I provider esauriti vengono saltati fino al reset (o per `exhaustedCooldownMinutes` se il reset non è noto); quelli oltre `creditHeadroom` (97%) passano in fondo alla coda. La soglia è alta di proposito: un task medio usa l’1–3% della finestra Claude e, se il limite arriva a metà lavoro, il failover passa il diff al worker successivo. Scansarsi troppo presto significa usare modelli più deboli e pagare token a consumo.
@@ -153,7 +176,7 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 
 ## Budget per delega
 
-- Ogni worker Claude, e ogni revisore Claude, riceve un limite di turni per profilo (`workerMaxTurns`: small 40, medium 80, large 120, critical 160; `--max-turns`). Sono valori prudenziali, da ritarare su misure reali.
+- Ogni worker e ogni revisore riceve un limite di turni per profilo (`workerMaxTurns`: small 40, medium 80, large 120, critical 160): `--max-turns` per Claude Code; per i modelli via Pi, che non ha un flag equivalente, l’estensione conta i turni e ferma il processo. Sono valori prudenziali, da ritarare su misure reali.
 - L’intera delega (baseline, implementazione, correzioni, review) ha una scadenza complessiva (`delegationTimeoutMinutes`, default 120) e, se impostato, un tetto di costo cumulativo (`delegationBudgetUsd`, 0 = disattivato), passato a Claude come `--max-budget-usd` residuo. Scadenza e tetto vengono controllati **tra una fase e l’altra**: un worker in esecuzione non viene mai interrotto per questo, ma dopo il limite non partono nuovi tentativi, correzioni o review. Una review saltata viene fatta da `complete_task`.
 - Raggiunto un limite, la delega si ferma **senza** passare a un altro modello: il lavoro fatto resta nel working tree e **la sessione del worker resta riprendibile**. Il supervisore vede lo stato e fa finire il lavoro alla stessa sessione con `continuePrevious=true`, senza rifare l’esplorazione. Un limite dell’estensione non è un credito esaurito del provider.
 - L’output dei processi è limitato in memoria (`maxProcessOutputBytes`), la review API a `reviewMaxTokens`.
@@ -166,7 +189,7 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 | `plan_task` | registra task, profilo e assessment per task large/critical o con più deleghe; imposta l’effort del supervisore, per i task critical propone il supervisore di punta |
 | `delegate_implementation` | implementazione tramite la catena del profilo, con failover e review automatica; accetta profilo e assessment anche senza `plan_task` |
 | `complete_task` | `accept` chiude il task e lo registra come accettato, dopo la review dell’intero task quando serve; `pause` lo lascia aperto per un seguito. Entrambi rilasciano il supervisore di punta e riportano l’effort a `default` |
-| `consult_readonly` | parere read-only mirato (Claude di default, Gemini se richiesto o in fallback) |
+| `consult_readonly` | parere read-only mirato di qualsiasi modello; `reviewer` sceglie la famiglia preferita (`claude`, `gpt`, `gemini`), le altre seguono se non disponibile |
 | `run_verification` | esegue un comando di test, typecheck, lint o build da `verificationCommands` non già eseguito da `VERIFY`; operatori shell rifiutati; se fallisce, il task aperto risulta fallito finché una nuova delega non lo sistema (salvo che quel controllo fosse rosso già all’inizio del task; un task accettato non viene riaperto) |
 | `record_lesson` | registra una lezione del repository per i worker futuri |
 | `supervisor_git` | ispezione Git read-only |
@@ -177,6 +200,7 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 - `allowedPaths` solo relativi, niente `..`, niente `.` nelle deleghe normali.
 - `allowedPaths` è un vincolo del prompt verificato **dopo** l’esecuzione, non un recinto del filesystem: dopo ogni delega vengono controllati branch, HEAD, index e file modificati fuori allowlist. File ignorati da Git e scritture fuori dal repository non rientrano in questo controllo.
 - Claude editor con `--safe-mode --restricted`, allowlist di strumenti e comandi Git mutanti vietati. Claude read-only solo con `Read`, `Glob`, `Grep`.
+- Worker via Pi con `--no-extensions --no-skills --no-context-files --no-approve`: SupervisedCoding non si carica nel worker, le regole arrivano dal prompt. Di default **senza terminale** (`piWorkerTools`: read, edit, write, grep, find, ls), perché Pi non può limitare la shell ai soli comandi di verifica: i test li esegue l’estensione. In sola lettura: read, grep, find, ls. Le sessioni dei worker Pi stanno in `data/pi-sessions`.
 - Timeout su worker, consulti e verifiche. Allo scadere viene terminato l’intero albero di processi (`taskkill /T` su Windows).
 - `run_verification` accetta un solo comando semplice, con `CI=1` (i test runner non restano in watch mode), e segnala i file che il comando modifica.
 
@@ -196,7 +220,8 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 | `reviewMaxTokens`, `maxProcessOutputBytes` | limiti di output di review API e processi |
 | `flagshipModels` | modelli di punta (solo critical, sempre con autorizzazione) |
 | `supervisorEffort` | effort del supervisore per profilo (`default` = nessun task aperto) |
-| `workerChains` | per profilo, `{worker, model, effort}` in ordine di preferenza (`model: ""` = default di Gemini CLI) |
+| `workerChains` | per profilo, i modelli idonei in ordine iniziale di qualità: `{worker: "claude", model, effort}`, `{worker: "gemini", model}` (`model: ""` = default di Gemini CLI) o `{worker: "pi", provider, model, effort}` per qualsiasi modello di Pi |
+| `piCommand`, `piCommandArgs`, `piWorkerTools`, `piReadOnlyTools` | CLI di Pi per i worker (`pi` = l’installazione che esegue l’estensione) e strumenti concessi |
 | `independentReviewProfiles` | profili con review automatica |
 | `minImplementationGuideChars` | lunghezza minima della guida per profilo |
 | `verificationCommands`, `verificationTimeoutMinutes` | comandi ammessi in `run_verification` |
@@ -211,10 +236,10 @@ Le sessioni create con il nome precedente (`codex-claude-supervisor`) mantengono
 
 ## File
 
-- `index.ts`: integrazione Pi (tool, comando, eventi, worker, verifica, review, selezione supervisore, modelli di punta);
+- `index.ts`: integrazione Pi (tool, comando, eventi, worker Claude/Gemini/Pi, verifica, review, selezione supervisore, modelli di punta);
 - `lib.ts`: classificazione errori, lettura limiti, stato provider, ranking;
 - `learning.ts`: esiti, calibrazione effort, lezioni, verdetti, estrazione comandi `VERIFY`;
-- `routing.ts`: assessment del task e ordine dei worker basato su evidenze;
+- `routing.ts`: assessment del task, escalation e ordine dei worker basato su evidenze;
 - `changes.ts`: checkpoint dei file autorizzati e diff della singola delega;
 - `AUDIT.md`, `AUDIT-2.md`: i due audit del 24 settembre 2026 da cui derivano le correzioni A1–A12 e B1–B13;
 - `tests/`: test unitari, d’integrazione e di regressione dell’audit (CLI Claude/Gemini simulate, host Pi simulato, repository Git reali);

@@ -49,6 +49,12 @@
         "effort": "medium"
       },
       {
+        "worker": "pi",
+        "provider": "openai-codex",
+        "model": "gpt-6-sol",
+        "effort": "medium"
+      },
+      {
         "worker": "gemini",
         "model": "gemini-3.1-pro-preview"
       },
@@ -62,6 +68,12 @@
       {
         "worker": "claude",
         "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      {
+        "worker": "pi",
+        "provider": "openai-codex",
+        "model": "gpt-5.5",
         "effort": "high"
       },
       {
@@ -81,6 +93,12 @@
         "effort": "high"
       },
       {
+        "worker": "pi",
+        "provider": "openai-codex",
+        "model": "gpt-5.5",
+        "effort": "xhigh"
+      },
+      {
         "worker": "claude",
         "model": "claude-sonnet-5",
         "effort": "xhigh"
@@ -97,8 +115,20 @@
         "effort": "xhigh"
       },
       {
+        "worker": "pi",
+        "provider": "openai-codex",
+        "model": "gpt-6-astra",
+        "effort": "xhigh"
+      },
+      {
         "worker": "claude",
         "model": "claude-opus-5-5",
+        "effort": "xhigh"
+      },
+      {
+        "worker": "pi",
+        "provider": "openai-codex",
+        "model": "gpt-5.5",
         "effort": "xhigh"
       },
       {
@@ -185,6 +215,22 @@
   "workerCommandArgs": [],
   "geminiCommand": "gemini",
   "geminiCommandArgs": [],
+  "piCommand": "pi",
+  "piCommandArgs": [],
+  "piWorkerTools": [
+    "read",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls"
+  ],
+  "piReadOnlyTools": [
+    "read",
+    "grep",
+    "find",
+    "ls"
+  ],
   "workerPermissionMode": "dontAsk",
   "workerTools": [
     "Read",

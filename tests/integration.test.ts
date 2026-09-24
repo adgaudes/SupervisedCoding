@@ -38,6 +38,8 @@ function configure(overrides: Record<string, unknown>, plan: Record<string, Step
 		workerCommandArgs: [path.join(here, "fakes", "fake-claude.mjs")],
 		geminiCommand: process.execPath,
 		geminiCommandArgs: [path.join(here, "fakes", "fake-gemini.mjs")],
+		piCommand: process.execPath,
+		piCommandArgs: [path.join(here, "fakes", "fake-pi.mjs")],
 		supervisorChain: [],
 		probeOnActivate: false,
 		flagshipModels: [],

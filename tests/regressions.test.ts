@@ -39,6 +39,8 @@ function configure(overrides: Record<string, unknown>, plan: Record<string, Step
 		workerCommandArgs: [path.join(here, "fakes", "fake-claude.mjs")],
 		geminiCommand: process.execPath,
 		geminiCommandArgs: [path.join(here, "fakes", "fake-gemini.mjs")],
+		piCommand: process.execPath,
+		piCommandArgs: [path.join(here, "fakes", "fake-pi.mjs")],
 		supervisorChain: [],
 		probeOnActivate: false,
 		flagshipModels: [],
@@ -82,6 +84,7 @@ function makeHost(repo: string) {
 	const models: Record<string, any> = {
 		"google/gemini-3.1-pro-preview": { provider: "google", id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro" },
 		"openai-codex/gpt-5.5": { provider: "openai-codex", id: "gpt-5.5", name: "GPT-5.5" },
+		"openai-codex/gpt-6-astra": { provider: "openai-codex", id: "gpt-6-astra", name: "GPT-6 Astra" },
 		"google/gemini-3.8-flash": { provider: "google", id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
 	};
 	const ctx: any = {
@@ -194,12 +197,12 @@ test("AUDIT: explicit acceptance closes a critical task and resets effort", asyn
 });
 
 test("AUDIT: activation never probes an unapproved flagship", async () => {
-  configure({supervisorChain:[{provider:"openai-codex",model:"gpt-5.5"}],flagshipModels:["gpt-5.5"],probeOnActivate:true}, {});
+  configure({supervisorChain:[{provider:"openai-codex",model:"gpt-6-astra"}],flagshipModels:["gpt-6-astra"],probeOnActivate:true}, {});
   const host=makeHost(makeRepo({"a.txt":"old"})); let probes=0;
   host.ctx.modelRegistry.complete=async()=>{probes++; return {stopReason:"stop",usage:{totalTokens:999}};};
   await host.on();
   assert.equal(probes,0); assert.equal(host.questions.length,0);
-  assert.equal(Object.keys(host.ctx.auditState.metrics.byModel).some(k=>k.includes("gpt-5.5")),false);
+  assert.equal(Object.keys(host.ctx.auditState.metrics.byModel).some(k=>k.includes("gpt-6-astra")),false);
 });
 
 test("AUDIT: account exhaustion skips subsequent models on the same account", async () => {
@@ -222,10 +225,10 @@ test("AUDIT: transient retries resume the partially completed session", async ()
 });
 
 test("AUDIT: credit exhaustion in correction fails over and verifies the repair", async () => {
-  configure({}, {"claude-sonnet-5":[{write:{"value.txt":"bad"}},{action:"credits"}],"claude-opus-5-5":[{write:{"value.txt":"ok"}}]});
+  configure({}, {"claude-sonnet-5":[{write:{"value.txt":"bad"}},{action:"credits"}],"gpt-5.5":[{write:{"value.txt":"ok"}}]});
   const host=makeHost(makeRepo({"value.txt":"ok","check.test.mjs":PASSING_CHECK})); await host.on();
   const result=await host.call("delegate_implementation",{task:"change",profile:"medium",allowedPaths:["value.txt"],implementationGuide:guide(["value.txt"],["node --test check.test.mjs"])});
-  assert.equal(result.isError,false); assert.deepEqual(calls().map(c=>c.model),["claude-sonnet-5","claude-sonnet-5","claude-opus-5-5"]);
+  assert.equal(result.isError,false); assert.deepEqual(calls().map(c=>c.model),["claude-sonnet-5","claude-sonnet-5","gpt-5.5"]);
   const learned=JSON.parse(fs.readFileSync(dataFile,"utf8")); assert.equal(learned.outcomes.at(-1).failed,false); assert.equal(learned.outcomes.at(-1).verification,"fixed");
 });
 
@@ -239,7 +242,7 @@ test("AUDIT: API review receives deeply nested changed files", async () => {
 });
 
 test("AUDIT: unrelated prompts cannot inherit a flagship grant", async () => {
-  configure({supervisorChain:[{provider:"openai-codex",model:"gpt-5.5"},{provider:"google",model:"gemini-3.8-flash"}],flagshipModels:["gpt-5.5"]}, {"claude-fable-5-1":[{write:{"a.txt":"done"}}]});
+  configure({supervisorChain:[{provider:"openai-codex",model:"gpt-6-astra"},{provider:"google",model:"gemini-3.8-flash"}],flagshipModels:["gpt-6-astra"]}, {"claude-fable-5-1":[{write:{"a.txt":"done"}}]});
   const host=makeHost(makeRepo({"a.txt":"old"})); host.setAnswer("SI"); await host.on();
   await host.handlers.get("before_agent_start")({prompt:"critical task"},host.ctx);
   await host.call("plan_task",{task:"critical task",profile:"critical",rationale:"test"});
@@ -438,14 +441,14 @@ test("AUDIT-2 B4: past the time limit, no correction round or review starts, and
 	assert.match(result.content[0].text, /No further correction round/);
 });
 
-test("AUDIT-2 B5: a reviewer that fails without a provider error hands over to the next reviewer, with the profile's turn limit", async () => {
-	configure({ workerCommandArgs: [scriptedClaude("review-maxturns", MAXTURNS)], independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "claude-sonnet-5": [{ action: "maxturns" }], "gemini-3.1-pro-preview": [{ text: "No defect.\nVERDICT: PASS" }] });
+test("AUDIT-2 B5: a reviewer stopped at the profile's turn limit hands over to the next reviewer", async () => {
+	// Opus implements; the first independent reviewer is GPT-5.5 through Pi, which keeps working until the extension stops it.
+	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1", "gpt-6-astra"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "gpt-5.5": [{ action: "turns" }], "gemini-3.1-pro-preview": [{ text: "No defect.\nVERDICT: PASS" }] });
 	const host = makeHost(makeRepo({ "a.txt": "old" }));
 	await host.on();
 	const result = await host.call("delegate_implementation", { task: "change", profile: "large", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
 	assert.equal(result.details.reviewVerdict, "pass");
-	assert.equal(calls().find((call) => call.model === "claude-sonnet-5")?.maxTurns, String(baseConfig.workerMaxTurns.large));
-	assert.ok(calls().some((call) => call.cli === "gemini"));
+	assert.deepEqual(calls().map((call) => call.model), ["claude-opus-5-5", "gpt-5.5", "gemini-3.1-pro-preview"]);
 });
 
 test("AUDIT-2 B6: the default configuration does not switch supervisor models around a small task", async () => {
@@ -474,16 +477,16 @@ test("AUDIT-2 B6: complete_task never switches the supervisor before the final a
 });
 
 test("AUDIT-2 B6: an unfinished critical task keeps its approved supervisor into the next prompt", async () => {
-	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }, { provider: "google", model: "gemini-3.8-flash" }], flagshipModels: ["gpt-5.5"] }, {});
+	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-6-astra" }, { provider: "google", model: "gemini-3.8-flash" }], flagshipModels: ["gpt-6-astra"] }, {});
 	const host = makeHost(makeRepo({ "a.txt": "old" }));
 	host.setAnswer("SI");
 	await host.on();
 	await host.handlers.get("before_agent_start")({ prompt: "Plan the critical change" }, host.ctx);
 	await host.call("plan_task", { task: "critical change", profile: "critical", rationale: "test" });
-	assert.equal(host.ctx.model.id, "gpt-5.5");
+	assert.equal(host.ctx.model.id, "gpt-6-astra");
 	const before = host.notifications.length;
 	await host.handlers.get("before_agent_start")({ prompt: "Yes, go ahead" }, host.ctx);
-	assert.equal(host.ctx.model.id, "gpt-5.5");
+	assert.equal(host.ctx.model.id, "gpt-6-astra");
 	assert.deepEqual(host.notifications.slice(before).filter((text) => text.startsWith("Supervisor model:")), []);
 	assert.equal(host.questions.length, 1, "approved once for the whole task");
 });
@@ -509,10 +512,11 @@ test("AUDIT-2 B7: accepting a multi-delegation task reviews the whole task, and 
 });
 
 test("AUDIT-2 B8: after a correction failover the outcome is credited to the model that did the work", async () => {
-	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { action: "credits" }], "claude-opus-5-5": [{ write: { "value.txt": "ok" } }] });
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { action: "credits" }], "gpt-5.5": [{ write: { "value.txt": "ok" } }] });
 	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
 	await host.on();
 	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(calls().at(-1)?.model, "gpt-5.5", "GPT through Pi rescued the correction");
 	const outcomes = JSON.parse(fs.readFileSync(dataFile, "utf8")).outcomes;
 	assert.deepEqual(outcomes.map((item: { model: string; verification: string }) => [item.model, item.verification]), [["claude-sonnet-5", "fixed"]]);
 });
@@ -525,13 +529,22 @@ test("AUDIT-2 B9: poor quality across task kinds raises effort for a new kind", 
 	assert.equal(effectiveEffort(state, "medium", "m", "high", "r", "refactor"), "xhigh");
 });
 
-test("AUDIT-2 B10: the implementer's own model reviews only after the other family", async () => {
-	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "claude-sonnet-5": [{ action: "credits" }], "gemini-3.1-pro-preview": [{ text: "Fine.\nVERDICT: PASS" }] });
+test("AUDIT-2 B10: reviewers of other families come first, whatever the implementer's family", async () => {
+	// A Claude implementer: GPT and Gemini review before any Claude model, and Opus itself never before Sonnet.
+	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1", "gpt-6-astra"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "gpt-5.5": [{ action: "credits" }], "gemini-3.1-pro-preview": [{ text: "Fine.\nVERDICT: PASS" }] });
 	const host = makeHost(makeRepo({ "a.txt": "old" }));
 	await host.on();
 	const result = await host.call("delegate_implementation", { task: "change", profile: "large", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
 	assert.equal(result.details.reviewVerdict, "pass");
-	assert.deepEqual(calls().map((call) => call.model), ["claude-opus-5-5", "claude-sonnet-5", "gemini-3.1-pro-preview"]);
+	assert.deepEqual(calls().map((call) => call.model), ["claude-opus-5-5", "gpt-5.5", "gemini-3.1-pro-preview"]);
+	// A GPT implementer: Claude and Gemini review first.
+	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1", "gpt-6-astra"], workerChains: { ...baseConfig.workerChains, large: [{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" }, ...baseConfig.workerChains.large] } }, { "gpt-5.5": [{ write: { "b.txt": "done" } }], "claude-opus-5-5": [{ text: "Fine.\nVERDICT: PASS" }] });
+	fs.writeFileSync(logFile, "");
+	const gptHost = makeHost(makeRepo({ "b.txt": "old" }));
+	await gptHost.on();
+	const gptResult = await gptHost.call("delegate_implementation", { task: "change", profile: "large", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]) });
+	assert.equal(gptResult.details.reviewVerdict, "pass");
+	assert.deepEqual(calls().map((call) => call.model), ["gpt-5.5", "claude-opus-5-5"]);
 });
 
 test("AUDIT-2 B11: run_verification never reopens an accepted task, nor fails a task for a check red since its start", async () => {
@@ -569,3 +582,78 @@ test("AUDIT-2 B13: instruction files along the authorized paths reach the worker
 	assert.match(calls()[0].prompt, /REPOSITORY RULES[\s\S]*Root rule[\s\S]*Package rule: keep exports sorted/);
 });
 
+
+// ── Interchangeable models: any Pi model (GPT included) implements and reviews ─────────────────────────
+
+import { routeWithEvidence } from "../routing.ts";
+
+const gptFirst = (profile: string, effort = "high") => ({ ...baseConfig.workerChains, [profile]: [{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort }, ...baseConfig.workerChains[profile]] });
+
+test("a GPT model implements through Pi: no shell, no extensions, effort as thinking, usage accounted", async () => {
+	configure({ workerChains: gptFirst("medium") }, { "gpt-5.5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(fs.readFileSync(path.join(host.ctx.cwd, "a.txt"), "utf8"), "done");
+	const [call] = calls() as Array<{ cli: string; provider: string; model: string; effort: string; tools: string; extensions: boolean; prompt: string }>;
+	assert.deepEqual([call.cli, call.provider, call.model, call.effort], ["pi", "openai-codex", "gpt-5.5", "high"]);
+	assert.equal(call.extensions, false, "the worker must not load SupervisedCoding itself");
+	assert.doesNotMatch(call.tools, /bash/);
+	assert.match(call.prompt, /\[WORKER NOTES\][\s\S]*do not claim checks passed/);
+	const entry = (Object.values(host.ctx.auditState.metrics.byModel) as Array<{ worker: string; model: string; input: number; billing?: string }>).find((item) => item.worker === "pi");
+	assert.deepEqual([entry?.model, entry?.input, entry?.billing], ["gpt-5.5", 200, "subscription"]);
+});
+
+test("a Pi worker's correction resumes its own session", async () => {
+	configure({ workerChains: gptFirst("medium") }, { "gpt-5.5": [{ write: { "value.txt": "bad" } }, { write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(result.details.verification, "fixed");
+	const [first, correction] = calls();
+	assert.equal(correction.resume, first.resume, "same --session-id");
+	assert.match(correction.prompt, /^\[CORRECTION ROUND 1\]/);
+});
+
+test("a Pi worker is stopped by the extension at the profile's turn limit, session kept", async () => {
+	configure({ workerChains: gptFirst("small", "medium") }, { "gpt-5.5": [{ action: "turns", write: { "a.txt": "partial" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.match(result.details.limitReached, /turn limit/);
+	assert.equal(result.details.sessionPreserved, true);
+	assert.equal(calls().length, 1, "no failover for an execution limit");
+});
+
+test("credits exhausted on one subscription fail over to another family through Pi", async () => {
+	configure({}, { "claude-sonnet-5": [{ action: "credits" }], "gpt-5.5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.isError, false);
+	assert.deepEqual(calls().map((call) => call.model), ["claude-sonnet-5", "gpt-5.5"]);
+	assert.match(calls()[1].prompt, /\[HANDOFF\]/);
+});
+
+test("consult_readonly can ask a GPT reviewer, read-only", async () => {
+	configure({}, { "gpt-5.5": [{ text: "The parser is fine." }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("consult_readonly", { purpose: "risk-review", question: "Is a.txt safe?", paths: ["a.txt"], reviewer: "gpt" });
+	assert.equal(result.isError, false, result.content[0].text);
+	const [call] = calls() as Array<{ cli: string; model: string; tools: string }>;
+	assert.deepEqual([call.cli, call.model, call.tools], ["pi", "gpt-5.5", "read,grep,find,ls"]);
+});
+
+test("escalation: a model with poor quality at its highest effort yields to the next candidate, in any profile", () => {
+	const candidates = [{ worker: "claude", model: "opus", effort: "high" }, { worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" }, { worker: "gemini", model: "gemini" }];
+	const poor = (model: string, effort: string | undefined, i: number) => ({ evidenceVersion: 2 as const, taskKind: "bugfix", at: Date.now(), repo: "r", taskId: `${model}-${i}`, profile: "large", worker: model === "opus" ? "claude" : "gemini", model, effort, verification: "failed" as const, correctionRounds: 0, review: "none" as const, failed: true, tokens: 0, costUsd: 0 });
+	const atHigh = [0, 1, 2, 3].map((i) => poor("opus", "high", i));
+	assert.equal(routeWithEvidence(candidates, atHigh, "r", "large", "bugfix").candidates[0].model, "opus", "effort is raised first; the model stays");
+	const atMax = [0, 1, 2, 3].map((i) => poor("opus", "max", i));
+	const escalated = routeWithEvidence(candidates, atMax, "r", "large", "bugfix");
+	assert.deepEqual(escalated.candidates.map((item) => item.model), ["gpt-5.5", "opus", "gemini"]);
+	assert.match(escalated.reason, /escalated to gpt-5\.5/);
+	assert.equal(routeWithEvidence(candidates, atMax, "r", "large", "feature").candidates[0].model, "opus", "evidence is per task kind");
+});
