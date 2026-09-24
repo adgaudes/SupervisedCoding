@@ -15,7 +15,7 @@ Il **supervisore** (il modello attivo in Pi) esplora, pianifica, delega, verific
 ```text
 /SupervisedCoding on       attiva, controlla i crediti, sceglie il supervisore
 /SupervisedCoding off      disattiva
-/SupervisedCoding status   stato, task, metriche, token/costi, crediti
+/SupervisedCoding status   consumi per modello e per ruolo, spesa reale (API a consumo) separata dagli abbonamenti, crediti usati nella conversazione, qualità
 /SupervisedCoding credits [refresh|reset]
 /SupervisedCoding model [auto|manual]
 /SupervisedCoding learning [forget <id>|reset]   cosa ha imparato l’estensione in questo repository
