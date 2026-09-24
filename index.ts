@@ -29,16 +29,36 @@ import {
 	type LimitReading,
 	type RankedCandidate,
 } from "./lib.ts";
+import {
+	addLesson,
+	effectiveEffort,
+	extractVerifyCommands,
+	lessonsFor,
+	loadLearning,
+	parseVerdict,
+	profileHint,
+	profileStats,
+	recordOutcome,
+	removeLesson,
+	saveLearning,
+	tuneEfforts,
+	type Effort,
+	type LearningState,
+	type ReviewVerdict,
+	type VerificationResult,
+} from "./learning.ts";
 
 const execFile = promisify(execFileCallback);
 const extensionDir = path.dirname(fileURLToPath(import.meta.url));
-const configPath = path.join(extensionDir, "config.json");
+/** Overridable so integration tests can run the real extension against fake CLIs and a scratch data directory. */
+const configPath = process.env.SUPERVISED_CODING_CONFIG ?? path.join(extensionDir, "config.json");
+const learningPath = process.env.SUPERVISED_CODING_DATA ?? path.join(extensionDir, "data", "learning.json");
 const EXTENSION_NAME = "SupervisedCoding";
 const STATE_TYPE = "supervised-coding";
 const POLICY_TYPE = "supervised-coding-policy";
 /** Entry types written by the extension before it was renamed; still read so existing sessions keep their state. */
 const LEGACY_STATE_TYPES = ["codex-claude-supervisor"];
-const CUSTOM_TOOLS = new Set(["plan_task", "consult_readonly", "delegate_implementation", "run_verification", "supervisor_git", "request_git_commit", "request_git_push"]);
+const CUSTOM_TOOLS = new Set(["plan_task", "consult_readonly", "delegate_implementation", "run_verification", "record_lesson", "supervisor_git", "request_git_commit", "request_git_push"]);
 const PROFILE_NAMES = ["small", "medium", "large", "critical"] as const;
 const WORKER_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const MAX_STORED_REPORT_CHARS = 8000;
@@ -50,13 +70,16 @@ const UNSAFE_COMMAND_CHARS = /[;&|`$<>\r\n%^()]/;
 type WorkerEffort = "low" | "medium" | "high" | "xhigh" | "max";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ExecutionProfileName = (typeof PROFILE_NAMES)[number];
-type WorkerKind = "claude" | "gemini";
+/** "api" = a read-only reviewer called directly through a Pi provider (no CLI fixed prompt overhead). */
+type WorkerKind = "claude" | "gemini" | "api";
 
 interface WorkerCandidate {
 	worker: WorkerKind;
 	/** Claude model id, or Gemini model id ("" = Gemini CLI default routing). */
 	model: string;
 	effort?: WorkerEffort;
+	/** Pi provider, for "api" reviewers only. */
+	provider?: string;
 }
 
 interface SupervisorCandidate {
@@ -66,7 +89,19 @@ interface SupervisorCandidate {
 
 interface Config {
 	workerCommand: string;
+	/** Extra leading arguments for workerCommand (e.g. a script path when workerCommand is node). */
+	workerCommandArgs: string[];
 	geminiCommand: string;
+	geminiCommandArgs: string[];
+	/** Read-only reviews through a Pi provider API; the Gemini CLI remains the fallback. null disables it. */
+	reviewApi: { provider: string; model: string; reasoning: ThinkingLevel } | null;
+	/** Run the guide's VERIFY commands before and after each delegation and let the worker fix regressions. */
+	autoVerify: boolean;
+	maxCorrectionRounds: number;
+	/** Repository instruction files given to every worker (they run in --safe-mode and would not load them). */
+	repoRulesFiles: string[];
+	maxDiffBytes: number;
+	learning: { enabled: boolean; autoTuneEffort: boolean };
 	workerPermissionMode: "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan";
 	workerTools: string[];
 	workerAllowedTools: string[];
@@ -129,6 +164,11 @@ interface SupervisorMetrics {
 	flagshipRequests: number;
 	flagshipApprovals: number;
 	verifications: number;
+	correctionRounds: number;
+	autoVerifiedDelegations: number;
+	apiReviews: number;
+	apiTokens: number;
+	apiCostUsd: number;
 }
 
 interface WorkerSession {
@@ -136,6 +176,8 @@ interface WorkerSession {
 	cwd: string;
 	allowedPaths: string[];
 	model: string;
+	/** The task the session worked on: follow-up steps of the same task may resume it even on new paths. */
+	taskId?: string;
 }
 
 type TaskPhase = "planned" | "implementing" | "implemented" | "reviewing" | "completed" | "failed";
@@ -216,6 +258,11 @@ const EMPTY_METRICS: SupervisorMetrics = {
 	flagshipRequests: 0,
 	flagshipApprovals: 0,
 	verifications: 0,
+	correctionRounds: 0,
+	autoVerifiedDelegations: 0,
+	apiReviews: 0,
+	apiTokens: 0,
+	apiCostUsd: 0,
 };
 
 const DEFAULT_WORKER_CHAINS: Record<ExecutionProfileName, WorkerCandidate[]> = {
@@ -288,7 +335,15 @@ function loadConfig(): Config {
 	if (!(headroom > 0 && headroom <= 1)) throw new Error(`creditHeadroom must be in (0, 1] in ${configPath}.`);
 	return {
 		workerCommand: raw.workerCommand ?? "claude",
+		workerCommandArgs: raw.workerCommandArgs ?? [],
 		geminiCommand: raw.geminiCommand ?? "gemini",
+		geminiCommandArgs: raw.geminiCommandArgs ?? [],
+		reviewApi: raw.reviewApi === null ? null : { provider: "google", model: "gemini-3.1-pro-preview", reasoning: "high", ...raw.reviewApi },
+		autoVerify: raw.autoVerify ?? true,
+		maxCorrectionRounds: raw.maxCorrectionRounds ?? 2,
+		repoRulesFiles: raw.repoRulesFiles ?? ["AGENTS.md", "CLAUDE.md"],
+		maxDiffBytes: raw.maxDiffBytes ?? 60_000,
+		learning: { enabled: true, autoTuneEffort: true, ...raw.learning },
 		workerPermissionMode: raw.workerPermissionMode ?? "dontAsk",
 		workerTools: raw.workerTools ?? ["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
 		workerAllowedTools: raw.workerAllowedTools ?? [
@@ -509,9 +564,20 @@ function compareGitSnapshots(before: GitSnapshot, after: GitSnapshot, allowedPat
 	return violations;
 }
 
-function buildWorkerPrompt(task: string, implementationGuide: string, acceptanceCriteria: string[], allowedPaths: string[], isContinuation: boolean): string {
+/**
+ * Repository context for a fresh worker: instruction files (workers run in --safe-mode and would not load them)
+ * and lessons learned in this repository. Resumed sessions already have it.
+ */
+function buildRepoContext(rules: string, lessons: string[]): string {
+	const parts: string[] = [];
+	if (rules) parts.push(`REPOSITORY RULES (follow them)\n${rules}`);
+	if (lessons.length) parts.push(`LESSONS FROM PREVIOUS WORK IN THIS REPOSITORY (avoid repeating these mistakes)\n${lessons.map((item) => `- ${item}`).join("\n")}`);
+	return parts.join("\n\n");
+}
+
+function buildWorkerPrompt(task: string, implementationGuide: string, acceptanceCriteria: string[], allowedPaths: string[], isContinuation: boolean, repoContext = ""): string {
 	return `[CODING WORKER — ${isContinuation ? "TARGETED CORRECTION" : "EXECUTE, DO NOT REPLAN"}]
-Implement only the task and file guide below. ${isContinuation ? "Reuse the existing session context; inspect only what changed or what the correction explicitly references." : "Read applicable repository instructions and Git status first; preserve existing changes."} Start from the named symbols and use narrow/ranged reads where possible, expanding only when dependencies or uncertainty require it. Edit surgically and avoid broad exploration or unrelated refactors. Never stage, commit, push, merge, switch branches, rewrite history, or invoke agents. Do not modify paths outside the allowlist. If instructions conflict with the code or admit multiple material approaches, stop and report the ambiguity. Run pertinent checks. On success return only changed files, concise change summary, tests and residual risks; on failure include the diagnostics needed to resolve it.
+${!isContinuation && repoContext ? `${repoContext}\n\n` : ""}Implement only the task and file guide below. ${isContinuation ? "Reuse the existing session context; inspect only what changed or what the correction explicitly references." : "Check Git status first; preserve existing changes."} Never weaken, skip or delete tests to make checks pass. Start from the named symbols and use narrow/ranged reads where possible, expanding only when dependencies or uncertainty require it. Edit surgically and avoid broad exploration or unrelated refactors. Never stage, commit, push, merge, switch branches, rewrite history, or invoke agents. Do not modify paths outside the allowlist. If instructions conflict with the code or admit multiple material approaches, stop and report the ambiguity. Run pertinent checks. On success return only changed files, concise change summary, tests and residual risks; on failure include the diagnostics needed to resolve it.
 
 TASK
 ${task}
@@ -526,8 +592,57 @@ PATH ALLOWLIST
 ${allowedPaths.map((item) => `- ${item}`).join("\n")}`;
 }
 
-function handoffNote(previous: string, kind: FailureKind, partialFiles: string[]): string {
-	return `[HANDOFF] The previous worker (${previous}) stopped because of a provider failure (${kind}), not because of the task. ${partialFiles.length ? `It may have partially edited: ${partialFiles.join(", ")}. Inspect those files and the current diff first, keep correct partial work, fix incomplete work, and finish the task.` : "It left no detectable file changes; start the task normally."}`;
+function handoffNote(previous: string, kind: FailureKind, partialFiles: string[], diff: string): string {
+	if (!partialFiles.length) return `[HANDOFF] The previous worker (${previous}) stopped because of a provider failure (${kind}), not because of the task. It left no detectable file changes; start the task normally.`;
+	return `[HANDOFF] The previous worker (${previous}) stopped because of a provider failure (${kind}), not because of the task. It partially edited: ${partialFiles.join(", ")}. Its changes are below: keep what is correct, fix what is incomplete, and finish the task.\n\n${diff}`;
+}
+
+/** Instruction files at the working directory and the Git root, capped so they never dominate the prompt. */
+function readRepoRules(cwd: string, gitRoot: string | undefined, files: string[], maxBytes = 12_000): string {
+	const dirs = [...new Set([cwd, gitRoot].filter((item): item is string => Boolean(item)).map((item) => path.resolve(item)))];
+	const parts: string[] = [];
+	let total = 0;
+	for (const dir of dirs) {
+		for (const name of files) {
+			const file = path.join(dir, name);
+			try {
+				if (!fs.statSync(file).isFile()) continue;
+				const text = fs.readFileSync(file, "utf8").trim();
+				if (!text) continue;
+				const remaining = maxBytes - total;
+				if (remaining <= 200) break;
+				const clipped = truncateUtf8(text, remaining);
+				parts.push(`[${path.relative(cwd, file) || name}]\n${clipped}`);
+				total += Buffer.byteLength(clipped, "utf8");
+			} catch {
+				// Missing instruction files are normal.
+			}
+		}
+	}
+	return parts.join("\n\n");
+}
+
+/**
+ * Diff of the allowed paths against HEAD, plus the full content of new untracked files (git diff omits them).
+ * Reviewers and handoffs get the actual change instead of having to reconstruct it.
+ */
+async function scopedDiff(cwd: string, paths: string[], maxBytes: number): Promise<string> {
+	const scope = paths.length ? paths : ["."];
+	const hasHead = Boolean((await gitStdout(cwd, ["rev-parse", "--verify", "--quiet", "HEAD"]))?.trim());
+	const tracked = (await gitStdout(cwd, ["-c", "core.quotepath=off", "diff", "--no-ext-diff", "--no-color", "--unified=5", ...(hasHead ? ["HEAD"] : []), "--", ...scope])) ?? "";
+	const untracked = nulSeparated(await gitStdout(cwd, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope]));
+	const added: string[] = [];
+	for (const file of untracked) {
+		try {
+			const content = fs.readFileSync(path.join(cwd, file), "utf8");
+			added.push(`diff --git a/${file} b/${file}\nnew file (untracked)\n+++ b/${file}\n${content.split("\n").map((line) => `+${line}`).join("\n")}`);
+		} catch {
+			added.push(`new file (untracked, unreadable): ${file}`);
+		}
+	}
+	const diff = [tracked.trim(), ...added].filter(Boolean).join("\n");
+	if (!diff) return "(no changes in the allowed paths)";
+	return Buffer.byteLength(diff, "utf8") > maxBytes ? `${truncateUtf8(diff, maxBytes)}\n[Diff truncated at ${maxBytes} bytes: read the listed files for the rest.]` : diff;
 }
 
 function numberField(value: unknown): number {
@@ -727,7 +842,7 @@ async function runClaude(
 	let httpStatus: number | undefined;
 	let limit: LimitReading | undefined;
 	let limitInfo: Record<string, any> | undefined;
-	const outcome = await runProcess(resolveClaudeCommand(config.workerCommand), claudeArgs(config, candidate, mode, resumeSessionId), prompt, cwd, signal, timeoutMs, (line) => {
+	const outcome = await runProcess(resolveClaudeCommand(config.workerCommand), [...config.workerCommandArgs, ...claudeArgs(config, candidate, mode, resumeSessionId)], prompt, cwd, signal, timeoutMs, (line) => {
 		if (!line.trim()) return;
 		let event: Record<string, any>;
 		try {
@@ -784,7 +899,7 @@ async function runClaude(
 
 async function runGemini(cwd: string, config: Config, candidate: WorkerCandidate, prompt: string, mode: "plan" | "auto_edit", signal: AbortSignal | undefined, timeoutMs: number): Promise<RunResult> {
 	const invocation = resolveGeminiInvocation(config.geminiCommand);
-	const args = [...invocation.prefix, "--skip-trust", "--approval-mode", mode, "--output-format", "json", "-p", ""];
+	const args = [...invocation.prefix, ...config.geminiCommandArgs, "--skip-trust", "--approval-mode", mode, "--output-format", "json", "-p", ""];
 	if (candidate.model) args.push("--model", candidate.model);
 	const outcome = await runProcess(invocation.command, args, prompt, cwd, signal, timeoutMs);
 	if (outcome.aborted) throw new Error("Gemini worker aborted.");
@@ -825,12 +940,79 @@ function modelDisplayName(ctx: ExtensionContext, provider: string, model: string
 }
 
 function candidateLabel(candidate: WorkerCandidate): string {
-	return candidate.worker === "claude" ? `Claude ${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}` : `Gemini ${candidate.model || "default"}`;
+	if (candidate.worker === "claude") return `Claude ${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}`;
+	if (candidate.worker === "api") return `${candidate.provider} API ${candidate.model}`;
+	return `Gemini ${candidate.model || "default"}`;
 }
 
 function workerHealthKeys(candidate: WorkerCandidate): string[] {
 	if (candidate.worker === "claude") return ["claude-cli", `claude-cli:${claudeFamily(candidate.model)}`, `claude-cli:model:${candidate.model}`];
+	// API reviewers share the Pi provider account (and its credits) with the supervisor.
+	if (candidate.worker === "api") return [`pi:${candidate.provider}`, `pi:model:${candidate.provider}/${candidate.model}`];
 	return ["gemini-cli", `gemini-cli:model:${candidate.model || "default"}`];
+}
+
+const SKIPPED_DIRS = new Set([".git", "node_modules", "dist", "build", "out", "coverage", ".venv", "__pycache__", "target", ".next"]);
+
+/**
+ * Text of the given paths for an API reviewer (directories expanded two levels, generated folders skipped).
+ * Returns undefined when the material exceeds maxBytes: the CLI reviewer, which can browse, is used instead.
+ */
+function collectFiles(cwd: string, paths: string[], maxBytes: number): string | undefined {
+	const parts: string[] = [];
+	let total = 0;
+	const visit = (relative: string, depth: number): boolean => {
+		const absolute = path.join(cwd, relative);
+		let stat: fs.Stats;
+		try {
+			stat = fs.statSync(absolute);
+		} catch {
+			return true; // Deleted or not yet created: the diff shows it.
+		}
+		if (stat.isDirectory()) {
+			if (depth > 2) return true;
+			for (const entry of fs.readdirSync(absolute)) {
+				if (SKIPPED_DIRS.has(entry)) continue;
+				if (!visit(path.join(relative, entry), depth + 1)) return false;
+			}
+			return true;
+		}
+		if (!stat.isFile()) return true;
+		const buffer = fs.readFileSync(absolute);
+		if (buffer.includes(0)) return true; // Binary.
+		total += buffer.length;
+		if (total > maxBytes) return false;
+		parts.push(`=== ${normalizeSupervisorPath(relative)} ===\n${buffer.toString("utf8")}`);
+		return true;
+	};
+	for (const item of paths) if (!visit(item, 0)) return undefined;
+	return parts.join("\n\n");
+}
+
+/** Read-only review through a Pi provider: only the diff and files are sent, without a CLI's fixed prompt overhead. */
+async function runApiReview(ctx: ExtensionContext, candidate: WorkerCandidate, reasoning: ThinkingLevel, prompt: string, material: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<RunResult> {
+	const base = { worker: "api" as const, model: candidate.model, stderr: "", turns: 1, timedOut: false };
+	const model = ctx.modelRegistry.find(candidate.provider ?? "", candidate.model);
+	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+		const errorMessage = `model not available in Pi: ${candidate.provider}/${candidate.model}`;
+		return { ...base, exitCode: 1, output: "", errorMessage, costUsd: 0, signal: { text: errorMessage, httpStatus: 404 } };
+	}
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	signal?.addEventListener("abort", onAbort, { once: true });
+	let timedOut = false;
+	const timer = timeoutMs > 0 ? setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs) : undefined;
+	try {
+		const content = `${prompt}\n\nFILES (current content)\n${material || "(none)"}`;
+		const message = await ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content, timestamp: Date.now() }] }, { reasoning: reasoning === "off" ? undefined : reasoning, signal: controller.signal }).result();
+		if (signal?.aborted) throw new Error("API review aborted.");
+		const output = message.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n").trim();
+		const errorMessage = message.stopReason === "error" || message.stopReason === "aborted" ? message.errorMessage ?? (timedOut ? `API review timed out after ${Math.round(timeoutMs / 60_000)} minutes.` : "API review failed.") : undefined;
+		return { ...base, exitCode: errorMessage ? 1 : 0, output, errorMessage, costUsd: numberField(message.usage?.cost?.total), usage: message.usage, signal: { text: errorMessage ?? "" }, timedOut, turns: output ? 1 : 0 };
+	} finally {
+		if (timer) clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
+	}
 }
 
 function supervisorHealthKeys(candidate: SupervisorCandidate): string[] {
@@ -869,6 +1051,8 @@ interface ImplementationSpec {
 	/** Supervisor override of the profile's Claude effort for this delegation. */
 	effort?: WorkerEffort;
 	resumeSessionId?: string;
+	/** Repository rules and lessons for fresh workers. */
+	repoContext?: string;
 }
 
 interface ImplementationOutcome {
@@ -892,6 +1076,7 @@ interface ConsultOutcome {
 	usage: Array<Usage | undefined>;
 	violations: string[];
 	gitAvailable: boolean;
+	verdict: ReviewVerdict;
 }
 
 function orderChain(chain: WorkerCandidate[], prefer?: WorkerKind): WorkerCandidate[] {
@@ -930,6 +1115,35 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	let settingModel = false;
 	let supervisorFlagshipGrant: FlagshipGrant | undefined;
 	const lastLimitHeaders: Record<string, Record<string, string>> = {};
+	// Learning is global (across sessions and projects), stored next to the extension, never in the session log.
+	let learning: LearningState = loadLearning(learningPath);
+	const gitRoots = new Map<string, string | undefined>();
+
+	function saveLearningSafe(ctx?: ExtensionContext): void {
+		try {
+			saveLearning(learningPath, learning);
+		} catch (error) {
+			ctx?.ui.notify(`${EXTENSION_NAME}: could not save learning data (${error instanceof Error ? error.message : String(error)}).`, "warning");
+		}
+	}
+
+	async function gitRoot(cwd: string): Promise<string | undefined> {
+		if (!gitRoots.has(cwd)) gitRoots.set(cwd, (await gitStdout(cwd, ["rev-parse", "--show-toplevel"]))?.trim() || undefined);
+		return gitRoots.get(cwd);
+	}
+
+	/** Lessons and statistics are kept per repository (Git root, or the working directory outside Git). */
+	async function repoKey(cwd: string): Promise<string> {
+		const root = (await gitRoot(cwd)) ?? cwd;
+		const normalized = path.resolve(root).replace(/\\/g, "/");
+		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+	}
+
+	async function repoContextFor(cwd: string): Promise<string> {
+		const rules = readRepoRules(cwd, await gitRoot(cwd), config.repoRulesFiles);
+		const lessons = config.learning.enabled ? lessonsFor(learning, await repoKey(cwd)).map((item) => item.text) : [];
+		return buildRepoContext(rules, lessons);
+	}
 
 	const cooldownMs = () => config.exhaustedCooldownMinutes * 60_000;
 	const minutes = (value: number) => (value > 0 ? value * 60_000 : 0);
@@ -988,6 +1202,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			metrics.outputTokens += result.usage?.output ?? 0;
 			metrics.cacheReadTokens += result.usage?.cacheRead ?? 0;
 			metrics.cacheWriteTokens += result.usage?.cacheWrite ?? 0;
+		} else if (result.worker === "api") {
+			metrics.apiReviews++;
+			metrics.apiTokens += result.usage?.totalTokens ?? 0;
+			metrics.apiCostUsd += result.costUsd;
 		} else {
 			metrics.geminiCalls++;
 			metrics.geminiInputTokens += result.usage?.input ?? 0;
@@ -1000,7 +1218,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	function recordWorkerHealth(candidate: WorkerCandidate, result: RunResult, kind: FailureKind | undefined): void {
 		const now = Date.now();
 		const source = `${candidateLabel(candidate)} run`;
-		const accountKey = candidate.worker === "claude" ? claudeLimitKey(result.limitInfo, candidate.model) : "gemini-cli";
+		const providerKey = candidate.worker === "claude" ? "claude-cli" : candidate.worker === "api" ? `pi:${candidate.provider}` : "gemini-cli";
+		const accountKey = candidate.worker === "claude" ? claudeLimitKey(result.limitInfo, candidate.model) : providerKey;
 		if (result.limit) applyReading(health, accountKey, result.limit, source, cooldownMs(), now);
 		if (!kind) {
 			markHealthy(health, workerHealthKeys(candidate).at(-1) as string, source, now);
@@ -1011,7 +1230,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		if (kind === "credits") {
 			markExhausted(health, accountKey, reason, parseResetHint(reason, now) ?? result.limit?.resetsAt ?? now + cooldownMs(), source, now);
 		} else if (kind === "auth") {
-			markExhausted(health, candidate.worker === "claude" ? "claude-cli" : "gemini-cli", `auth: ${reason}`, now + cooldownMs(), source, now);
+			markExhausted(health, providerKey, `auth: ${reason}`, now + cooldownMs(), source, now);
 		} else if (kind === "unavailable") {
 			markExhausted(health, workerHealthKeys(candidate).at(-1) as string, `unavailable: ${reason}`, now + minutes(config.unavailableCooldownMinutes), source, now);
 		}
@@ -1022,6 +1241,151 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const lastReport = patch.lastReport !== undefined ? patch.lastReport.slice(-MAX_STORED_REPORT_CHARS) : taskPacket.lastReport;
 		taskPacket = { ...taskPacket, ...patch, lastReport, updatedAt: Date.now() };
 		persist();
+	}
+
+	interface CheckResult {
+		command: string;
+		ok: boolean;
+		exitCode: number;
+		timedOut: boolean;
+		output: string;
+		changed: string[];
+	}
+
+	/** One allowlisted check, non-interactive (CI=1 keeps test runners out of watch mode). */
+	async function runCheck(ctx: ExtensionContext, command: string, signal: AbortSignal | undefined): Promise<CheckResult> {
+		const before = await getGitSnapshot(ctx.cwd);
+		const outcome = await runProcess(command, [], "", ctx.cwd, signal, minutes(config.verificationTimeoutMinutes), undefined, { shell: true, env: { CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" } });
+		if (outcome.aborted) throw new Error("Verification aborted.");
+		const after = await getGitSnapshot(ctx.cwd);
+		metrics.verifications++;
+		return {
+			command,
+			ok: outcome.exitCode === 0 && !outcome.timedOut,
+			exitCode: outcome.exitCode,
+			timedOut: outcome.timedOut,
+			output: `${outcome.stdout}${outcome.stderr ? `\n[stderr]\n${outcome.stderr}` : ""}`.trim() || "(no output)",
+			changed: filesChangedBetween(before, after),
+		};
+	}
+
+	async function runChecks(ctx: ExtensionContext, commands: string[], signal: AbortSignal | undefined): Promise<CheckResult[]> {
+		const results: CheckResult[] = [];
+		for (const command of commands) results.push(await runCheck(ctx, command, signal));
+		return results;
+	}
+
+	function formatChecks(checks: CheckResult[], baseline: Map<string, boolean>, rounds: number, verification: VerificationResult, notes: string[]): string {
+		const lines = checks.map((check) => {
+			const state = check.ok ? "pass" : baseline.get(check.command) === false ? "FAIL (was already failing before the change)" : "FAIL (regression)";
+			return `- ${check.command}: ${state}`;
+		});
+		const failing = checks.filter((check) => !check.ok).map((check) => `$ ${check.command}\n${check.timedOut ? "timed out" : `exit code ${check.exitCode}`}\n${truncateUtf8Tail(check.output, 4000)}`);
+		return [
+			`AUTOMATIC VERIFICATION: ${verification.toUpperCase()}${rounds ? ` (${rounds} correction round${rounds > 1 ? "s" : ""})` : ""}`,
+			...lines,
+			...notes,
+			...(failing.length ? ["", ...failing] : []),
+		].join("\n");
+	}
+
+	/** Let the implementer fix its own regressions: resume its Claude session, or re-run with the diff and failures. */
+	async function runCorrection(ctx: ExtensionContext, implementer: WorkerCandidate, sessionId: string | undefined, spec: ImplementationSpec, failing: CheckResult[], round: number, signal: AbortSignal | undefined): Promise<{ result: RunResult; kind?: FailureKind }> {
+		const failures = failing.map((check) => `$ ${check.command}\n${check.timedOut ? "timed out" : `exit code ${check.exitCode}`}\n${truncateUtf8Tail(check.output, 6000)}`).join("\n\n");
+		const instructions = `[CORRECTION ROUND ${round}] These checks passed before your change and fail now:\n\n${failures}\n\nFind and fix the cause in the allowlisted files. Never weaken, skip or delete tests and do not change the checks themselves. If the cause is outside the allowlist or the requirement is ambiguous, stop and explain. Return the changed files and what you fixed.`;
+		let result: RunResult | undefined;
+		let kind: FailureKind | undefined;
+		for (let attempt = 0; attempt <= config.transientRetryAttempts; attempt++) {
+			if (implementer.worker === "claude" && sessionId) {
+				result = await runClaude(ctx.cwd, config, implementer, "edit", instructions, sessionId, signal, minutes(config.workerTimeoutMinutes));
+			} else {
+				const diff = await scopedDiff(ctx.cwd, spec.allowedPaths, config.maxDiffBytes);
+				const prompt = `${buildWorkerPrompt(spec.task, spec.guide, spec.criteria, spec.allowedPaths, false, spec.repoContext)}\n\nCURRENT CHANGES (made by the previous attempt)\n${diff}\n\n${instructions}`;
+				result = implementer.worker === "claude"
+					? await runClaude(ctx.cwd, config, implementer, "edit", prompt, undefined, signal, minutes(config.workerTimeoutMinutes))
+					: await runGemini(ctx.cwd, config, implementer, prompt, "auto_edit", signal, minutes(config.workerTimeoutMinutes));
+			}
+			recordRun(result);
+			kind = runFailed(result) ? failureKindOf(result) : undefined;
+			if (kind !== "transient" || attempt >= config.transientRetryAttempts) break;
+			await waitForRetry(config.transientRetryDelayMs * 2 ** attempt, signal);
+		}
+		const finalResult = result as RunResult;
+		recordWorkerHealth(implementer, finalResult, kind);
+		return { result: finalResult, kind };
+	}
+
+	/** What learning knows about this repository, for the supervisor at planning time. */
+	async function learningBriefing(ctx: ExtensionContext, profile: ExecutionProfileName): Promise<string[]> {
+		if (!config.learning.enabled) return [];
+		const repo = await repoKey(ctx.cwd);
+		const lines: string[] = [];
+		const hint = profileHint(profileStats(learning, repo), profile);
+		if (hint) lines.push(`Learning: ${hint}`);
+		const adjusted = config.workerChains[profile]
+			.filter((item) => item.worker === "claude" && item.effort)
+			.map((item) => ({ item, effort: effectiveEffort(learning, profile, item.model, item.effort as Effort) }))
+			.filter(({ item, effort }) => effort !== item.effort)
+			.map(({ item, effort }) => `${item.model} ${item.effort}→${effort}`);
+		if (adjusted.length) lines.push(`Learning: calibrated worker effort for ${profile}: ${adjusted.join(", ")}.`);
+		const lessons = lessonsFor(learning, repo);
+		if (lessons.length) lines.push(`Known lessons for this repository (already given to workers; take them into account in the guide):\n${lessons.map((item) => `- ${item.text}`).join("\n")}`);
+		return lines;
+	}
+
+	async function learningReport(ctx: ExtensionContext): Promise<string> {
+		const repo = await repoKey(ctx.cwd);
+		const stats = profileStats(learning, repo);
+		const statLines = stats.map((item) => `  ${item.profile}: ${item.samples} scored delegations, first-pass ${Math.round(item.firstPassRate * 100)}%, mean quality ${item.meanQuality.toFixed(2)}, avg ${item.avgCorrectionRounds.toFixed(1)} correction rounds`);
+		const adjustments = Object.entries(learning.effortAdjustments).map(([key, item]) => `  ${key.replace("|", " / ")}: ${item.configured} → ${item.effort} (${item.reason})`);
+		const lessons = lessonsFor(learning, repo).map((item) => `  [${item.id}] ${item.text}${item.uses ? ` (reinforced ${item.uses}×)` : ""}`);
+		return [
+			`Learning ${config.learning.enabled ? "on" : "off"} · effort auto-tuning ${config.learning.autoTuneEffort ? "on" : "off"} · ${learning.outcomes.length} outcomes recorded in total`,
+			`Repository: ${repo}`,
+			"Quality by profile (this repository):",
+			...(statLines.length ? statLines : ["  (no delegations recorded yet)"]),
+			"Calibrated efforts (all repositories):",
+			...(adjustments.length ? adjustments : ["  (none: config.json values are in use)"]),
+			"Lessons for this repository:",
+			...(lessons.length ? lessons : ["  (none)"]),
+			"Remove a lesson: /SupervisedCoding learning forget <id> · clear everything: /SupervisedCoding learning reset",
+			`Data: ${learningPath}`,
+		].join("\n");
+	}
+
+	/** Every Claude candidate with a configured effort is a calibration target. */
+	function tuningTargets(): Array<{ profile: string; model: string; configured: Effort }> {
+		return PROFILE_NAMES.flatMap((profile) => config.workerChains[profile]
+			.filter((item) => item.worker === "claude" && item.effort)
+			.map((item) => ({ profile, model: item.model, configured: item.effort as Effort })));
+	}
+
+	/**
+	 * Record the outcome of a delegation and recalibrate effort. Delegations that never reached a worker for
+	 * provider reasons carry no quality signal and are not recorded.
+	 */
+	async function learnFromDelegation(ctx: ExtensionContext, data: { implementer: WorkerCandidate; final: RunResult; profileName: ExecutionProfileName; verification: VerificationResult; correctionRounds: number; reviewVerdict: ReviewVerdict; failed: boolean; combined?: Usage }): Promise<string[]> {
+		if (!config.learning.enabled) return [];
+		if (runFailed(data.final) && FAILOVER_KINDS.has(failureKindOf(data.final))) return [];
+		recordOutcome(learning, {
+			at: Date.now(),
+			repo: await repoKey(ctx.cwd),
+			taskId: taskPacket?.id ?? "",
+			profile: data.profileName,
+			worker: data.implementer.worker,
+			model: data.implementer.model,
+			effort: data.implementer.effort,
+			verification: data.verification,
+			correctionRounds: data.correctionRounds,
+			review: data.reviewVerdict,
+			failed: data.failed,
+			tokens: data.combined?.totalTokens ?? 0,
+			costUsd: data.combined?.cost.total ?? 0,
+		});
+		const changes = config.learning.autoTuneEffort ? tuneEfforts(learning, tuningTargets()) : [];
+		saveLearningSafe(ctx);
+		if (changes.length) ctx.ui.notify(`${EXTENSION_NAME} learned: ${changes.join("; ")}`, "info");
+		return changes;
 	}
 
 	/**
@@ -1042,14 +1406,16 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		let claudeResumeAvailable = Boolean(spec.resumeSessionId);
 		let providerFailureSeen = false;
 		for (const { candidate: configured } of usable) {
-			const candidate: WorkerCandidate = configured.worker === "claude" && spec.effort ? { ...configured, effort: spec.effort } : configured;
+			// Effort: the supervisor's explicit override, else what learning calibrated for this profile/model, else config.json.
+			const learnedEffort = config.learning.enabled ? effectiveEffort(learning, spec.profileName, configured.model, configured.effort as Effort | undefined) : configured.effort;
+			const candidate: WorkerCandidate = configured.worker === "claude" ? { ...configured, effort: spec.effort ?? learnedEffort } : configured;
 			const label = candidateLabel(candidate);
 			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.worker === "claude" ? "anthropic" : "google", candidate.model)))) {
 				attempts.push({ label, ok: false, detail: "declined: flagship not authorized" });
 				continue;
 			}
 			const resumeId = candidate.worker === "claude" && claudeResumeAvailable ? spec.resumeSessionId : undefined;
-			const basePrompt = buildWorkerPrompt(spec.task, spec.guide, spec.criteria, spec.allowedPaths, Boolean(resumeId));
+			const basePrompt = buildWorkerPrompt(spec.task, spec.guide, spec.criteria, spec.allowedPaths, Boolean(resumeId), spec.repoContext);
 			let result: RunResult | undefined;
 			let kind: FailureKind | undefined;
 			for (let attempt = 0; attempt <= config.transientRetryAttempts; attempt++) {
@@ -1080,7 +1446,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			providerFailureSeen = true;
 			metrics.providerFailovers++;
 			const now = await getGitSnapshot(ctx.cwd);
-			handoff = handoffNote(label, kind, filesChangedBetween(before, now).filter((file) => pathInAllowedScope(file, spec.allowedPaths)));
+			const partial = filesChangedBetween(before, now).filter((file) => pathInAllowedScope(file, spec.allowedPaths));
+			handoff = handoffNote(label, kind, partial, partial.length ? await scopedDiff(ctx.cwd, partial, config.maxDiffBytes) : "");
 		}
 		if (!final || !finalCandidate) throw new Error(`No worker could be started for profile ${spec.profileName}: ${attempts.map((item) => `${item.label} (${item.detail ?? item.kind})`).join("; ") || "empty chain"}.`);
 		if (providerFailureSeen && finalCandidate.worker === "gemini") metrics.geminiFallbacks++;
@@ -1094,7 +1461,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	}
 
 	/** Read-only consultation with failover across reviewers; any working-tree mutation is reported as a violation. */
-	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined): Promise<ConsultOutcome> {
+	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; requireVerdict?: boolean } = {}): Promise<ConsultOutcome> {
 		const { usable, blocked } = rankCandidates(order, workerHealthKeys, health, config.creditHeadroom);
 		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: "skipped: exhausted" }));
 		const usage: Array<Usage | undefined> = [];
@@ -1103,15 +1470,28 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		let reviewer: string | undefined;
 		let failed = true;
 		const pathList = paths.map((item) => `- ${item}`).join("\n");
+		const diffBlock = options.diff ? `\n\nCHANGES UNDER REVIEW (diff against HEAD)\n\`\`\`diff\n${options.diff}\n\`\`\`\nBase the review on these changes; read files only for the surrounding context you need.` : "";
+		const verdictLine = options.requireVerdict ? "\nEnd with exactly one final line: VERDICT: PASS (no material defect) | MINOR (only minor issues) | MAJOR (bugs, missed requirements, regressions or unsafe behavior)." : "";
+		let material: string | undefined | null = null;
 		for (const { candidate } of usable) {
 			const label = candidateLabel(candidate);
-			const prompt = `${header}\n${question}\nRelevant paths:\n${pathList}\n\nInspect only the listed paths and directly relevant symbols. Do not edit, write, stage, commit, push, merge, switch branches, or run mutating commands. Return concise findings ordered by severity, concrete evidence with file/symbol references, recommended action, verification ideas, and remaining uncertainty. Do not summarize unrelated code.`;
+			const prompt = `${header}\n${question}\nRelevant paths:\n${pathList}${diffBlock}\n\nInspect only the listed paths and directly relevant symbols. Do not edit, write, stage, commit, push, merge, switch branches, or run mutating commands. Return concise findings ordered by severity, concrete evidence with file/symbol references, recommended action, verification ideas, and remaining uncertainty. Do not summarize unrelated code.${verdictLine}`;
+			if (candidate.worker === "api") {
+				// An API reviewer cannot browse: it needs the files inline, and only when they fit.
+				if (material === null) material = collectFiles(ctx.cwd, paths, 250_000);
+				if (material === undefined) {
+					attempts.push({ label, ok: false, detail: "skipped: files too large for an API review" });
+					continue;
+				}
+			}
 			let result: RunResult | undefined;
 			let kind: FailureKind | undefined;
 			for (let attempt = 0; attempt <= config.transientRetryAttempts; attempt++) {
 				result = candidate.worker === "claude"
 					? await runClaude(ctx.cwd, config, candidate, "readonly", prompt, undefined, signal, minutes(config.consultTimeoutMinutes))
-					: await runGemini(ctx.cwd, config, candidate, prompt, "plan", signal, minutes(config.consultTimeoutMinutes));
+					: candidate.worker === "api"
+						? await runApiReview(ctx, candidate, config.reviewApi?.reasoning ?? "high", prompt, material ?? "", signal, minutes(config.consultTimeoutMinutes))
+						: await runGemini(ctx.cwd, config, candidate, prompt, "plan", signal, minutes(config.consultTimeoutMinutes));
 				recordRun(result);
 				usage.push(result.usage);
 				kind = runFailed(result) ? failureKindOf(result) : undefined;
@@ -1129,10 +1509,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		}
 		const after = await getGitSnapshot(ctx.cwd);
 		const violations = compareGitSnapshots(before, after, []);
-		return { failed: failed || violations.length > 0, text, reviewer, attempts, usage, violations, gitAvailable: before.available && after.available };
+		return { failed: failed || violations.length > 0, text, reviewer, attempts, usage, violations, gitAvailable: before.available && after.available, verdict: failed ? "none" : parseVerdict(text) };
 	}
 
-	/** Reviewers for independent review: a different worker family first, then remaining healthy candidates. */
 	/** Non-flagship reviewers of one family, strongest profile chains first, one entry per model. Flagships are for implementation only. */
 	function reviewers(worker: WorkerKind, profiles: ExecutionProfileName[]): WorkerCandidate[] {
 		const seen = new Set<string>();
@@ -1144,7 +1523,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				result.push(item);
 			}
 		}
-		return result.length || worker === "claude" ? result : [{ worker: "gemini", model: "" }];
+		if (worker === "claude") return result;
+		const cli: WorkerCandidate[] = result.length ? result : [{ worker: "gemini", model: "" }];
+		// Same model family through the API first (no CLI fixed overhead); the CLI stays as fallback and for large inputs.
+		return config.reviewApi ? [{ worker: "api", provider: config.reviewApi.provider, model: config.reviewApi.model }, ...cli] : cli;
 	}
 
 	/**
@@ -1342,7 +1724,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const approved = await ctx.ui.confirm("Every supervisor model is out of credits. Continue with external workers?", `Task: ${taskPacket.objective}\n\nAllowed paths:\n${allowedPaths.join("\n")}`);
 			if (!approved) throw new Error("rejected by the human operator.");
 			const guide = `FILE: ${allowedPaths.join(", ")}\nSYMBOLS: all symbols directly relevant to the task and the current working-tree diff\nCHANGES:\n- Inspect repository instructions, the current Git diff and the task below.\n- Finish or fix the implementation; keep changes minimal and complete.\nPRESERVE:\n- Pre-existing user changes, behavior outside task scope, Git history.\n- Never stage, commit, push, merge, or change branches.\nVERIFY:\n- Run the relevant tests/typecheck/lint and report exact outcomes.\n\nPREVIOUS GUIDE:\n${taskPacket.implementationGuide}`;
-			const outcome = await executeImplementation(ctx, { task: `${taskPacket.objective}\n\nUser request that the supervisor could not finish: ${task}`, guide, criteria: taskPacket.acceptanceCriteria, allowedPaths, profileName: "critical" }, ctx.signal);
+			const outcome = await executeImplementation(ctx, { task: `${taskPacket.objective}\n\nUser request that the supervisor could not finish: ${task}`, guide, criteria: taskPacket.acceptanceCriteria, allowedPaths, profileName: "critical", repoContext: await repoContextFor(ctx.cwd) }, ctx.signal);
 			let report = `External recovery by ${outcome.finalCandidate ? candidateLabel(outcome.finalCandidate) : "no worker"} ${outcome.failed ? "failed" : "completed"}:\n${outcome.primaryOutput}`;
 			const usage = [...outcome.usage];
 			if (!outcome.failed && outcome.finalCandidate) {
@@ -1444,6 +1826,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				`Independent review: ${config.independentReviewProfiles.includes(params.profile) ? "automatic" : "not automatic (use consult_readonly only for concrete doubts)"}.`,
 				`Minimum guide length: ${config.minImplementationGuideChars[params.profile]} characters.`,
 				...notes,
+				...(await learningBriefing(ctx, params.profile)),
 			].join("\n");
 			return { content: [{ type: "text", text }], details: { taskId: taskPacket.id, profile: params.profile } };
 		},
@@ -1517,8 +1900,11 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			let resumeSessionId: string | undefined;
 			if (params.continuePrevious) {
 				if (!workerSession || workerSession.cwd !== ctx.cwd) throw new Error("Cannot continue: no compatible previous Claude session is available.");
+				// A follow-up step of the same open task may reuse the session on new paths (it already knows the code);
+				// scope is still enforced after the run. A different task never inherits a session.
+				const sameTask = Boolean(workerSession.taskId && workerSession.taskId === openTask()?.id);
 				const outsidePreviousScope = allowedPaths.filter((item) => !pathInAllowedScope(item, workerSession?.allowedPaths ?? []));
-				if (outsidePreviousScope.length) throw new Error(`Cannot continue with a broader path scope. Start a fresh delegation for: ${outsidePreviousScope.join(", ")}`);
+				if (outsidePreviousScope.length && !sameTask) throw new Error(`Cannot continue with a broader path scope on a different task. Start a fresh delegation for: ${outsidePreviousScope.join(", ")}`);
 				resumeSessionId = workerSession.sessionId;
 			} else {
 				workerSession = undefined;
@@ -1544,46 +1930,92 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			persist();
 
 			try {
-				const outcome = await executeImplementation(
-					ctx,
-					{ task: params.task, guide: params.implementationGuide, criteria, allowedPaths, profileName, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId },
-					signal,
-					(text, label) => onUpdate?.({ content: [{ type: "text", text: truncateUtf8(text, 4000) }], details: { running: true, profile: profileName, worker: label } }),
-				);
+				const repoContext = await repoContextFor(ctx.cwd);
+				const verifyCommands = config.autoVerify ? extractVerifyCommands(params.implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS) : [];
+				// Baseline first: checks that already failed are reported, never blamed on (or credited to) the worker.
+				const baseline = new Map<string, boolean>();
+				for (const command of verifyCommands) baseline.set(command, (await runCheck(ctx, command, signal)).ok);
+				const spec = { task: params.task, guide: params.implementationGuide, criteria, allowedPaths, profileName, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, repoContext };
+				const outcome = await executeImplementation(ctx, spec, signal, (text, label) => onUpdate?.({ content: [{ type: "text", text: truncateUtf8(text, 4000) }], details: { running: true, profile: profileName, worker: label } }));
 				if (outcome.resumed) metrics.resumedDelegations++;
 				const final = outcome.final as RunResult;
 				const implementer = outcome.finalCandidate as WorkerCandidate;
-				if (implementer.worker === "claude" && final.sessionId && !outcome.scopeViolations.length) {
-					workerSession = { sessionId: final.sessionId, cwd: ctx.cwd, allowedPaths: [...allowedPaths], model: implementer.model };
-				} else {
-					workerSession = undefined;
+				const usage = [...outcome.usage];
+				let sessionId = implementer.worker === "claude" ? final.sessionId : undefined;
+				let failed = outcome.failed;
+
+				// Automatic verification with a bounded correction loop: the worker fixes its own regressions with its context intact.
+				let verification: VerificationResult = "unverified";
+				let verificationText = "";
+				let correctionRounds = 0;
+				if (!failed && verifyCommands.length) {
+					metrics.autoVerifiedDelegations++;
+					let checks = await runChecks(ctx, verifyCommands, signal);
+					let regressions = checks.filter((check) => !check.ok && baseline.get(check.command) !== false);
+					const notes: string[] = [];
+					while (regressions.length && correctionRounds < config.maxCorrectionRounds) {
+						correctionRounds++;
+						metrics.correctionRounds++;
+						onUpdate?.({ content: [{ type: "text", text: `Correction round ${correctionRounds}: ${regressions.map((check) => check.command).join(", ")} failing` }], details: { running: true, profile: profileName, worker: candidateLabel(implementer) } });
+						const correction = await runCorrection(ctx, implementer, sessionId, spec, regressions, correctionRounds, signal);
+						usage.push(correction.result.usage);
+						if (correction.kind) {
+							notes.push(`Correction round ${correctionRounds} could not run (${correction.kind}): ${(correction.result.errorMessage ?? "").slice(0, 200)}`);
+							break;
+						}
+						if (implementer.worker === "claude") sessionId = correction.result.sessionId ?? sessionId;
+						checks = await runChecks(ctx, verifyCommands, signal);
+						regressions = checks.filter((check) => !check.ok && baseline.get(check.command) !== false);
+					}
+					verification = regressions.length ? "failed" : correctionRounds ? "fixed" : "passed";
+					if (regressions.length) failed = true;
+					verificationText = formatChecks(checks, baseline, correctionRounds, verification, notes);
 				}
-				updateTaskPacket({ phase: outcome.failed ? "failed" : "implemented", primaryWorker: candidateLabel(implementer), lastReport: outcome.primaryOutput });
+
+				// Scope is checked again: correction rounds edit files too.
+				const afterAll = await getGitSnapshot(ctx.cwd);
+				const scopeViolations = compareGitSnapshots(outcome.before, afterAll, allowedPaths);
+				if (scopeViolations.length) failed = true;
+				workerSession = implementer.worker === "claude" && sessionId && !scopeViolations.length
+					? { sessionId, cwd: ctx.cwd, allowedPaths: [...allowedPaths], model: implementer.model, taskId: taskPacket?.id }
+					: undefined;
+				const report = `${outcome.primaryOutput}${verificationText ? `\n\n${verificationText}` : ""}`;
+				updateTaskPacket({ phase: failed ? "failed" : "implemented", primaryWorker: candidateLabel(implementer), lastReport: report });
 
 				let reviewText = "";
-				const usage = [...outcome.usage];
-				if (!outcome.failed && config.independentReviewProfiles.includes(profileName)) {
+				let reviewVerdict: ReviewVerdict = "none";
+				if (!failed && config.independentReviewProfiles.includes(profileName)) {
 					updateTaskPacket({ phase: "reviewing" });
-					const question = `Task: ${params.task}\nAcceptance criteria:\n${criteria.length ? criteria.map((item) => `- ${item}`).join("\n") : "- Satisfy the authorized task and repository requirements."}\n\nInspect the working-tree diff and relevant code. Look for correctness bugs, missed requirements, regressions, unsafe behavior, type/API problems, and inadequate tests. If no material defect is found, say so explicitly and list residual risks.`;
-					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, allowedPaths, signal);
+					const question = `Task: ${params.task}\nAcceptance criteria:\n${criteria.length ? criteria.map((item) => `- ${item}`).join("\n") : "- Satisfy the authorized task and repository requirements."}\n${verificationText ? `\nAutomatic checks: ${verification}.\n` : ""}\nLook for correctness bugs, missed requirements, regressions, unsafe behavior, type/API problems, and inadequate tests. If no material defect is found, say so explicitly and list residual risks.`;
+					const diff = await scopedDiff(ctx.cwd, allowedPaths, config.maxDiffBytes);
+					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, allowedPaths, signal, { diff, requireVerdict: true });
 					usage.push(...review.usage);
+					reviewVerdict = review.verdict;
 					reviewText = review.reviewer && !review.failed
-						? `Independent review (${review.reviewer}):\n${review.text}`
+						? `Independent review (${review.reviewer}), verdict ${reviewVerdict.toUpperCase()}:\n${review.text}`
 						: `INDEPENDENT REVIEW UNAVAILABLE: ${review.text}${review.violations.length ? `\nREAD-ONLY VIOLATION: ${review.violations.join("; ")}` : ""}\nReview the diff yourself before accepting.`;
-					updateTaskPacket({ phase: "implemented", lastReport: `${outcome.primaryOutput}\n\n${reviewText}` });
+					updateTaskPacket({ phase: "implemented", lastReport: `${report}\n\n${reviewText}` });
 				}
 
+				const combined = combineUsage(usage);
+				const learningNotes = await learnFromDelegation(ctx, { implementer, final, profileName, verification, correctionRounds, reviewVerdict, failed, combined });
 				persist();
 				updateStatus(ctx);
-				const combined = combineUsage(usage);
 				const usageLine = combined ? `Combined tokens: ${combined.input} in + ${combined.output} out + ${combined.cacheRead} cache-read; reported cost $${combined.cost.total.toFixed(2)}` : "Usage unavailable";
-				const safetyLine = outcome.scopeViolations.length ? `SAFETY VIOLATIONS: ${outcome.scopeViolations.join("; ")}\n` : "";
-				const changedLine = outcome.after.available ? `Changed files: ${outcome.after.changedFiles.join(", ") || "none"}\n` : "Git unavailable: scope enforcement degraded outside Git repositories.\n";
-				const text = truncateUtf8(`${candidateLabel(implementer)} (${profileName}) ${outcome.failed ? "failed" : "completed"}.\n${safetyLine}${changedLine}${usageLine}\n\n${outcome.primaryOutput}${reviewText ? `\n\n${reviewText}` : ""}`, config.maxOutputBytes);
+				const safetyLine = scopeViolations.length ? `SAFETY VIOLATIONS: ${scopeViolations.join("; ")}\n` : "";
+				const changedLine = afterAll.available ? `Changed files: ${afterAll.changedFiles.join(", ") || "none"}\n` : "Git unavailable: scope enforcement degraded outside Git repositories.\n";
+				const verificationLine = verifyCommands.length ? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""}\n` : "Automatic verification: none (no allowlisted command in VERIFY); run_verification before accepting.\n";
+				const text = truncateUtf8([
+					`${candidateLabel(implementer)} (${profileName}) ${failed ? "failed" : "completed"}.\n${safetyLine}${changedLine}${verificationLine}${usageLine}`,
+					outcome.primaryOutput,
+					verificationText,
+					reviewText,
+					learningNotes.length ? `Learning: ${learningNotes.join("; ")}` : "",
+				].filter(Boolean).join("\n\n"), config.maxOutputBytes);
 				return {
 					content: [{ type: "text", text }],
-					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: outcome.after, scopeViolations: outcome.scopeViolations, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id },
-					isError: outcome.failed,
+					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: afterAll, scopeViolations, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict },
+					isError: failed,
 					usage: combined,
 				};
 			} catch (error) {
@@ -1608,19 +2040,33 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!config.verificationCommands.some((prefix) => command === prefix || command.startsWith(`${prefix} `))) {
 				throw new Error(`Command not allowlisted. Allowed prefixes: ${config.verificationCommands.join(", ")} (verificationCommands in config.json).`);
 			}
-			const before = await getGitSnapshot(ctx.cwd);
-			const outcome = await runProcess(command, [], "", ctx.cwd, signal, minutes(config.verificationTimeoutMinutes), undefined, { shell: true, env: { CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" } });
-			if (outcome.aborted) throw new Error("Verification aborted.");
-			const after = await getGitSnapshot(ctx.cwd);
-			const changed = filesChangedBetween(before, after);
-			metrics.verifications++;
-			const status = outcome.timedOut ? `timed out after ${config.verificationTimeoutMinutes} min` : `exit code ${outcome.exitCode}`;
-			const warning = changed.length ? `\n\nNote: the command changed files: ${changed.join(", ")}` : "";
-			const body = truncateUtf8Tail(`${outcome.stdout}${outcome.stderr ? `\n[stderr]\n${outcome.stderr}` : ""}`.trim() || "(no output)", config.maxOutputBytes);
+			const check = await runCheck(ctx, command, signal);
+			const status = check.timedOut ? `timed out after ${config.verificationTimeoutMinutes} min` : `exit code ${check.exitCode}`;
+			const warning = check.changed.length ? `\n\nNote: the command changed files: ${check.changed.join(", ")}` : "";
 			return {
-				content: [{ type: "text", text: `$ ${command}\n${status}${warning}\n\n${body}` }],
-				details: { command, exitCode: outcome.exitCode, timedOut: outcome.timedOut, changed },
-				isError: outcome.exitCode !== 0 || outcome.timedOut,
+				content: [{ type: "text", text: `$ ${command}\n${status}${warning}\n\n${truncateUtf8Tail(check.output, config.maxOutputBytes)}` }],
+				details: { command, exitCode: check.exitCode, timedOut: check.timedOut, changed: check.changed },
+				isError: !check.ok,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "record_lesson",
+		label: "Record repository lesson",
+		description: "Record a durable, repository-specific lesson that future workers must know, after it caused a failure, a correction round or a review finding. Examples: a required build step before tests, a non-obvious convention, a fragile module. Never record task-specific details, secrets or one-off facts. Lessons are injected into every future worker prompt for this repository.",
+		parameters: Type.Object({
+			lesson: Type.String({ description: "One concrete, reusable instruction (max 300 characters), e.g. \"Run `npm run build` before `npm test`: tests import from dist/.\"" }),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			if (!enabled) throw new Error("SupervisedCoding is disabled. Run /SupervisedCoding on.");
+			if (!config.learning.enabled) throw new Error("Learning is disabled in config.json (learning.enabled).");
+			const repo = await repoKey(ctx.cwd);
+			const { lesson, duplicate } = addLesson(learning, repo, params.lesson);
+			saveLearningSafe(ctx);
+			return {
+				content: [{ type: "text", text: duplicate ? `Lesson already known; reinforced (${lesson.id}): ${lesson.text}` : `Lesson recorded (${lesson.id}): ${lesson.text}\nIt will be given to every future worker in this repository.` }],
+				details: { id: lesson.id, duplicate, repo },
 			};
 		},
 	});
@@ -1703,9 +2149,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	// ── Commands ───────────────────────────────────────────────────────────────────────────────
 
 	pi.registerCommand(EXTENSION_NAME, {
-		description: "Supervised coding: on | off | status | credits [refresh|reset] | model [auto|manual]",
+		description: "Supervised coding: on | off | status | credits [refresh|reset] | model [auto|manual] | learning [forget <id>|reset]",
 		handler: async (args, ctx) => {
-			const [action = "status", sub = ""] = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+			const [action = "status", sub = "", arg = ""] = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 			if (action === "on") {
 				if (await activate(ctx)) ctx.ui.notify(`${EXTENSION_NAME} enabled on ${ctx.model?.provider}/${ctx.model?.id}. Worker chain (${config.defaultExecutionProfile}): ${config.workerChains[config.defaultExecutionProfile].map(candidateLabel).join(" → ")}`, "info");
 				return;
@@ -1736,6 +2182,23 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Supervisor model selection: ${supervisorMode}. ${supervisorMode === "manual" ? "Credit failover still switches away from an exhausted model." : "The best available model in supervisorChain is used for every new prompt."}\n\n${creditsReport(ctx)}`, "info");
 				return;
 			}
+			if (action === "learning") {
+				if (sub === "reset") {
+					const approved = !ctx.hasUI || (await ctx.ui.confirm("Reset SupervisedCoding learning?", "This deletes all recorded outcomes, calibrated efforts and lessons for every repository."));
+					if (!approved) return;
+					learning = { version: 1, outcomes: [], lessons: [], effortAdjustments: {} };
+					saveLearningSafe(ctx);
+					ctx.ui.notify("Learning data cleared.", "info");
+					return;
+				}
+				if (sub === "forget") {
+					ctx.ui.notify(removeLesson(learning, arg) ? `Lesson ${arg} removed.` : `No lesson with id "${arg}".`, "info");
+					saveLearningSafe(ctx);
+					return;
+				}
+				ctx.ui.notify(await learningReport(ctx), "info");
+				return;
+			}
 			const claudeTokens = metrics.inputTokens + metrics.outputTokens + metrics.cacheReadTokens + metrics.cacheWriteTokens;
 			const geminiTokens = metrics.geminiInputTokens + metrics.geminiOutputTokens + metrics.geminiCachedTokens;
 			let supervisorTokens = 0;
@@ -1757,7 +2220,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				`Flagship requests: ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved)${supervisorFlagshipGrant && openTask()?.id === supervisorFlagshipGrant.taskId ? ` · flagship supervisor active: ${supervisorFlagshipGrant.provider}/${supervisorFlagshipGrant.model}` : ""}`,
 				`Supervisor model: ${supervisorTokens.toLocaleString()} tokens (${share(supervisorTokens)}%), $${supervisorCost.toFixed(2)}`,
 				`Claude: ${claudeTokens.toLocaleString()} tokens (${share(claudeTokens)}%), $${metrics.costUsd.toFixed(2)}`,
-				`Gemini: ${geminiTokens.toLocaleString()} tokens (${share(geminiTokens)}%)`,
+				`Gemini: ${geminiTokens.toLocaleString()} tokens (${share(geminiTokens)}%) · API reviews: ${metrics.apiReviews} (${metrics.apiTokens.toLocaleString()} tokens, $${metrics.apiCostUsd.toFixed(2)})`,
+				`Automatic verification: ${metrics.autoVerifiedDelegations} delegations, ${metrics.correctionRounds} correction rounds`,
 				`Task: ${taskPacket ? `${taskPacket.phase} · ${taskPacket.profile} · ${taskPacket.id}${taskPacket.flagshipDecisions && Object.keys(taskPacket.flagshipDecisions).length ? ` · flagship answers: ${Object.entries(taskPacket.flagshipDecisions).map(([model, yes]) => `${model}=${yes ? FLAGSHIP_YES : FLAGSHIP_NO}`).join(", ")}` : ""}` : "none"}`,
 				`Git review read: ${metrics.gitInspectionBytes.toLocaleString()} bytes · worker continuation: ${workerSession ? "yes" : "no"}`,
 				"",
@@ -1781,7 +2245,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task (no broad exploration, never paste source into handoffs).\n2. Call plan_task with the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Review diff-stat/diff-names first, then scoped diffs. Confirm with run_verification (tests/typecheck/lint), always when the worker could not run checks and before accepting large or critical work.\n5. For corrections to the same scope use continuePrevious=true; do not call plan_task again for the same task.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Commit/push only through the confirmation tools; never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task (no broad exploration, never paste source into handoffs).\n2. Call plan_task with the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Then review diff-stat/diff-names and scoped diffs; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Commit/push only through the confirmation tools; never merge.",
 				display: false,
 			},
 		};
