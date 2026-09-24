@@ -18,15 +18,48 @@ Il **supervisore** (il modello attivo in Pi) esplora, pianifica, delega, verific
 /SupervisedCoding status   stato, task, metriche, token/costi, crediti
 /SupervisedCoding credits [refresh|reset]
 /SupervisedCoding model [auto|manual]
+/SupervisedCoding learning [forget <id>|reset]   cosa ha imparato l’estensione in questo repository
 ```
 
 Dopo `on` basta descrivere il task. Per ogni nuovo task il supervisore:
 
 1. legge solo i file e i simboli necessari per valutarlo;
 2. chiama `plan_task` con il profilo di complessità;
-3. delega con `delegate_implementation` e una guida strutturata;
-4. rivede diff-stat e diff mirati, poi conferma con `run_verification` (test, typecheck, lint);
-5. per le correzioni riprende la sessione del worker (`continuePrevious`), senza ripianificare.
+3. delega con `delegate_implementation` e una guida strutturata, con i comandi di verifica nella sezione `VERIFY`;
+4. l’estensione esegue quei comandi prima e dopo la modifica e fa correggere al worker le eventuali regressioni (vedi sotto);
+5. rivede il risultato (diff-stat, diff mirati, review indipendente) e usa `run_verification` per ciò che `VERIFY` non copre;
+6. per correzioni o passi successivi dello stesso task riprende la sessione del worker (`continuePrevious`);
+7. quando scopre un’insidia ricorrente del repository la registra con `record_lesson`.
+
+## Ciclo di qualità
+
+Per ogni delega:
+
+1. **Contesto del repository.** Il worker riceve `AGENTS.md`/`CLAUDE.md` (in `--safe-mode` non li caricherebbe da solo) e le lezioni imparate in quel repository.
+2. **Baseline.** I comandi di `VERIFY` presenti in `verificationCommands` (es. `npm test`, `npx tsc --noEmit`) vengono eseguiti **prima** della modifica, per distinguere i fallimenti già esistenti.
+3. **Implementazione** con la catena di worker del profilo.
+4. **Verifica e auto-correzione.** Gli stessi comandi vengono rieseguiti. Se qualcosa che prima passava ora fallisce, lo **stesso** worker riprende la propria sessione con l’output dell’errore e corregge, fino a `maxCorrectionRounds` volte (default 2). Gli è vietato indebolire o cancellare test. I fallimenti già presenti prima vengono segnalati, ma non attribuiti al worker.
+5. **Review indipendente** (large/critical). Il revisore riceve il **diff effettivo** della modifica e chiude con `VERDICT: PASS | MINOR | MAJOR`.
+6. **Esito registrato** per l’apprendimento.
+
+Se il task fallisce ancora dopo le correzioni, l’estensione **non** passa da sola a un modello più potente: di solito la causa è la guida (ambiguità, un dettaglio mancante), e deve correggerla il supervisore.
+
+## Apprendimento
+
+L’estensione non riaddestra i modelli, ma impara dai **propri risultati**. I dati stanno in `data/learning.json`: sono locali, non versionati e comuni a tutte le sessioni.
+
+**Calibrazione dell’effort dei worker** (per profilo e modello):
+
+- ogni delega registra se i test sono passati al primo colpo, quanti giri di correzione sono serviti e il verdetto della review;
+- se la qualità scende sotto 0,7 su almeno 4 deleghe, l’effort **sale** di un livello (es. Sonnet `high` → `xhigh`);
+- scende di un livello solo dopo **20 successi consecutivi al primo colpo, verificati da test reali**, al massimo un livello sotto `config.json`, e **mai** nei profili large/critical: la qualità viene prima dei token;
+- dopo ogni cambio servono prove nuove (nessuna oscillazione); se modifichi `config.json`, il valore nuovo diventa la base.
+
+**Lezioni del repository:** il supervisore registra con `record_lesson` le insidie specifiche e ricorrenti, per esempio *"eseguire `npm run build` prima di `npm test`"*. Da quel momento entrano nel prompt di ogni worker in quel repository (massimo 15; le duplicate rafforzano quella esistente).
+
+**Suggerimento sul profilo:** se in un repository i task `medium` richiedono spesso correzioni, `plan_task` lo segnala e suggerisce il profilo superiore.
+
+`/SupervisedCoding learning` mostra statistiche, efforts calibrati e lezioni. Con `learning forget <id>` si toglie una lezione, con `learning reset` si azzera tutto.
 
 ## Profili: modello ed effort per ogni situazione
 
@@ -35,7 +68,7 @@ Dopo `on` basta descrivere il task. Per ogni nuovo task il supervisore:
 | small | modifica locale o meccanica | medium | Sonnet 5 medium → Gemini → Opus 5.5 low | no |
 | medium | lavoro normale, multi-file | medium | Sonnet 5 high → Opus 5.5 medium → Gemini | no |
 | large | architettura, debugging difficile | high | Opus 5.5 high → Sonnet 5 xhigh → Gemini | Claude read-only, modello diverso |
-| critical | sicurezza, concorrenza, migrazioni, complessità eccezionale | xhigh | **Fable 5.1 xhigh** (con autorizzazione) → Opus 5.5 xhigh → Gemini → Sonnet 5 max | famiglia diversa (Gemini), poi Claude |
+| critical | sicurezza, concorrenza, migrazioni, complessità eccezionale | xhigh | **Fable 5.1 xhigh** (con autorizzazione) → Opus 5.5 xhigh → Gemini → Sonnet 5 max | famiglia diversa: Gemini via API (poi CLI), poi Claude |
 
 - L’effort del supervisore segue il profilo del task aperto e torna a `medium` quando non c’è un task.
 - Per una singola delega il supervisore può alzare o abbassare l’effort del worker (`effort`) quando quella modifica specifica lo richiede.
@@ -80,6 +113,7 @@ Non vengono mai usati modelli di punta per consultazioni o review.
 | `delegate_implementation` | implementazione tramite la catena del profilo, con failover e review automatica |
 | `consult_readonly` | parere read-only mirato (Claude di default, Gemini se richiesto o in fallback) |
 | `run_verification` | esegue un comando di test, typecheck, lint o build da `verificationCommands`; operatori shell rifiutati |
+| `record_lesson` | registra una lezione del repository per i worker futuri |
 | `supervisor_git` | ispezione Git read-only |
 | `request_git_commit`, `request_git_push` | con conferma umana; niente merge né force-push |
 
@@ -95,6 +129,10 @@ Non vengono mai usati modelli di punta per consultazioni o review.
 
 | Campo | Significato |
 |---|---|
+| `autoVerify`, `maxCorrectionRounds` | verifica automatica prima/dopo e giri di auto-correzione |
+| `reviewApi` | revisore via API di Pi (default Gemini 3.1 Pro): stessi risultati della CLI con una frazione dei token; `null` per disattivarlo |
+| `repoRulesFiles`, `maxDiffBytes` | file di regole passati ai worker, dimensione massima del diff nelle review |
+| `learning.enabled`, `learning.autoTuneEffort` | apprendimento e calibrazione automatica dell’effort |
 | `supervisorChain` | `{provider, model}` in ordine di preferenza; sono considerati solo i modelli con autenticazione in Pi |
 | `flagshipModels` | modelli di punta (solo critical, sempre con autorizzazione) |
 | `supervisorEffort` | effort del supervisore per profilo (`default` = nessun task aperto) |
@@ -113,7 +151,19 @@ Le sessioni create con il nome precedente (`codex-claude-supervisor`) mantengono
 
 ## File
 
-- `index.ts`: integrazione Pi (tool, comando, eventi, esecuzione worker, selezione supervisore, modelli di punta);
-- `lib.ts`: logica pura (classificazione errori, lettura limiti, stato provider, ranking);
-- `tests/lib.test.ts`: test (`node --test tests/lib.test.ts`) con i messaggi reali di Codex, Anthropic e Claude Code;
-- `config.json`, `README.md`.
+- `index.ts`: integrazione Pi (tool, comando, eventi, worker, verifica, review, selezione supervisore, modelli di punta);
+- `lib.ts`: classificazione errori, lettura limiti, stato provider, ranking;
+- `learning.ts`: esiti, calibrazione effort, lezioni, verdetti, estrazione comandi `VERIFY`;
+- `tests/`: test unitari e d’integrazione (CLI Claude/Gemini simulate, host Pi simulato, repository Git reali);
+- `data/learning.json`: dati di apprendimento (creato all’uso, escluso da Git).
+
+La cartella è un repository Git: ogni modifica è visibile con `git diff` e reversibile.
+
+## Test
+
+```bash
+node --test tests/lib.test.ts tests/learning.test.ts
+node --import ./tests/resolve-pi.mjs --test tests/integration.test.ts
+```
+
+I test d’integrazione non usano modelli reali e non costano nulla. Coprono failover con passaggio del diff, auto-correzione, fallimenti preesistenti, diff e verdetto nella review, revisore API, regole e lezioni, calibrazione dell’effort, riuso della sessione, domanda SI/No sui modelli di punta e cambio del supervisore.
