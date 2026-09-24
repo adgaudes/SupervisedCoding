@@ -131,3 +131,54 @@ export function formatOutline(file: string, source: string, maxEntries = 400): s
 	const body = entries.map((entry) => `${"  ".repeat(entry.depth + 1)}${String(entry.line).padStart(width)}-${String(entry.end).padEnd(width)}  ${entry.text}`);
 	return [header, ...body, ...(entries.length >= maxEntries ? [`  … more than ${maxEntries} declarations; outline a narrower path`] : [])].join("\n");
 }
+
+export interface ReferenceMatch {
+	file: string;
+	/** 1-based line. */
+	line: number;
+	text: string;
+}
+
+/** Short name of a declaration line: its identifier, a test's title, or a heading. */
+export function entryName(text: string): string {
+	const goMethod = /^func\s+\([^)]*\)\s*([\w$]+)/.exec(text);
+	if (goMethod) return goMethod[1];
+	const test = /^(?:test|it|describe|suite)(?:\.\w+)?\(\s*(["'`])(.*?)\1/.exec(text);
+	if (test) return `test "${test[2].slice(0, 40)}"`;
+	if (/^#{1,6}\s/.test(text)) return text.slice(0, 60);
+	const keyword = /\b(?:function\*?|class|interface|type|enum|namespace|module|def|fn|func|struct|trait|impl|mod|object|record|protocol|extension|const|let|var)\s+([\w$.]+)/.exec(text);
+	if (keyword) return keyword[1];
+	const call = /([\w$]+)\s*(?:<[^>]*>)?\(/.exec(text);
+	return call ? call[1] : text.slice(0, 40);
+}
+
+/**
+ * Where a symbol is used, grouped by file, each line with its innermost enclosing declaration: who uses it, not
+ * only where. `sources` holds the text of each file, for the enclosing declarations.
+ */
+export function formatReferences(symbol: string, matches: ReferenceMatch[], sources: Record<string, string | undefined>, maxMatches = 60): string {
+	const files = [...new Set(matches.map((match) => match.file))];
+	const header = `${symbol}: ${matches.length} reference${matches.length === 1 ? "" : "s"} in ${files.length} file${files.length === 1 ? "" : "s"}`;
+	if (!matches.length) return `${symbol}: no references`;
+	const shown = matches.slice(0, maxMatches);
+	const lines = [header];
+	const name = symbol.split(".").at(-1);
+	const width = String(Math.max(...shown.map((match) => match.line))).length;
+	for (const file of files) {
+		const inFile = shown.filter((match) => match.file === file);
+		if (!inFile.length) continue;
+		const source = sources[file];
+		const entries = source === undefined ? [] : outlineSource(file, source);
+		lines.push(`  ${file}`);
+		for (const match of inFile) {
+			const enclosing = entries.filter((entry) => entry.line <= match.line && match.line <= entry.end).at(-1);
+			const where = !enclosing ? "" : enclosing.line === match.line && entryName(enclosing.text) === name ? "declaration: " : `in ${entryName(enclosing.text)}: `;
+			lines.push(`    ${String(match.line).padStart(width)}  ${where}${match.text.trim().slice(0, 120)}`);
+		}
+	}
+	if (matches.length > shown.length) {
+		const rest = matches.slice(maxMatches);
+		lines.push(`  … ${rest.length} more in ${new Set(rest.map((match) => match.file)).size} file(s): pass narrower paths`);
+	}
+	return lines.join("\n");
+}

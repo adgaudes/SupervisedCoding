@@ -50,7 +50,7 @@ import {
 } from "./learning.ts";
 import { assessTask, routeWithEvidence, taskEffort, TASK_KINDS, type TaskAssessment } from "./routing.ts";
 import { checkpoint, changesSince, type Checkpoint } from "./changes.ts";
-import { formatOutline, outlineSupported } from "./outline.ts";
+import { formatOutline, formatReferences, outlineSupported, type ReferenceMatch } from "./outline.ts";
 
 const execFile = promisify(execFileCallback);
 const extensionDir = path.dirname(fileURLToPath(import.meta.url));
@@ -1379,6 +1379,32 @@ async function outlineFiles(cwd: string, paths: string[]): Promise<{ list: strin
 		}
 	}
 	return { list: list.slice(0, OUTLINE_MAX_FILES), missing, capped: list.length > OUTLINE_MAX_FILES };
+}
+
+/** Uses of each symbol, by whole-word name, in the files Git tracks or would track under the given paths. */
+async function findReferences(cwd: string, symbols: string[], paths: string[]): Promise<string> {
+	if (!(await gitStdout(cwd, ["rev-parse", "--show-toplevel"]))) throw new Error("References need a Git repository.");
+	const parts: string[] = [];
+	for (const raw of symbols) {
+		const symbol = raw.trim();
+		if (!/^[\w$]+(?:\.[\w$]+)*$/.test(symbol)) throw new Error(`Not a symbol name: ${raw}`);
+		// A qualified name (Store.add) is searched by its last part: calls rarely spell the qualifier.
+		const name = symbol.split(".").at(-1)!;
+		// Exit code 1 (no match) reads as no output.
+		const output = await gitStdout(cwd, ["-c", "core.quotepath=off", "--literal-pathspecs", "grep", "--untracked", "-I", "-n", "-z", "-w", "-F", "--no-color", "-e", name, "--", ...paths]);
+		const matches: ReferenceMatch[] = [];
+		for (const line of (output ?? "").split("\n").filter(Boolean)) {
+			const [file, number, ...text] = line.split("\0");
+			if (file && number) matches.push({ file: normalizeSupervisorPath(file), line: Number(number), text: text.join("\0") });
+		}
+		const sources: Record<string, string | undefined> = {};
+		for (const file of new Set(matches.slice(0, 60).map((match) => match.file))) {
+			if (!outlineSupported(file)) continue;
+			try { sources[file] = fs.readFileSync(path.join(cwd, file), "utf8"); } catch { /* Deleted meanwhile. */ }
+		}
+		parts.push(formatReferences(symbol, matches, sources));
+	}
+	return parts.join("\n\n");
 }
 
 function walkFiles(cwd: string, relative: string, depth = 0): string[] {
@@ -3080,12 +3106,18 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "code_outline",
 		label: "Code outline",
-		description: "Outline of source files without reading them: functions, classes, methods, types and tests (Markdown: headings) with their line ranges. Use it before reading a large or unfamiliar file, then read only the ranges you need (read with offset/limit). Directories list the supported files Git does not ignore. Deterministic, no model call; ranges are approximate for unconventionally formatted code.",
+		description: "Outline of source files without reading them: functions, classes, methods, types and tests (Markdown: headings) with their line ranges. Use it before reading a large or unfamiliar file, then read only the ranges you need (read with offset/limit). Directories list the supported files Git does not ignore. With references, it lists instead where each symbol is used, each line with the function or class that contains it (to judge a change's impact); paths then limit the search (default: the whole repository). Deterministic, no model call; ranges are approximate for unconventionally formatted code, references match by name.",
 		parameters: Type.Object({
-			paths: Type.Array(Type.String({ description: "Repository-relative file or directory" }), { minItems: 1, maxItems: 50 }),
+			paths: Type.Optional(Type.Array(Type.String({ description: "Repository-relative file or directory" }), { minItems: 1, maxItems: 50 })),
+			references: Type.Optional(Type.Array(Type.String({ description: "Symbol name, e.g. runCheck or Store.add" }), { minItems: 1, maxItems: 5 })),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			if (!enabled) throw new Error("SupervisedCoding is disabled. Run /SupervisedCoding on.");
+			if (params.references) {
+				const text = await findReferences(ctx.cwd, params.references, normalizeAllowedPaths(params.paths ?? ["."], true));
+				return { content: [{ type: "text", text: truncateUtf8(text, config.outputLimits.outlineBytes) }], details: { references: params.references } };
+			}
+			if (!params.paths) throw new Error("code_outline needs paths to outline, or references to look up.");
 			const files = await outlineFiles(ctx.cwd, normalizeAllowedPaths(params.paths, true));
 			const parts: string[] = [];
 			let bytes = 0;
@@ -3300,7 +3332,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it, or where a symbol is used), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
 				display: false,
 			},
 		};

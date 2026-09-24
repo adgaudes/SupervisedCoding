@@ -981,3 +981,26 @@ test("OUTLINE: code_outline lists declarations with line ranges, expands directo
 	assert.doesNotMatch(text, /generated|data\.json/);
 	await assert.rejects(host.call("code_outline", { paths: ["../outside"] }), /'\.\.'/);
 });
+
+test("OUTLINE: code_outline references list the uses of a symbol with their enclosing function, Git-ignored files excluded", async () => {
+	configure({}, {});
+	const repo = makeRepo({
+		".gitignore": "gen/\n",
+		"src/store.ts": "export class Store {\n\tadd(item: string): void {\n\t\tconsole.log(item);\n\t}\n}\n",
+		"src/app.ts": "import { Store } from \"./store.ts\";\n\nexport function main() {\n\tnew Store().add(\"x\");\n}\n",
+		"gen/copy.ts": "new Store().add(\"y\");\n",
+	});
+	fs.writeFileSync(path.join(repo, "src", "extra.ts"), "export const run = () => {\n\tnew Store().add(\"z\");\n};\n");
+	const host = makeHost(repo);
+	await host.on();
+	const text = (await host.call("code_outline", { references: ["Store.add"] })).content[0].text;
+	assert.match(text, /^Store\.add: 3 references in 3 files$/m);
+	assert.match(text, /src\/app\.ts\n +4 {2}in main: new Store\(\)\.add\("x"\);/);
+	assert.match(text, /src\/extra\.ts\n +2 {2}in run: /, "untracked files are searched");
+	assert.match(text, /src\/store\.ts\n +2 {2}declaration: add\(item: string\): void \{/);
+	assert.doesNotMatch(text, /gen\/copy\.ts/);
+	const scoped = (await host.call("code_outline", { references: ["Store"], paths: ["src/app.ts"] })).content[0].text;
+	assert.match(scoped, /^Store: 2 references in 1 file$/m);
+	await assert.rejects(host.call("code_outline", { references: ["--open-files-in-pager"] }), /Not a symbol name/);
+	await assert.rejects(host.call("code_outline", {}), /needs paths/);
+});

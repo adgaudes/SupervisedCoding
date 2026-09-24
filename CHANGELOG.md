@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
-- `code_outline`: a deterministic outline of source files (functions, classes, methods, types, tests; Markdown headings) with line ranges, so the supervisor reads only the ranges it needs. TypeScript/JavaScript, Python, Go, Rust, Java, Kotlin, C#, Swift, Ruby, PHP and Markdown; directories list the files Git does not ignore.
+- `code_outline`: a deterministic outline of source files (functions, classes, methods, types, tests; Markdown headings) with line ranges, so the supervisor reads only the ranges it needs. TypeScript/JavaScript, Python, Go, Rust, Java, Kotlin, C#, Swift, Ruby, PHP and Markdown; directories list the files Git does not ignore. With `references`, it lists where a symbol is used, each use with the function or class that contains it, to judge a change's impact (matched by name, like grep).
 - Check reuse (`reuseChecks`, on by default): within one prompt, a delegation's starting checks reuse the results of the checks that closed the previous delegation, or of `run_verification`, when the repository state is exactly the same (HEAD, index and the content of every changed or untracked file). Results are dropped whenever a worker starts, and reuse is off when the supervisor has a shell.
 
 ### Changed

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatOutline, outlineSource, outlineSupported } from "../outline.ts";
+import { entryName, formatOutline, formatReferences, outlineSource, outlineSupported } from "../outline.ts";
 
 const TS = `import {
 	helper,
@@ -83,4 +83,31 @@ test("formatOutline: header with the line count, unsupported types and files wit
 test("formatOutline: the entry cap is stated", () => {
 	const source = Array.from({ length: 5 }, (_, index) => `function f${index}() {}\n`).join("");
 	assert.match(formatOutline("many.ts", source, 3), /more than 3 declarations/);
+});
+
+test("entryName: identifiers, Go methods, tests and headings", () => {
+	assert.equal(entryName("export async function runCheck(ctx: Context): Promise<void>"), "runCheck");
+	assert.equal(entryName("func (r *Repo) Load(path string) error"), "Load");
+	assert.equal(entryName("add(item: string): void"), "add");
+	assert.equal(entryName(`test("adds an item", () =>`), `test "adds an item"`);
+	assert.equal(entryName("## Install"), "## Install");
+});
+
+test("formatReferences: each use with its enclosing declaration; the declaration itself is marked", () => {
+	const matches = [
+		{ file: "store.ts", line: 17, text: "\tadd(item: string): void {" },
+		{ file: "store.ts", line: 33, text: "\tnew Store().add(\"x\");" },
+		{ file: "notes.txt", line: 2, text: "call add first" },
+	];
+	const text = formatReferences("Store.add", matches, { "store.ts": TS });
+	assert.equal(text.split("\n")[0], "Store.add: 3 references in 2 files");
+	assert.match(text, /17 {2}declaration: add\(item: string\): void \{/);
+	assert.match(text, /33 {2}in test "adds an item": new Store\(\)\.add\("x"\);/);
+	assert.match(text, /notes\.txt\n +2 {2}call add first/);
+	assert.equal(formatReferences("gone", [], {}), "gone: no references");
+});
+
+test("formatReferences: matches beyond the cap are counted, not listed", () => {
+	const matches = Array.from({ length: 5 }, (_, index) => ({ file: `f${index}.txt`, line: 1, text: "x" }));
+	assert.match(formatReferences("x", matches, {}, 2), /… 3 more in 3 file\(s\)/);
 });

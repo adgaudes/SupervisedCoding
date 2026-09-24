@@ -194,7 +194,7 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `complete_task` | `accept` closes the task (after the whole-task review when needed); `pause` keeps it open for later. Both release the flagship supervisor and reset the effort |
 | `consult_readonly` | a focused read-only opinion from any model, or an audit of many files read in the consultant's context instead of the supervisor's (`purpose: audit`); `reviewer` (`claude` / `gpt`) picks the preferred family |
 | `run_verification` | one allowlisted test, typecheck, lint or build command not already covered by `VERIFY` |
-| `code_outline` | functions, classes, methods, types and tests of source files (headings for Markdown) with their line ranges, so the supervisor reads only the ranges it needs; deterministic, no model call |
+| `code_outline` | functions, classes, methods, types and tests of source files (headings for Markdown) with their line ranges, so the supervisor reads only the ranges it needs; with `references`, where a symbol is used and which function contains each use; deterministic, no model call |
 | `record_lesson` | a durable repository pitfall for future workers |
 | `supervisor_git` | read-only Git inspection |
 | `request_git_commit`, `request_git_push` | only with your confirmation |
@@ -453,7 +453,7 @@ Se scegli un modello a mano, la selezione del supervisore diventa `manual` (il f
 | `complete_task` | `accept` chiude il task (dopo la review complessiva quando serve); `pause` lo lascia aperto per dopo. Entrambi rilasciano il supervisore di punta e azzerano l'effort |
 | `consult_readonly` | un parere mirato in sola lettura da qualsiasi modello, oppure un audit di molti file letti nel contesto del consulente anziché in quello del supervisore (`purpose: audit`); `reviewer` (`claude` / `gpt`) sceglie la famiglia preferita |
 | `run_verification` | un comando autorizzato di test, typecheck, lint o build non già coperto da `VERIFY` |
-| `code_outline` | funzioni, classi, metodi, tipi e test dei file sorgente (titoli per il Markdown) con i loro intervalli di righe, così il supervisore legge solo gli intervalli che servono; deterministico, senza chiamate a modelli |
+| `code_outline` | funzioni, classi, metodi, tipi e test dei file sorgente (titoli per il Markdown) con i loro intervalli di righe, così il supervisore legge solo gli intervalli che servono; con `references`, dove è usato un simbolo e quale funzione contiene ogni uso; deterministico, senza chiamate a modelli |
 | `record_lesson` | un'insidia duratura del repository per i worker futuri |
 | `supervisor_git` | ispezione Git in sola lettura |
 | `request_git_commit`, `request_git_push` | solo con la tua conferma |
