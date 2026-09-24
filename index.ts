@@ -307,23 +307,23 @@ const EMPTY_METRICS: SupervisorMetrics = {
 const DEFAULT_WORKER_CHAINS: Record<ExecutionProfileName, WorkerCandidate[]> = {
 	small: [
 		{ worker: "claude", model: "claude-sonnet-5", effort: "medium" },
-		{ worker: "gemini", model: "" },
+		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "low" },
 	],
 	medium: [
 		{ worker: "claude", model: "claude-sonnet-5", effort: "high" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "medium" },
-		{ worker: "gemini", model: "" },
+		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 	],
 	large: [
 		{ worker: "claude", model: "claude-opus-5-5", effort: "high" },
 		{ worker: "claude", model: "claude-sonnet-5", effort: "xhigh" },
-		{ worker: "gemini", model: "" },
+		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 	],
 	critical: [
 		{ worker: "claude", model: "claude-fable-5-1", effort: "xhigh" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "xhigh" },
-		{ worker: "gemini", model: "" },
+		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 		{ worker: "claude", model: "claude-sonnet-5", effort: "max" },
 	],
 };
@@ -370,7 +370,7 @@ function loadConfig(): Config {
 	const flagshipModels = raw.flagshipModels ?? ["claude-fable-5-1", "claude-fable-5", "gpt-6-astra"];
 	const flagshipOutsideCritical = PROFILE_NAMES.filter((name) => name !== "critical" && workerChains[name].some((item) => flagshipModels.includes(item.model)));
 	if (flagshipOutsideCritical.length) throw new Error(`Flagship models are reserved for the critical profile; remove them from workerChains.${flagshipOutsideCritical.join(", ")} (${configPath}).`);
-	const headroom = raw.creditHeadroom ?? 0.9;
+	const headroom = raw.creditHeadroom ?? 0.97;
 	if (!(headroom > 0 && headroom <= 1)) throw new Error(`creditHeadroom must be in (0, 1] in ${configPath}.`);
 	const verificationCommands = raw.verificationCommands ?? [
 		"npm test", "npm run test", "npm run lint", "npm run typecheck", "npm run check", "npm run build",
@@ -1730,7 +1730,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			}
 		}
 		if (worker === "claude") return result;
-		const cli: WorkerCandidate[] = result.length ? result : [{ worker: "gemini", model: "" }];
+		const cli: WorkerCandidate[] = result.length ? result : [{ worker: "gemini", model: "gemini-3.1-pro-preview" }];
 		// Same model family through the API first (no CLI fixed overhead); the CLI stays as fallback and for large inputs.
 		return config.reviewApi ? [{ worker: "api", provider: config.reviewApi.provider, model: config.reviewApi.model }, ...cli] : cli;
 	}

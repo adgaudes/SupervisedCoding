@@ -99,7 +99,7 @@ Non vengono mai usati modelli di punta per consultazioni o review.
 | Supervisore Pi (Codex, Anthropic, Google) | header di limite nelle risposte + sonda minima all’attivazione |
 | Gemini CLI | solo dagli errori (nessuna API di saldo) |
 
-- I provider esauriti vengono saltati fino al reset (o per `exhaustedCooldownMinutes` se il reset non è noto); quelli oltre `creditHeadroom` (90%) passano in fondo alla coda.
+- I provider esauriti vengono saltati fino al reset (o per `exhaustedCooldownMinutes` se il reset non è noto); quelli oltre `creditHeadroom` (97%) passano in fondo alla coda. La soglia è alta di proposito: un task medio usa l’1–3% della finestra Claude e, se il limite arriva a metà lavoro, il failover passa il diff al worker successivo. Scansarsi troppo presto significa usare modelli più deboli e pagare token a consumo.
 - Il blocco ha la granularità giusta: un modello fuori piano blocca solo quel modello, un limite Opus solo Opus, un limite dell’account tutto il provider.
 - **Worker:** errore temporaneo → fino a 4 retry con attesa crescente; crediti, autenticazione o modello non disponibile → candidato successivo, con l’elenco dei file già modificati a metà; errore di coding → nessun cambio di modello, diagnosi del supervisore.
 - **Supervisore:** su errore di crediti l’estensione cambia modello (`pi.setModel`) e riprende il turno da sola con un messaggio `[SUPERVISOR FAILOVER]`. Se non resta nessun supervisore, propone di completare il task aperto con i worker.

@@ -50,7 +50,7 @@
       },
       {
         "worker": "gemini",
-        "model": ""
+        "model": "gemini-3.1-pro-preview"
       },
       {
         "worker": "claude",
@@ -71,7 +71,7 @@
       },
       {
         "worker": "gemini",
-        "model": ""
+        "model": "gemini-3.1-pro-preview"
       }
     ],
     "large": [
@@ -87,7 +87,7 @@
       },
       {
         "worker": "gemini",
-        "model": ""
+        "model": "gemini-3.1-pro-preview"
       }
     ],
     "critical": [
@@ -103,7 +103,7 @@
       },
       {
         "worker": "gemini",
-        "model": ""
+        "model": "gemini-3.1-pro-preview"
       },
       {
         "worker": "claude",
@@ -139,7 +139,7 @@
     "large": 400,
     "critical": 400
   },
-  "creditHeadroom": 0.9,
+  "creditHeadroom": 0.97,
   "exhaustedCooldownMinutes": 60,
   "unavailableCooldownMinutes": 1440,
   "transientRetryAttempts": 4,
