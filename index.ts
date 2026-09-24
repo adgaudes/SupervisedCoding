@@ -169,6 +169,28 @@ interface SupervisorMetrics {
 	apiReviews: number;
 	apiTokens: number;
 	apiCostUsd: number;
+	/** Worker/reviewer consumption per model in this conversation, keyed "<worker>:<model>". */
+	byModel: Record<string, ModelUsage>;
+	/** Tokens and cost per role (the supervisor is computed from the session itself). */
+	byRole: Record<string, { tokens: number; costUsd: number }>;
+	/** First utilization seen in this conversation per "<health key>|<window>", to show credits used. */
+	limitStart: Record<string, number>;
+	reviewVerdicts: Record<string, number>;
+	firstPassDelegations: number;
+	failedDelegations: number;
+}
+
+type UsageRole = "implement" | "correct" | "review" | "consult" | "probe";
+
+interface ModelUsage {
+	worker: string;
+	model: string;
+	runs: number;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	costUsd: number;
 }
 
 interface WorkerSession {
@@ -237,6 +259,11 @@ interface RunResult {
 	timedOut: boolean;
 }
 
+/** Fresh metrics: nested maps must never be shared between sessions (a spread copy would share them). */
+function freshMetrics(): SupervisorMetrics {
+	return { ...EMPTY_METRICS, byModel: {}, byRole: {}, limitStart: {}, reviewVerdicts: {} };
+}
+
 const EMPTY_METRICS: SupervisorMetrics = {
 	delegations: 0,
 	resumedDelegations: 0,
@@ -263,6 +290,12 @@ const EMPTY_METRICS: SupervisorMetrics = {
 	apiReviews: 0,
 	apiTokens: 0,
 	apiCostUsd: 0,
+	byModel: {},
+	byRole: {},
+	limitStart: {},
+	reviewVerdicts: {},
+	firstPassDelegations: 0,
+	failedDelegations: 0,
 };
 
 const DEFAULT_WORKER_CHAINS: Record<ExecutionProfileName, WorkerCandidate[]> = {
@@ -1102,7 +1135,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	const config = loadConfig();
 	let enabled = false;
 	let toolsBeforeSupervisor: string[] | undefined;
-	let metrics: SupervisorMetrics = { ...EMPTY_METRICS };
+	let metrics: SupervisorMetrics = freshMetrics();
 	let workerSession: WorkerSession | undefined;
 	let taskPacket: TaskPacket | undefined;
 	let health: HealthMap = {};
@@ -1158,7 +1191,17 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		ctx.ui.setStatus(STATE_TYPE, ctx.ui.theme.fg("accent", statusText(ctx)));
 	}
 
+	/** Remember the first utilization seen per limit window in this conversation (to show credits consumed). */
+	function noteLimitBaselines(): void {
+		for (const [key, item] of Object.entries(health)) {
+			for (const [window, data] of Object.entries(item.windows ?? {})) {
+				if (data.utilization !== undefined && metrics.limitStart[`${key}|${window}`] === undefined) metrics.limitStart[`${key}|${window}`] = data.utilization;
+			}
+		}
+	}
+
 	function persist(): void {
+		noteLimitBaselines();
 		pi.appendEntry(STATE_TYPE, { enabled, toolsBeforeSupervisor, metrics, workerSession, taskPacket, health, supervisorMode, supervisorFlagshipGrant } satisfies PersistedState);
 	}
 
@@ -1194,7 +1237,19 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		if (pi.getThinkingLevel() !== level) pi.setThinkingLevel(level);
 	}
 
-	function recordRun(result: RunResult): void {
+	function recordRun(result: RunResult, role: UsageRole): void {
+		const usage = result.usage;
+		const key = `${result.worker}:${result.model || "default"}`;
+		const entry = (metrics.byModel[key] ??= { worker: result.worker, model: result.model || "default", runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 });
+		entry.runs++;
+		entry.input += usage?.input ?? 0;
+		entry.output += usage?.output ?? 0;
+		entry.cacheRead += usage?.cacheRead ?? 0;
+		entry.cacheWrite += usage?.cacheWrite ?? 0;
+		entry.costUsd += result.costUsd;
+		const roleEntry = (metrics.byRole[role] ??= { tokens: 0, costUsd: 0 });
+		roleEntry.tokens += (usage?.input ?? 0) + (usage?.output ?? 0) + (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
+		roleEntry.costUsd += result.costUsd;
 		if (result.worker === "claude") {
 			metrics.claudeAttempts++;
 			metrics.costUsd += result.costUsd;
@@ -1305,7 +1360,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					? await runClaude(ctx.cwd, config, implementer, "edit", prompt, undefined, signal, minutes(config.workerTimeoutMinutes))
 					: await runGemini(ctx.cwd, config, implementer, prompt, "auto_edit", signal, minutes(config.workerTimeoutMinutes));
 			}
-			recordRun(result);
+			recordRun(result, "correct");
 			kind = runFailed(result) ? failureKindOf(result) : undefined;
 			if (kind !== "transient" || attempt >= config.transientRetryAttempts) break;
 			await waitForRetry(config.transientRetryDelayMs * 2 ** attempt, signal);
@@ -1351,6 +1406,88 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			"Remove a lesson: /SupervisedCoding learning forget <id> · clear everything: /SupervisedCoding learning reset",
 			`Data: ${learningPath}`,
 		].join("\n");
+	}
+
+	/**
+	 * Consumption and quality of this conversation, for the user only (ctx.ui.notify never reaches the model,
+	 * so these statistics cost no tokens).
+	 */
+	function usageReport(ctx: ExtensionContext): string[] {
+		const tokens = (item: { input: number; output: number; cacheRead: number; cacheWrite: number }) => item.input + item.output + item.cacheRead + item.cacheWrite;
+		const money = (value: number, estimated = false) => `${estimated ? "~" : ""}$${value.toFixed(value < 0.1 ? 3 : 2)}`;
+		const fmt = (value: number) => value.toLocaleString("en-US");
+
+		// Supervisor: straight from the session's assistant messages, per provider/model.
+		const supervisors = new Map<string, { turns: number; input: number; output: number; cacheRead: number; cacheWrite: number; costUsd: number }>();
+		for (const entry of ctx.sessionManager.getBranch() as Array<Record<string, any>>) {
+			const message = entry.type === "message" ? entry.message : undefined;
+			if (message?.role !== "assistant" || !message.usage) continue;
+			const key = `${message.provider}/${message.model}`;
+			const item = supervisors.get(key) ?? { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
+			item.turns++;
+			item.input += numberField(message.usage.input);
+			item.output += numberField(message.usage.output);
+			item.cacheRead += numberField(message.usage.cacheRead);
+			item.cacheWrite += numberField(message.usage.cacheWrite);
+			item.costUsd += numberField(message.usage.cost?.total);
+			supervisors.set(key, item);
+		}
+
+		// Workers and reviewers; the Gemini CLI reports no cost, so it is estimated from Pi's price list.
+		const estimate = (item: ModelUsage): { cost: number; estimated: boolean } => {
+			if (item.costUsd > 0 || item.worker !== "gemini") return { cost: item.costUsd, estimated: false };
+			const price = ctx.modelRegistry.find("google", item.model)?.cost;
+			if (!price) return { cost: 0, estimated: true };
+			return { cost: (item.input * price.input + item.output * price.output + item.cacheRead * price.cacheRead) / 1_000_000, estimated: true };
+		};
+		const workerRows = Object.values(metrics.byModel).sort((a, b) => tokens(b) - tokens(a));
+		const supervisorTotal = [...supervisors.values()].reduce((sum, item) => sum + tokens(item), 0);
+		const supervisorCost = [...supervisors.values()].reduce((sum, item) => sum + item.costUsd, 0);
+		const workerTotal = workerRows.reduce((sum, item) => sum + tokens(item), 0);
+		const workerCost = workerRows.reduce((sum, item) => sum + estimate(item).cost, 0);
+		const grand = supervisorTotal + workerTotal;
+		const pct = (value: number) => (grand > 0 ? `${Math.round((value / grand) * 100)}%` : "0%");
+		const row = (label: string, count: string, item: { input: number; output: number; cacheRead: number; cacheWrite: number }, cost: string) =>
+			`  ${label.padEnd(42)} ${count.padEnd(9)} ${fmt(tokens(item)).padStart(11)} tok (${pct(tokens(item)).padStart(4)})  in ${fmt(item.input)} · out ${fmt(item.output)} · cache ${fmt(item.cacheRead + item.cacheWrite)}  ${cost}`;
+
+		const lines: string[] = ["Consumption in this conversation:"];
+		lines.push(" Supervisor");
+		if (!supervisors.size) lines.push("  (no supervisor turns yet)");
+		for (const [key, item] of supervisors) lines.push(row(key, `${item.turns} turns`, item, money(item.costUsd)));
+		lines.push(" Workers and reviewers");
+		if (!workerRows.length) lines.push("  (no worker runs yet)");
+		for (const item of workerRows) {
+			const label = item.worker === "claude" ? `Claude ${item.model}` : item.worker === "api" ? `API ${item.model}` : `Gemini CLI ${item.model}`;
+			const { cost, estimated } = estimate(item);
+			lines.push(row(label, `${item.runs} run${item.runs === 1 ? "" : "s"}`, item, money(cost, estimated)));
+		}
+		lines.push(`  Total: ${fmt(grand)} tokens · ${money(supervisorCost + workerCost)} (supervisor ${pct(supervisorTotal)}, workers/reviewers ${pct(workerTotal)})`);
+
+		const roleNames: Record<string, string> = { implement: "implementation", correct: "self-correction", review: "independent review", consult: "consultation", probe: "credit probes" };
+		const roles = [`supervisor ${pct(supervisorTotal)}`, ...Object.entries(metrics.byRole).sort((a, b) => b[1].tokens - a[1].tokens).map(([role, item]) => `${roleNames[role] ?? role} ${pct(item.tokens)}`)];
+		lines.push(`By role: ${roles.join(" · ")}`);
+
+		const allInput = [...supervisors.values(), ...workerRows].reduce((sum, item) => sum + item.input + item.cacheRead + item.cacheWrite, 0);
+		const cached = [...supervisors.values(), ...workerRows].reduce((sum, item) => sum + item.cacheRead, 0);
+		if (allInput > 0) lines.push(`Prompt cache: ${Math.round((cached / allInput) * 100)}% of input tokens read from cache`);
+
+		const deltas: string[] = [];
+		for (const [key, start] of Object.entries(metrics.limitStart)) {
+			const [healthKey, window] = key.split("|");
+			const now = health[healthKey]?.windows?.[window]?.utilization;
+			if (now === undefined) continue;
+			const name = healthKey === "claude-cli" ? "Claude" : healthKey.startsWith("pi:") ? healthKey.slice(3) : healthKey;
+			deltas.push(`${name} ${window.replace(/_/g, " ")} ${Math.round(start * 100)}% → ${Math.round(now * 100)}% (+${Math.max(0, Math.round((now - start) * 100))})`);
+		}
+		lines.push(`Subscription limits used in this conversation: ${deltas.length ? deltas.join(" · ") : "no readings yet (/SupervisedCoding credits refresh)"}`);
+
+		const verdicts = Object.entries(metrics.reviewVerdicts).map(([verdict, count]) => `${verdict.toUpperCase()} ${count}`).join(", ");
+		const completed = metrics.delegations - metrics.failedDelegations;
+		lines.push(`Quality: ${metrics.delegations} delegations (${completed} completed, ${metrics.failedDelegations} failed) · ${metrics.autoVerifiedDelegations} auto-verified, ${metrics.firstPassDelegations} green at the first attempt, ${metrics.correctionRounds} correction rounds · reviews: ${verdicts || "none"}`);
+		lines.push(`Routing: failovers workers ${metrics.providerFailovers}, supervisor ${metrics.supervisorFailovers} · flagship asked ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved) · consultations ${metrics.readOnlyConsultations} · resumed sessions ${metrics.resumedDelegations} · checks run ${metrics.verifications}`);
+		if (completed > 0) lines.push(`Average per completed delegation: ${fmt(Math.round(grand / completed))} tokens · ${money((supervisorCost + workerCost) / completed)}`);
+		lines.push("Costs are API-equivalent: on subscriptions (Claude Code, Codex) the real cost is the plan usage shown above; ~ = estimated from Pi's price list.");
+		return lines;
 	}
 
 	/** Every Claude candidate with a configured effort is a calibration target. */
@@ -1425,7 +1562,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					const geminiPrompt = `${handoff ? `${handoff}\n\n` : ""}${basePrompt}\n\n[GEMINI WORKER NOTES]\nEdit only the allowlisted paths and preserve pre-existing changes. Never stage, commit, push, merge, change branches, or rewrite Git history. If shell tools are unavailable in this mode, do not claim checks passed: list the exact verification commands the supervisor must run.`;
 					result = await runGemini(ctx.cwd, config, candidate, geminiPrompt, "auto_edit", signal, minutes(config.workerTimeoutMinutes));
 				}
-				recordRun(result);
+				recordRun(result, "implement");
 				usage.push(result.usage);
 				kind = runFailed(result) ? failureKindOf(result) : undefined;
 				if (kind !== "transient" || attempt >= config.transientRetryAttempts) break;
@@ -1461,7 +1598,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	}
 
 	/** Read-only consultation with failover across reviewers; any working-tree mutation is reported as a violation. */
-	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; requireVerdict?: boolean } = {}): Promise<ConsultOutcome> {
+	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; requireVerdict?: boolean; role?: UsageRole } = {}): Promise<ConsultOutcome> {
 		const { usable, blocked } = rankCandidates(order, workerHealthKeys, health, config.creditHeadroom);
 		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: "skipped: exhausted" }));
 		const usage: Array<Usage | undefined> = [];
@@ -1492,7 +1629,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					: candidate.worker === "api"
 						? await runApiReview(ctx, candidate, config.reviewApi?.reasoning ?? "high", prompt, material ?? "", signal, minutes(config.consultTimeoutMinutes))
 						: await runGemini(ctx.cwd, config, candidate, prompt, "plan", signal, minutes(config.consultTimeoutMinutes));
-				recordRun(result);
+				recordRun(result, options.role ?? "consult");
 				usage.push(result.usage);
 				kind = runFailed(result) ? failureKindOf(result) : undefined;
 				if (kind !== "transient" || attempt >= config.transientRetryAttempts) break;
@@ -1666,7 +1803,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const candidate: WorkerCandidate = { worker: "claude", model: config.claudeProbeModel, effort: "low" };
 		try {
 			const result = await runClaude(ctx.cwd, config, candidate, "probe", "Reply with exactly: OK", undefined, undefined, 120_000);
-			recordRun(result);
+			recordRun(result, "probe");
 			const kind = runFailed(result) ? failureKindOf(result) : undefined;
 			recordWorkerHealth(candidate, result, kind);
 			const item = health[claudeLimitKey(result.limitInfo, candidate.model)];
@@ -1728,7 +1865,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			let report = `External recovery by ${outcome.finalCandidate ? candidateLabel(outcome.finalCandidate) : "no worker"} ${outcome.failed ? "failed" : "completed"}:\n${outcome.primaryOutput}`;
 			const usage = [...outcome.usage];
 			if (!outcome.failed && outcome.finalCandidate) {
-				const review = await runConsultation(ctx, reviewOrder(outcome.finalCandidate, "critical"), "[INDEPENDENT READ-ONLY CODE REVIEW]", `Task: ${taskPacket.objective}\nInspect the working-tree diff for correctness bugs, missed requirements and regressions.`, allowedPaths, ctx.signal);
+				const review = await runConsultation(ctx, reviewOrder(outcome.finalCandidate, "critical"), "[INDEPENDENT READ-ONLY CODE REVIEW]", `Task: ${taskPacket.objective}\nLook for correctness bugs, missed requirements and regressions.`, allowedPaths, ctx.signal, { diff: await scopedDiff(ctx.cwd, allowedPaths, config.maxDiffBytes), requireVerdict: true, role: "review" });
 				usage.push(...review.usage);
 				report += `\n\nIndependent review (${review.reviewer ?? "unavailable"}):\n${review.text}`;
 			}
@@ -1988,7 +2125,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					updateTaskPacket({ phase: "reviewing" });
 					const question = `Task: ${params.task}\nAcceptance criteria:\n${criteria.length ? criteria.map((item) => `- ${item}`).join("\n") : "- Satisfy the authorized task and repository requirements."}\n${verificationText ? `\nAutomatic checks: ${verification}.\n` : ""}\nLook for correctness bugs, missed requirements, regressions, unsafe behavior, type/API problems, and inadequate tests. If no material defect is found, say so explicitly and list residual risks.`;
 					const diff = await scopedDiff(ctx.cwd, allowedPaths, config.maxDiffBytes);
-					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, allowedPaths, signal, { diff, requireVerdict: true });
+					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, allowedPaths, signal, { diff, requireVerdict: true, role: "review" });
 					usage.push(...review.usage);
 					reviewVerdict = review.verdict;
 					reviewText = review.reviewer && !review.failed
@@ -1999,6 +2136,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 				const combined = combineUsage(usage);
 				const learningNotes = await learnFromDelegation(ctx, { implementer, final, profileName, verification, correctionRounds, reviewVerdict, failed, combined });
+				if (verification === "passed") metrics.firstPassDelegations++;
+				if (failed) metrics.failedDelegations++;
+				if (reviewVerdict !== "none") metrics.reviewVerdicts[reviewVerdict] = (metrics.reviewVerdicts[reviewVerdict] ?? 0) + 1;
 				persist();
 				updateStatus(ctx);
 				const usageLine = combined ? `Combined tokens: ${combined.input} in + ${combined.output} out + ${combined.cacheRead} cache-read; reported cost $${combined.cost.total.toFixed(2)}` : "Usage unavailable";
@@ -2199,31 +2339,11 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				ctx.ui.notify(await learningReport(ctx), "info");
 				return;
 			}
-			const claudeTokens = metrics.inputTokens + metrics.outputTokens + metrics.cacheReadTokens + metrics.cacheWriteTokens;
-			const geminiTokens = metrics.geminiInputTokens + metrics.geminiOutputTokens + metrics.geminiCachedTokens;
-			let supervisorTokens = 0;
-			let supervisorCost = 0;
-			for (const entry of ctx.sessionManager.getBranch() as Array<Record<string, any>>) {
-				const message = entry.type === "message" ? entry.message : undefined;
-				if (message?.role !== "assistant") continue;
-				supervisorTokens += numberField(message.usage?.input) + numberField(message.usage?.output) + numberField(message.usage?.cacheRead) + numberField(message.usage?.cacheWrite);
-				supervisorCost += numberField(message.usage?.cost?.total);
-			}
-			const total = supervisorTokens + claudeTokens + geminiTokens;
-			const share = (tokens: number) => (total > 0 ? Math.round((tokens / total) * 100) : 0);
 			ctx.ui.notify([
 				`${EXTENSION_NAME}: ${enabled ? "ON" : "OFF"} · supervisor ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"} (${supervisorMode}, effort ${pi.getThinkingLevel()})`,
-				`Default worker chain (${config.defaultExecutionProfile}): ${config.workerChains[config.defaultExecutionProfile].map(candidateLabel).join(" → ")}`,
-				`Implementations: ${metrics.delegations} (${metrics.resumedDelegations} resumed) · read-only consultations: ${metrics.readOnlyConsultations}`,
-				`Claude runs: ${metrics.claudeAttempts} · Gemini runs: ${metrics.geminiCalls} (${metrics.geminiFallbacks} as fallback implementer)`,
-				`Failovers: workers ${metrics.providerFailovers} · supervisor ${metrics.supervisorFailovers} · verifications run: ${metrics.verifications}`,
-				`Flagship requests: ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved)${supervisorFlagshipGrant && openTask()?.id === supervisorFlagshipGrant.taskId ? ` · flagship supervisor active: ${supervisorFlagshipGrant.provider}/${supervisorFlagshipGrant.model}` : ""}`,
-				`Supervisor model: ${supervisorTokens.toLocaleString()} tokens (${share(supervisorTokens)}%), $${supervisorCost.toFixed(2)}`,
-				`Claude: ${claudeTokens.toLocaleString()} tokens (${share(claudeTokens)}%), $${metrics.costUsd.toFixed(2)}`,
-				`Gemini: ${geminiTokens.toLocaleString()} tokens (${share(geminiTokens)}%) · API reviews: ${metrics.apiReviews} (${metrics.apiTokens.toLocaleString()} tokens, $${metrics.apiCostUsd.toFixed(2)})`,
-				`Automatic verification: ${metrics.autoVerifiedDelegations} delegations, ${metrics.correctionRounds} correction rounds`,
-				`Task: ${taskPacket ? `${taskPacket.phase} · ${taskPacket.profile} · ${taskPacket.id}${taskPacket.flagshipDecisions && Object.keys(taskPacket.flagshipDecisions).length ? ` · flagship answers: ${Object.entries(taskPacket.flagshipDecisions).map(([model, yes]) => `${model}=${yes ? FLAGSHIP_YES : FLAGSHIP_NO}`).join(", ")}` : ""}` : "none"}`,
-				`Git review read: ${metrics.gitInspectionBytes.toLocaleString()} bytes · worker continuation: ${workerSession ? "yes" : "no"}`,
+				`Task: ${taskPacket ? `${taskPacket.phase} · ${taskPacket.profile} · ${taskPacket.id}${taskPacket.flagshipDecisions && Object.keys(taskPacket.flagshipDecisions).length ? ` · flagship answers: ${Object.entries(taskPacket.flagshipDecisions).map(([model, yes]) => `${model}=${yes ? FLAGSHIP_YES : FLAGSHIP_NO}`).join(", ")}` : ""}` : "none"} · worker continuation: ${workerSession ? "yes" : "no"}`,
+				"",
+				...usageReport(ctx),
 				"",
 				creditsReport(ctx),
 				`Config: ${configPath}`,
@@ -2325,7 +2445,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			.pop() as { data?: PersistedState } | undefined;
 		enabled = saved?.data?.enabled ?? false;
 		toolsBeforeSupervisor = saved?.data?.toolsBeforeSupervisor;
-		metrics = { ...EMPTY_METRICS, ...saved?.data?.metrics };
+		const savedMetrics = saved?.data?.metrics;
+		metrics = { ...freshMetrics(), ...savedMetrics, byModel: { ...savedMetrics?.byModel }, byRole: { ...savedMetrics?.byRole }, limitStart: { ...savedMetrics?.limitStart }, reviewVerdicts: { ...savedMetrics?.reviewVerdicts } };
 		workerSession = saved?.data?.workerSession;
 		taskPacket = saved?.data?.taskPacket;
 		health = saved?.data?.health ?? {};
