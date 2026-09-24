@@ -18,7 +18,8 @@ export interface OutcomeRecord {
 	evidenceVersion?: 2;
 	taskKind?: string;
 	accepted?: boolean;
-	failureDomain?: "provider" | "quality";
+	/** provider = credits/outage; budget = stopped by the extension's own turn/time/cost limits; neither measures quality. */
+	failureDomain?: "provider" | "quality" | "budget";
 	at: number;
 	repo: string;
 	taskId: string;
@@ -117,7 +118,7 @@ export async function updateLearning(file: string, mutate: (state: LearningState
  * (no checks and no review): such outcomes must not move the calibration either way.
  */
 export function outcomeQuality(outcome: OutcomeRecord): number | undefined {
-	if (outcome.failureDomain === "provider") return undefined;
+	if (outcome.failureDomain === "provider" || outcome.failureDomain === "budget") return undefined;
 	if (outcome.failed || outcome.verification === "failed" || outcome.review === "major") return 0;
 	if ((outcome.verification === "unverified" || outcome.verification === "unchanged_failures") && outcome.review === "none") return undefined;
 	let quality = 1;
@@ -162,10 +163,24 @@ export function tuningKey(target: { profile: string; model: string; repo?: strin
 	return target.repo ? JSON.stringify([target.repo, target.kind ?? "general", target.profile, target.model]) : `${target.profile}|${target.model}`;
 }
 
+/** Group outcomes by task, in order of each task's latest delegation: delegations of one task are correlated. */
+function byTask(outcomes: OutcomeRecord[]): OutcomeRecord[][] {
+	const tasks = new Map<string, OutcomeRecord[]>();
+	for (const item of outcomes) {
+		const list = tasks.get(item.taskId) ?? [];
+		tasks.delete(item.taskId);
+		tasks.set(item.taskId, [...list, item]);
+	}
+	return [...tasks.values()];
+}
+
 /**
  * Recompute effort adjustments. Evidence is counted only at the currently effective effort, so every change
  * needs fresh evidence (natural hysteresis). Raising is quick when quality suffers; lowering is slow, one step
  * at most below config.json, and only for low-risk profiles, because quality always wins over tokens.
+ * With a repository, one task is one sample and counts with its worst delegation: a failure the supervisor
+ * repaired with another delegation is still a failure. Raising looks at every task kind of the repository
+ * (a weak model needs help at once); lowering needs evidence for the specific kind.
  */
 export function tuneEfforts(state: LearningState, targets: TuningTarget[], rules: TuningRules = DEFAULT_TUNING, now = Date.now()): string[] {
 	const changes: string[] = [];
@@ -180,17 +195,18 @@ export function tuneEfforts(state: LearningState, targets: TuningTarget[], rules
 		const current = state.effortAdjustments[key]?.effort ?? target.configured;
 		const adjustment = state.effortAdjustments[key];
 		const evidence = state.outcomes.filter(item => item.profile === target.profile && item.model === target.model && (item.effort ?? target.configured) === current
-			&& (!target.repo || (item.repo === target.repo && (item.taskKind ?? "general") === (target.kind ?? "general") && item.evidenceVersion === 2))
+			&& (!target.repo || (item.repo === target.repo && item.evidenceVersion === 2))
 			&& (!adjustment || (item.sequence !== undefined && adjustment.cursor !== undefined ? item.sequence > adjustment.cursor : item.at > adjustment.since))
 			&& now - item.at <= 90 * 86400_000);
-		// Multiple delegations of one task are correlated; one task supplies at most one sample.
-		const distinct = target.repo ? [...new Map(evidence.map(item => [item.taskId, item])).values()] : evidence;
-		const samples = distinct
-			.map((item) => ({ item, quality: outcomeQuality(item) }))
-			.filter((entry): entry is { item: OutcomeRecord; quality: number } => entry.quality !== undefined)
-			.slice(-rules.window);
+		// Without a repository (legacy callers) every outcome is its own sample.
+		const tasks = target.repo ? byTask(evidence) : evidence.map((item) => [item]);
+		const worst = (items: OutcomeRecord[]) => {
+			const scores = items.map(outcomeQuality).filter((value): value is number => value !== undefined);
+			return scores.length ? Math.min(...scores) : undefined;
+		};
+		const samples = tasks.map(worst).filter((quality): quality is number => quality !== undefined).slice(-rules.window);
 		if (samples.length >= rules.raiseMinSamples) {
-			const mean = samples.reduce((sum, entry) => sum + entry.quality, 0) / samples.length;
+			const mean = samples.reduce((sum, quality) => sum + quality, 0) / samples.length;
 			if (mean < rules.raiseBelowQuality && current !== "max") {
 				const next = step(current, 1);
 				state.effortAdjustments[key] = { effort: next, configured: target.configured, reason: `mean quality ${mean.toFixed(2)} over ${samples.length} tasks at ${current}`, since: now, cursor: state.sequence ?? 0 };
@@ -198,9 +214,10 @@ export function tuneEfforts(state: LearningState, targets: TuningTarget[], rules
 				continue;
 			}
 		}
-		const streak = distinct.slice(-rules.lowerMinSamples);
+		const sameKind = target.repo ? tasks.filter((items) => items.every((item) => (item.taskKind ?? "general") === (target.kind ?? "general"))) : tasks;
+		const streak = sameKind.slice(-rules.lowerMinSamples);
 		const canLower = rules.lowerProfiles.includes(target.profile) && current !== "low" && EFFORT_LEVELS.indexOf(current) > EFFORT_LEVELS.indexOf(target.configured) - 1;
-		if (canLower && streak.length >= rules.lowerMinSamples && streak.every((item) => item.verification === "passed" && outcomeQuality(item) === 1 && (!target.repo || item.accepted === true))) {
+		if (canLower && streak.length >= rules.lowerMinSamples && streak.every((items) => items.every((item) => item.verification === "passed" && outcomeQuality(item) === 1 && (!target.repo || item.accepted === true)))) {
 			const next = step(current, -1);
 			state.effortAdjustments[key] = { effort: next, configured: target.configured, reason: `${streak.length} consecutive accepted first-pass successes at ${current}`, since: now, cursor: state.sequence ?? 0 };
 			changes.push(`${target.profile}/${target.model}: effort ${current} → ${next} (${streak.length} verified first-pass successes)`);
@@ -283,23 +300,23 @@ export function lessonsFor(state: LearningState, repo: string, limit = MAX_LESSO
 		.slice(0, limit);
 }
 
-export function markLessonsUsed(lessons: Lesson[], now = Date.now()): void {
-	for (const lesson of lessons) {
-		lesson.uses++;
-		lesson.lastUsedAt = now;
-	}
-}
-
 export function removeLesson(state: LearningState, id: string): boolean {
 	const before = state.lessons.length;
 	state.lessons = state.lessons.filter((item) => item.id !== id);
 	return state.lessons.length !== before;
 }
 
-/** Reviewers end with "VERDICT: PASS|MINOR|MAJOR"; anything else counts as no usable verdict. */
+/**
+ * Reviewers end with "VERDICT: PASS|MINOR|MAJOR". The verdict line must be one of the last three non-empty lines
+ * (a closing remark after it is tolerated); a verdict buried in the body counts as no usable verdict.
+ */
 export function parseVerdict(text: string): ReviewVerdict {
-	const match = /^\s*\**VERDICT\s*[:=]\s*\**\s*(PASS|MINOR|MAJOR)\b[^\n]*$/i.exec(text.trim().split(/\r?\n/).at(-1) ?? "");
-	return match ? (match[1].toLowerCase() as ReviewVerdict) : "none";
+	const tail = text.trim().split(/\r?\n/).filter((line) => line.trim()).slice(-3).reverse();
+	for (const line of tail) {
+		const match = /^\s*\**VERDICT\s*[:=]\s*\**\s*(PASS|MINOR|MAJOR)\b[^\n]*$/i.exec(line);
+		if (match) return match[1].toLowerCase() as ReviewVerdict;
+	}
+	return "none";
 }
 
 /**

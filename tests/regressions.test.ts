@@ -277,15 +277,29 @@ test("a resumed correction receives only the correction, not the guide and diff 
 	assert.doesNotMatch(correction.prompt, /FILE GUIDE|\[CURRENT WORK\]/);
 });
 
-test("AUDIT A10: workers get the profile's turn limit, and reaching it stops the chain with work preserved", async () => {
-	const fake = path.join(root, "maxturns-claude.mjs");
-	fs.writeFileSync(fake, FAKE_CLAUDE.replace('if (step.action === "credits") {', 'if (step.action === "maxturns") { emit({ type: "result", subtype: "error_max_turns", is_error: true, session_id: sessionId, usage }); process.exit(1); }\nif (step.action === "credits") {'));
-	configure({ workerCommandArgs: [fake] }, { "claude-sonnet-5": [{ action: "maxturns", write: { "a.txt": "partial" } }] });
+function scriptedClaude(name: string, actions: string): string {
+	const file = path.join(root, `${name}.mjs`);
+	fs.writeFileSync(file, FAKE_CLAUDE.replace('if (step.action === "credits") {', `${actions}\nif (step.action === "credits") {`));
+	return file;
+}
+const MAXTURNS = 'if (step.action === "maxturns") { emit({ type: "result", subtype: "error_max_turns", is_error: true, session_id: sessionId, usage }); process.exit(1); }';
+
+test("AUDIT A10 / AUDIT-2 B3: the turn limit stops the chain, keeps work and session, and the same session resumes", async () => {
+	configure({ workerCommandArgs: [scriptedClaude("maxturns-claude", MAXTURNS)] }, { "claude-sonnet-5": [{ action: "maxturns", write: { "a.txt": "partial" } }, { write: { "a.txt": "done" } }] });
 	const host = makeHost(makeRepo({ "a.txt": "old" }));
 	await host.on();
-	await assert.rejects(host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) }), /execution budget reached/);
-	assert.deepEqual(calls().map((call) => [call.model, call.maxTurns]), [["claude-sonnet-5", String(baseConfig.workerMaxTurns.medium)]]);
+	const stopped = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(stopped.isError, true);
+	assert.match(stopped.details.limitReached, /turn limit/);
+	assert.equal(stopped.details.sessionPreserved, true);
+	assert.match(stopped.content[0].text, /STOPPED: worker turn limit/);
+	assert.deepEqual(calls().map((call) => [call.model, call.maxTurns]), [["claude-sonnet-5", String(baseConfig.workerMaxTurns.medium)]], "no failover to another model");
 	assert.equal(fs.readFileSync(path.join(host.ctx.cwd, "a.txt"), "utf8"), "partial");
+	const resumed = await host.call("delegate_implementation", { task: "finish", continuePrevious: true, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(resumed.isError, false);
+	assert.ok(calls()[1].resume, "the session that hit the limit continues");
+	const outcomes = JSON.parse(fs.readFileSync(dataFile, "utf8")).outcomes;
+	assert.equal(outcomes[0].failed, true, "hitting the turn limit is recorded as a difficulty signal");
 });
 
 test("zero timeouts mean no limit, not an immediate kill", async () => {
@@ -366,5 +380,192 @@ test("a task planned in one prompt keeps its profile and identity when delegated
 	assert.equal(result.details.profile, "large");
 	assert.equal(result.details.taskPacketId, planned.details.taskId);
 	assert.equal(calls()[0].model, baseConfig.workerChains.large[0].model);
+});
+
+// ── Second audit (AUDIT-2.md) ──────────────────────────────────────────────────────────────────────
+
+import { parseVerdict } from "../learning.ts";
+
+test("AUDIT-2 B1: a regression left by an earlier delegation stays a regression of the task and blocks acceptance", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { write: { "other.txt": "x\n" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(first.details.verification, "failed");
+	// A new prompt: the failed task carries over, so even a delegation without continuePrevious keeps its baseline.
+	await host.handlers.get("before_agent_start")({ prompt: "Go on" }, host.ctx);
+	const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["value.txt", "other.txt"], implementationGuide: guide(["value.txt", "other.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(second.details.taskPacketId, first.details.taskPacketId);
+	assert.equal(second.details.verification, "failed");
+	assert.match(second.content[0].text, /FAIL \(regression\)/);
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "Checks were already failing before the change." }), /cannot be accepted/);
+});
+
+test("AUDIT-2 B2: a task counts with its worst delegation, for raising and for lowering", () => {
+	const base = { evidenceVersion: 2 as const, taskKind: "general", at: Date.now(), repo: "r", profile: "medium", worker: "claude", model: "m", effort: "high", correctionRounds: 0, review: "none" as const, tokens: 0, costUsd: 0 };
+	const target = { profile: "medium", model: "m", configured: "high" as const, repo: "r", kind: "general" };
+	const raising = emptyLearning();
+	for (let i = 0; i < 4; i++) {
+		recordOutcome(raising, { ...base, taskId: `t${i}`, verification: "failed", failed: true });
+		recordOutcome(raising, { ...base, taskId: `t${i}`, verification: "passed", failed: false });
+	}
+	assert.equal(tuneEfforts(raising, [target]).length, 1, "tasks repaired by a second delegation still raise effort");
+	const lowering = emptyLearning();
+	for (let i = 0; i < 20; i++) {
+		recordOutcome(lowering, { ...base, taskId: `t${i}`, verification: "unverified", failed: false, accepted: true });
+		recordOutcome(lowering, { ...base, taskId: `t${i}`, verification: "passed", failed: false, accepted: true });
+	}
+	assert.deepEqual(tuneEfforts(lowering, [target]), [], "lowering needs every delegation of every task verified green at the first attempt");
+});
+
+test("AUDIT-2 B4: the delegation time limit never kills a running worker", async () => {
+	configure({ workerCommandArgs: [scriptedClaude("slow-claude", 'if (step.action === "slow") { await new Promise((resolve) => setTimeout(resolve, 2000)); }')], delegationTimeoutMinutes: 0.01 }, { "claude-sonnet-5": [{ action: "slow", write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(fs.readFileSync(path.join(host.ctx.cwd, "a.txt"), "utf8"), "done");
+});
+
+test("AUDIT-2 B4: past the time limit, no correction round or review starts, and the session is kept", async () => {
+	configure({ workerCommandArgs: [scriptedClaude("slow-claude-2", 'if (step.action === "slow") { await new Promise((resolve) => setTimeout(resolve, 1500)); }')], delegationTimeoutMinutes: 0.01, independentReviewProfiles: ["medium"] }, { "claude-sonnet-5": [{ action: "slow", write: { "value.txt": "bad" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(calls().length, 1, "no correction round after the limit");
+	assert.match(result.details.limitReached, /delegation time limit/);
+	assert.equal(result.details.sessionPreserved, true);
+	assert.match(result.content[0].text, /No further correction round/);
+});
+
+test("AUDIT-2 B5: a reviewer that fails without a provider error hands over to the next reviewer, with the profile's turn limit", async () => {
+	configure({ workerCommandArgs: [scriptedClaude("review-maxturns", MAXTURNS)], independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "claude-sonnet-5": [{ action: "maxturns" }], "gemini-3.1-pro-preview": [{ text: "No defect.\nVERDICT: PASS" }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "large", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.details.reviewVerdict, "pass");
+	assert.equal(calls().find((call) => call.model === "claude-sonnet-5")?.maxTurns, String(baseConfig.workerMaxTurns.large));
+	assert.ok(calls().some((call) => call.cli === "gemini"));
+});
+
+test("AUDIT-2 B6: the default configuration does not switch supervisor models around a small task", async () => {
+	assert.deepEqual(baseConfig.supervisorProfiles ?? {}, {}, "per-profile supervisors switch models mid-task; opt in only after measuring");
+	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }, { provider: "google", model: "gemini-3.8-flash" }] }, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await host.handlers.get("before_agent_start")({ prompt: "Fix a.txt" }, host.ctx);
+	const before = host.notifications.length;
+	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change." });
+	assert.deepEqual(host.notifications.slice(before).filter((text) => text.startsWith("Supervisor model:")), []);
+});
+
+test("AUDIT-2 B6: complete_task never switches the supervisor before the final answer", async () => {
+	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }], supervisorProfiles: { small: [{ provider: "google", model: "gemini-3.8-flash" }] } }, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await host.handlers.get("before_agent_start")({ prompt: "Fix a.txt" }, host.ctx);
+	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(host.ctx.model.id, "gemini-3.8-flash", "the configured small-task supervisor");
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change." });
+	assert.equal(host.ctx.model.id, "gemini-3.8-flash");
+	await host.handlers.get("before_agent_start")({ prompt: "Something else" }, host.ctx);
+	assert.equal(host.ctx.model.id, "gpt-5.5", "the next prompt selects the general supervisor");
+});
+
+test("AUDIT-2 B6: an unfinished critical task keeps its approved supervisor into the next prompt", async () => {
+	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }, { provider: "google", model: "gemini-3.8-flash" }], flagshipModels: ["gpt-5.5"] }, {});
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	host.setAnswer("SI");
+	await host.on();
+	await host.handlers.get("before_agent_start")({ prompt: "Plan the critical change" }, host.ctx);
+	await host.call("plan_task", { task: "critical change", profile: "critical", rationale: "test" });
+	assert.equal(host.ctx.model.id, "gpt-5.5");
+	const before = host.notifications.length;
+	await host.handlers.get("before_agent_start")({ prompt: "Yes, go ahead" }, host.ctx);
+	assert.equal(host.ctx.model.id, "gpt-5.5");
+	assert.deepEqual(host.notifications.slice(before).filter((text) => text.startsWith("Supervisor model:")), []);
+	assert.equal(host.questions.length, 1, "approved once for the whole task");
+});
+
+test("AUDIT-2 B7: accepting a multi-delegation task reviews the whole task, and a MAJOR finding blocks it", async () => {
+	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1"] }, {
+		"claude-opus-5-5": [{ write: { "a.txt": "one\n" } }, { text: "The two steps conflict.\nVERDICT: MAJOR" }],
+		"claude-sonnet-5": [{ text: "Step fine.\nVERDICT: PASS" }, { write: { "b.txt": "two\n" } }],
+	});
+	const host = makeHost(makeRepo({ "a.txt": "old\n" }));
+	await host.on();
+	const first = await host.call("delegate_implementation", { task: "step one", profile: "large", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(first.details.reviewVerdict, "pass");
+	const second = await host.call("delegate_implementation", { task: "step two", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]) });
+	assert.equal(second.details.reviewVerdict, "none", "a medium step gets no review of its own");
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "Both steps reviewed by me." });
+	assert.equal(accepted.isError, true);
+	assert.match(accepted.content[0].text, /whole task found material defects/);
+	const review = calls().at(-1)!;
+	assert.equal(review.model, "claude-opus-5-5");
+	assert.match(review.prompt, /OF THE WHOLE TASK[\s\S]*\+one[\s\S]*\+two|OF THE WHOLE TASK[\s\S]*\+two[\s\S]*\+one/);
+	assert.equal(host.ctx.auditState.taskPacket.phase, "failed");
+});
+
+test("AUDIT-2 B8: after a correction failover the outcome is credited to the model that did the work", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { action: "credits" }], "claude-opus-5-5": [{ write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	const outcomes = JSON.parse(fs.readFileSync(dataFile, "utf8")).outcomes;
+	assert.deepEqual(outcomes.map((item: { model: string; verification: string }) => [item.model, item.verification]), [["claude-sonnet-5", "fixed"]]);
+});
+
+test("AUDIT-2 B9: poor quality across task kinds raises effort for a new kind", () => {
+	const state = emptyLearning();
+	const base = { evidenceVersion: 2 as const, at: Date.now(), repo: "r", profile: "medium", worker: "claude", model: "m", effort: "high", verification: "failed" as const, correctionRounds: 0, review: "none" as const, failed: true, tokens: 0, costUsd: 0 };
+	["feature", "bugfix", "docs", "tests"].forEach((kind, i) => recordOutcome(state, { ...base, taskKind: kind, taskId: `t${i}` }));
+	assert.equal(tuneEfforts(state, [{ profile: "medium", model: "m", configured: "high", repo: "r", kind: "refactor" }]).length, 1);
+	assert.equal(effectiveEffort(state, "medium", "m", "high", "r", "refactor"), "xhigh");
+});
+
+test("AUDIT-2 B10: the implementer's own model reviews only after the other family", async () => {
+	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "claude-sonnet-5": [{ action: "credits" }], "gemini-3.1-pro-preview": [{ text: "Fine.\nVERDICT: PASS" }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "large", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.details.reviewVerdict, "pass");
+	assert.deepEqual(calls().map((call) => call.model), ["claude-opus-5-5", "claude-sonnet-5", "gemini-3.1-pro-preview"]);
+});
+
+test("AUDIT-2 B11: run_verification never reopens an accepted task, nor fails a task for a check red since its start", async () => {
+	const broken = `import test from "node:test";\nimport assert from "node:assert";\ntest("x", () => assert.fail("unrelated"));\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old", "broken.test.mjs": broken }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], ["node --test broken.test.mjs"]) });
+	await host.call("run_verification", { command: "node --test broken.test.mjs" });
+	assert.equal(host.ctx.auditState.taskPacket.phase, "implemented", "red since the task started");
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change." });
+	await host.call("run_verification", { command: "node --test broken.test.mjs" });
+	assert.equal(host.ctx.auditState.taskPacket.phase, "completed");
+});
+
+test("AUDIT-2 B12: an unavailable model keeps its full cooldown during a delegation", async () => {
+	configure({ workerCommandArgs: [scriptedClaude("unavailable-claude", 'if (step.action === "unavailable") { emit({ type: "result", is_error: true, result: "model not found: " + model, session_id: sessionId, usage }); process.exit(1); }')] }, { "claude-sonnet-5": [{ action: "unavailable" }], "claude-opus-5-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	const blocked = host.ctx.auditState.health["claude-cli:model:claude-sonnet-5"];
+	assert.ok(blocked.blockedUntil - Date.now() > (baseConfig.unavailableCooldownMinutes - 5) * 60_000);
+});
+
+test("AUDIT-2 B13: a closing remark after the verdict line is tolerated; a verdict inside the body is not", () => {
+	assert.equal(parseVerdict("Findings...\nVERDICT: MINOR\nThanks for the clear guide."), "minor");
+	assert.equal(parseVerdict("VERDICT: PASS\nline one\nline two\nline three"), "none");
+});
+
+test("AUDIT-2 B13: instruction files along the authorized paths reach the worker", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "pkg/lib/x.txt": "new" } }] });
+	const host = makeHost(makeRepo({ "AGENTS.md": "Root rule.\n", "pkg/AGENTS.md": "Package rule: keep exports sorted.\n", "pkg/lib/x.txt": "old" }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["pkg/lib/x.txt"], implementationGuide: guide(["pkg/lib/x.txt"]) });
+	assert.match(calls()[0].prompt, /REPOSITORY RULES[\s\S]*Root rule[\s\S]*Package rule: keep exports sorted/);
 });
 

@@ -203,7 +203,7 @@ test("a check that was already failing is reported but not blamed on the worker"
 	assert.equal(result.isError, false);
 	assert.equal(result.details.verification, "unchanged_failures");
 	assert.equal(result.details.correctionRounds, 0);
-	assert.match(result.content[0].text, /was already failing before the change/);
+	assert.match(result.content[0].text, /was already failing before this task/);
 	assert.equal(calls().length, 1, "no correction round for a pre-existing failure");
 });
 

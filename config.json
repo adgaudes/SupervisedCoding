@@ -255,26 +255,15 @@
     "request_git_push"
   ],
   "maxOutputBytes": 51200,
-  "supervisorProfiles": {
-    "small": [
-      {
-        "provider": "openai-codex",
-        "model": "gpt-6-sol"
-      },
-      {
-        "provider": "openai-codex",
-        "model": "gpt-5.5"
-      }
-    ]
-  },
+  "supervisorProfiles": {},
   "probeTtlMinutes": 15,
   "probeMaxTokens": 128,
   "reviewMaxTokens": 8192,
   "workerMaxTurns": {
-    "small": 30,
-    "medium": 60,
-    "large": 100,
-    "critical": 120
+    "small": 40,
+    "medium": 80,
+    "large": 120,
+    "critical": 160
   },
   "delegationTimeoutMinutes": 120,
   "delegationBudgetUsd": 0,

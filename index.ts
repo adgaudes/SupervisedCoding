@@ -64,6 +64,8 @@ const CUSTOM_TOOLS = new Set(["plan_task", "complete_task", "consult_readonly", 
 const PROFILE_NAMES = ["small", "medium", "large", "critical"] as const;
 const WORKER_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const MAX_STORED_REPORT_CHARS = 8000;
+/** data/usage.jsonl rotates to usage.jsonl.1 beyond this size, so the invocation log stays bounded. */
+const USAGE_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const FLAGSHIP_YES = "SI";
 const FLAGSHIP_NO = "No";
 /** Shell metacharacters that could chain or redirect commands in run_verification. */
@@ -246,6 +248,17 @@ interface TaskPacket {
 	promptSeq?: number;
 	/** User answers to "use flagship model X?" for this task, keyed by model id; asked at most once per task. */
 	flagshipDecisions?: Record<string, boolean>;
+	/** Result of each VERIFY command when the task started: a check the task turned red is its regression. */
+	baseline?: Record<string, boolean>;
+	delegationCount?: number;
+	/** Strongest profile of any delegation of the task: review requirements follow it. */
+	maxProfile?: ExecutionProfileName;
+	/** What the last independent review covered: the whole task, or only the last delegation. */
+	reviewScope?: "task" | "delegation";
+	/** Implementer of the last delegation, so a task-level review can pick independent reviewers. */
+	implementer?: WorkerCandidate;
+	/** Paused with complete_task: it stops carrying its supervisor and effort into new prompts. */
+	paused?: boolean;
 	updatedAt: number;
 }
 
@@ -289,6 +302,10 @@ interface RunResult {
 	/** How the run is paid: a subscription (plan usage) or a pay-per-use API key. */
 	billing?: Billing;
 	timedOut: boolean;
+	/** The CLI stopped at the turn or cost limit the extension passed (--max-turns, --max-budget-usd). */
+	limitHit?: "turns" | "budget";
+	/** The output was cut off (e.g. an API review at its token limit): it is not a complete answer. */
+	incomplete?: boolean;
 }
 
 /** Fresh metrics: nested maps must never be shared between sessions (a spread copy would share them). */
@@ -406,7 +423,7 @@ function loadConfig(): Config {
 	for (const candidate of Object.values(workerChains).flat()) if (candidate.effort && !WORKER_EFFORTS.includes(candidate.effort)) throw new Error(`Invalid effort for ${candidate.model}.`);
 	if (raw.reviewApi && flagshipModels.includes(raw.reviewApi.model)) throw new Error("Flagship models cannot be used for API reviews.");
 	if (flagshipModels.includes(raw.claudeProbeModel ?? "claude-haiku-4-5")) throw new Error("Flagship models cannot be used for probes.");
-	const workerMaxTurns = { small: 30, medium: 60, large: 100, critical: 120, ...raw.workerMaxTurns };
+	const workerMaxTurns = { small: 40, medium: 80, large: 120, critical: 160, ...raw.workerMaxTurns };
 	if (Object.values(workerMaxTurns).some(n => !Number.isInteger(n) || n < 1 || n > 1000)) throw new Error("workerMaxTurns must contain integers between 1 and 1000.");
 	if (!Number.isInteger(raw.learning?.minModelSamples ?? 20) || (raw.learning?.minModelSamples ?? 20) < 20) throw new Error("learning.minModelSamples must be an integer >= 20.");
 	const flagshipOutsideCritical = PROFILE_NAMES.filter((name) => name !== "critical" && workerChains[name].some((item) => flagshipModels.includes(item.model)));
@@ -688,10 +705,36 @@ function handoffNote(previous: string, kind: FailureKind, partialFiles: string[]
 	return `[HANDOFF] The previous worker (${previous}) stopped because of a provider failure (${kind}), not because of the task. It partially edited: ${partialFiles.join(", ")}. Its changes are below: keep what is correct, fix what is incomplete, and finish the task.\n\n${diff}`;
 }
 
-/** Instruction files at the working directory and the Git root, capped so they never dominate the prompt. */
-function readRepoRules(cwd: string, gitRoot: string | undefined, files: string[], maxBytes = 12_000): string {
-	const dirs = [...new Set([cwd, gitRoot].filter((item): item is string => Boolean(item)).map((item) => path.resolve(item)))];
+/**
+ * Directories whose instruction files apply to a delegation: the Git root, the working directory and every
+ * directory from the root down to each authorized path (nested AGENTS.md/CLAUDE.md refine the root ones).
+ */
+function ruleDirs(cwd: string, gitRoot: string | undefined, allowedPaths: string[]): string[] {
+	const root = path.resolve(gitRoot ?? cwd);
+	const dirs = [root, path.resolve(cwd)];
+	for (const item of allowedPaths) {
+		let dir = path.resolve(cwd, item);
+		try {
+			if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir);
+		} catch {
+			dir = path.dirname(dir); // Not created yet: its parent directory's rules apply.
+		}
+		const chain: string[] = [];
+		for (let current = dir; ; current = path.dirname(current)) {
+			const relative = path.relative(root, current);
+			if (relative.startsWith("..") || path.isAbsolute(relative)) break;
+			chain.unshift(current);
+			if (!relative) break;
+		}
+		dirs.push(...chain);
+	}
+	return [...new Set(dirs)];
+}
+
+/** Instruction files of the given directories, capped so they never dominate the prompt; omissions are reported. */
+function readRepoRules(cwd: string, dirs: string[], files: string[], maxBytes = 12_000): string {
 	const parts: string[] = [];
+	const omitted: string[] = [];
 	let total = 0;
 	for (const dir of dirs) {
 		for (const name of files) {
@@ -700,16 +743,21 @@ function readRepoRules(cwd: string, gitRoot: string | undefined, files: string[]
 				if (!fs.statSync(file).isFile()) continue;
 				const text = fs.readFileSync(file, "utf8").trim();
 				if (!text) continue;
+				const label = path.relative(cwd, file) || name;
 				const remaining = maxBytes - total;
-				if (remaining <= 200) break;
+				if (remaining <= 200) {
+					omitted.push(label);
+					continue;
+				}
 				const clipped = truncateUtf8(text, remaining);
-				parts.push(`[${path.relative(cwd, file) || name}]\n${clipped}`);
+				parts.push(`[${label}]\n${clipped}`);
 				total += Buffer.byteLength(clipped, "utf8");
 			} catch {
 				// Missing instruction files are normal.
 			}
 		}
 	}
+	if (omitted.length) parts.push(`[Rules omitted for size: ${omitted.join(", ")}. Read them before editing files they govern.]`);
 	return parts.join("\n\n");
 }
 
@@ -953,6 +1001,7 @@ async function runClaude(
 	let limit: LimitReading | undefined;
 	let limitInfo: Record<string, any> | undefined;
 	let billing: Billing = "unknown";
+	let limitHit: RunResult["limitHit"];
 	const outcome = await runProcess(resolveClaudeCommand(config.workerCommand), [...config.workerCommandArgs, ...claudeArgs(config, candidate, mode, resumeSessionId)], prompt, cwd, signal, timeoutMs, (line) => {
 		if (!line.trim()) return;
 		let event: Record<string, any>;
@@ -985,6 +1034,8 @@ async function runClaude(
 			usage = usageFromClaude(event, costUsd);
 			if (typeof event.api_error_status === "number") httpStatus = event.api_error_status;
 			if (event.is_error) errorMessage = String(event.result || event.api_error || event.subtype || "Claude Code reported an error.");
+			if (event.subtype === "error_max_turns") limitHit = "turns";
+			else if (event.subtype === "error_max_budget_usd") limitHit = "budget";
 		}
 	}, { maxBytes: config.maxProcessOutputBytes });
 	if (outcome.aborted) { errorMessage = "Claude Code worker aborted."; stopReason = "aborted"; }
@@ -1007,6 +1058,7 @@ async function runClaude(
 		limitInfo,
 		billing,
 		timedOut: outcome.timedOut,
+		limitHit,
 	};
 }
 
@@ -1043,6 +1095,13 @@ async function runGemini(cwd: string, config: Config, candidate: WorkerCandidate
 
 function runFailed(result: RunResult): boolean {
 	return result.exitCode !== 0 || Boolean(result.errorMessage) || result.timedOut;
+}
+
+/** The turn/cost limit the extension itself imposed stopped the run (structured subtype, else the error text). */
+function executionLimit(result: RunResult): string | undefined {
+	const text = runFailed(result) ? result.errorMessage ?? "" : "";
+	const limit = result.limitHit ?? (/max[_ -]?turns|turn limit/i.test(text) ? "turns" : /max[_ -]?budget|budget limit/i.test(text) ? "budget" : undefined);
+	return limit === "turns" ? "worker turn limit (--max-turns)" : limit === "budget" ? "worker cost limit (--max-budget-usd)" : undefined;
 }
 
 /** A hung process that produced nothing never got going (auth prompt, dead endpoint): treat as provider-side. */
@@ -1141,11 +1200,12 @@ async function runApiReview(ctx: ExtensionContext, candidate: WorkerCandidate, r
 		const content = `${prompt}\n\nFILES (current content)\n${material || "(none)"}`;
 		const message = await ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content, timestamp: Date.now() }] }, { reasoning: reasoning === "off" ? undefined : reasoning, signal: controller.signal, maxTokens }).result();
 		const text = message.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n").trim();
-		// A truncated review is not a provider failure: the appended last line voids any verdict, so the next reviewer runs.
-		const output = message.stopReason === "length" ? `${text}\n[Review output limit reached; review is incomplete.]` : text;
+		// A truncated review is not a provider failure, but it is no verdict either: the next reviewer runs.
+		const incomplete = message.stopReason === "length";
+		const output = incomplete ? `${text}\n[Review output limit reached; review is incomplete.]` : text;
 		const errorMessage = message.stopReason === "error" || message.stopReason === "aborted" ? message.errorMessage ?? (timedOut ? `API review timed out after ${Math.round(timeoutMs / 60_000)} minutes.` : "API review failed.") : undefined;
 		const billing: Billing = ctx.modelRegistry.isUsingOAuth(model) ? "subscription" : "api";
-		return { ...base, exitCode: errorMessage ? 1 : 0, output, errorMessage, costUsd: numberField(message.usage?.cost?.total), usage: message.usage, signal: { text: errorMessage ?? "" }, timedOut, turns: output ? 1 : 0, billing };
+		return { ...base, exitCode: errorMessage ? 1 : 0, output, errorMessage, costUsd: numberField(message.usage?.cost?.total), usage: message.usage, signal: { text: errorMessage ?? "" }, timedOut, turns: output ? 1 : 0, billing, incomplete };
 	} catch (error) {
 		return { ...base, exitCode: 1, output: "", costUsd: 0, timedOut, turns: 0, errorMessage: String(error), signal: { text: String(error) } };
 	} finally {
@@ -1214,6 +1274,8 @@ interface ImplementationOutcome {
 	after: GitSnapshot;
 	scopeViolations: string[];
 	resumed: boolean;
+	/** The worker stopped at an execution limit (turns, cost, delegation time); its session and edits are kept. */
+	limitReached?: string;
 }
 
 interface ConsultOutcome {
@@ -1264,6 +1326,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	let supervisorFlagshipGrant: FlagshipGrant | undefined;
 	/** Incremented per user prompt: delegations of one prompt form one task unless plan_task/continuePrevious say otherwise. */
 	let promptSeq = 0;
+	/** An unfinished task that keeps its supervisor model and effort into the current prompt (see drivesThisPrompt). */
+	let carriedTaskId: string | undefined;
 	let delegationRunning = false;
 	let activeBudget: { spent: number; deadline: number } | undefined;
 	let unknownUsageRuns = 0;
@@ -1292,23 +1356,27 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 	}
 
-	async function repoContextFor(cwd: string): Promise<string> {
+	async function repoContextFor(cwd: string, allowedPaths: string[]): Promise<string> {
 		learning = loadLearning(learningPath);
-		const rules = readRepoRules(cwd, await gitRoot(cwd), config.repoRulesFiles);
+		const rules = readRepoRules(cwd, ruleDirs(cwd, await gitRoot(cwd), allowedPaths), config.repoRulesFiles);
 		const lessons = config.learning.enabled ? lessonsFor(learning, await repoKey(cwd)).map((item) => item.text) : [];
 		return buildRepoContext(rules, lessons);
 	}
 
 	const cooldownMs = () => config.exhaustedCooldownMinutes * 60_000;
-	const minutes = (value: number) => {
-		const own = value > 0 ? value * 60_000 : 0;
-		if (!activeBudget) return own;
-		const remaining = activeBudget.deadline - Date.now();
-		if (remaining <= 0 || (config.delegationBudgetUsd > 0 && activeBudget.spent >= config.delegationBudgetUsd)) throw new Error("Delegation budget reached. Work is preserved; supervisor must assess before continuing.");
-		// 0 means "no timeout" to runProcess; an infinite value would overflow setTimeout and fire at once.
-		const bounded = Math.min(own || Infinity, remaining);
-		return Number.isFinite(bounded) ? bounded : 0;
-	};
+	/** Minutes → milliseconds; 0 stays 0 ("no timeout" for runProcess). */
+	const minutes = (value: number) => (value > 0 ? value * 60_000 : 0);
+
+	/**
+	 * The delegation's cumulative time/cost limit. It is checked only between phases (before an attempt, a correction
+	 * round or the review): a running worker is never killed for it, so its session stays resumable.
+	 */
+	function budgetExceeded(): string | undefined {
+		if (!activeBudget) return undefined;
+		if (Date.now() >= activeBudget.deadline) return `delegation time limit (${config.delegationTimeoutMinutes} min)`;
+		if (config.delegationBudgetUsd > 0 && activeBudget.spent >= config.delegationBudgetUsd) return `delegation cost limit ($${config.delegationBudgetUsd})`;
+		return undefined;
+	}
 
 	function statusText(ctx: ExtensionContext): string {
 		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
@@ -1339,6 +1407,19 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return taskPacket && taskPacket.phase !== "completed" ? taskPacket : undefined;
 	}
 
+	/**
+	 * Whether a task sets supervisor model and effort in the current prompt: it was created or continued in this
+	 * prompt, or it was left unfinished (planned, failed, interrupted) when the prompt started. A task that is
+	 * implemented but not accepted, or paused, does not carry over: an unrelated request must start conservatively.
+	 */
+	function drivesThisPrompt(task: TaskPacket | undefined): boolean {
+		return Boolean(task && (task.promptSeq === promptSeq || task.id === carriedTaskId));
+	}
+
+	function carriesOver(task: TaskPacket | undefined): boolean {
+		return Boolean(task && !task.paused && ["planned", "failed", "implementing", "reviewing"].includes(task.phase));
+	}
+
 	function isFlagship(model: string): boolean {
 		return config.flagshipModels.includes(model);
 	}
@@ -1363,16 +1444,21 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	/** Supervisor reasoning effort follows the open task's profile; without a task it drops back to the default. */
 	function applySupervisorEffort(profile?: ExecutionProfileName): void {
 		const current = openTask();
-		const level = config.supervisorEffort[profile ?? (current?.promptSeq === promptSeq ? current.profile : "default")] ?? config.supervisorEffort.default;
+		const level = config.supervisorEffort[profile ?? (drivesThisPrompt(current) ? current!.profile : "default")] ?? config.supervisorEffort.default;
 		if (pi.getThinkingLevel() !== level) pi.setThinkingLevel(level);
 	}
 
 	function recordRun(result: RunResult, role: UsageRole): void {
 		if (activeBudget) activeBudget.spent += result.costUsd;
-		if (!result.usage) unknownUsageRuns++;
+		// Only invocations that ran count: a candidate that never started (missing model, spawn error) consumed nothing.
+		if (!result.usage && (result.turns > 0 || result.output || result.timedOut)) unknownUsageRuns++;
 		try {
+			const usageLog = path.join(path.dirname(learningPath), "usage.jsonl");
 			fs.mkdirSync(path.dirname(learningPath), { recursive: true });
-			fs.appendFileSync(path.join(path.dirname(learningPath), "usage.jsonl"), JSON.stringify({ at: Date.now(), taskId: taskPacket?.id, role, worker: result.worker, provider: result.provider, model: result.model, billing: result.billing ?? "unknown", usage: result.usage, modelUsages: result.modelUsages, costUsd: result.costUsd, measured: Boolean(result.usage), failed: runFailed(result), timedOut: result.timedOut }) + "\n");
+			try {
+				if (fs.statSync(usageLog).size > USAGE_LOG_MAX_BYTES) fs.renameSync(usageLog, `${usageLog}.1`);
+			} catch { /* No log yet. */ }
+			fs.appendFileSync(usageLog, JSON.stringify({ at: Date.now(), taskId: taskPacket?.id, role, worker: result.worker, provider: result.provider, model: result.model, billing: result.billing ?? "unknown", usage: result.usage, modelUsages: result.modelUsages, costUsd: result.costUsd, measured: Boolean(result.usage), failed: runFailed(result), timedOut: result.timedOut }) + "\n");
 		} catch { /* Telemetry must never stop implementation. */ }
 		for (const part of result.modelUsages ?? [{ model: result.model, usage: result.usage, costUsd: result.costUsd }]) recordModelRun({ ...result, ...part }, role);
 		if (result.worker === "gemini" && result.modelUsages) metrics.geminiCalls -= Math.max(0, result.modelUsages.length - 1);
@@ -1474,7 +1560,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 	function formatChecks(checks: CheckResult[], baseline: Map<string, boolean>, rounds: number, verification: VerificationResult, notes: string[]): string {
 		const lines = checks.map((check) => {
-			const state = check.ok ? "pass" : baseline.get(check.command) === false ? "FAIL (was already failing before the change)" : "FAIL (regression)";
+			const state = check.ok ? "pass" : baseline.get(check.command) === false ? "FAIL (was already failing before this task)" : "FAIL (regression)";
 			return `- ${check.command}: ${state}`;
 		});
 		const failing = checks.filter((check) => !check.ok).map((check) => `$ ${check.command}\n${check.timedOut ? "timed out" : `exit code ${check.exitCode}`}\n${truncateUtf8Tail(check.output, 4000)}`);
@@ -1656,7 +1742,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	 * Record the outcome of a delegation and recalibrate effort. Delegations that never reached a worker for
 	 * provider reasons carry no quality signal and are not recorded.
 	 */
-	async function learnFromDelegation(ctx: ExtensionContext, data: { implementer: WorkerCandidate; final: RunResult; profileName: ExecutionProfileName; verification: VerificationResult; correctionRounds: number; reviewVerdict: ReviewVerdict; failed: boolean; providerFailure?: boolean; combined?: Usage }): Promise<string[]> {
+	async function learnFromDelegation(ctx: ExtensionContext, data: { implementer: WorkerCandidate; final: RunResult; profileName: ExecutionProfileName; verification: VerificationResult; correctionRounds: number; reviewVerdict: ReviewVerdict; failed: boolean; providerFailure?: boolean; budgetStop?: boolean; combined?: Usage }): Promise<string[]> {
 		if (!config.learning.enabled) return [];
 		if (runFailed(data.final) && FAILOVER_KINDS.has(failureKindOf(data.final))) return [];
 		const repo = await repoKey(ctx.cwd);
@@ -1666,7 +1752,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			evidenceVersion: 2,
 			taskKind: taskPacket?.assessment?.kind ?? "general",
 			accepted: false,
-			failureDomain: data.providerFailure ? "provider" : "quality",
+			failureDomain: data.providerFailure ? "provider" : data.budgetStop ? "budget" : "quality",
 			at: Date.now(),
 			repo,
 			taskId: taskPacket?.id ?? "",
@@ -1710,6 +1796,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		let resumed = false;
 		let resumeAvailable = Boolean(spec.resumeSessionId);
 		let providerFailureSeen = false;
+		let limitReached: string | undefined;
 		for (const { candidate: configured } of usable) {
 			const currentAvailability = availability(health, workerHealthKeys(configured), config.creditHeadroom);
 			if (currentAvailability.state === "blocked") { attempts.push({ label: candidateLabel(configured), ok: false, detail: "skipped: account became unavailable during this chain" }); continue; }
@@ -1730,8 +1817,11 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			}
 			let result: RunResult | undefined;
 			let kind: FailureKind | undefined;
+			let stoppedBy: string | undefined;
 			for (let attempt = 0; attempt <= config.transientRetryAttempts; attempt++) {
-				minutes(config.workerTimeoutMinutes); // Check the cumulative budget before every paid attempt.
+				// The cumulative delegation budget is checked before every paid attempt, never during one.
+				stoppedBy = budgetExceeded();
+				if (stoppedBy) break;
 				if (activeBudget && config.delegationBudgetUsd > 0) candidate.maxBudgetUsd = Math.max(0.001, config.delegationBudgetUsd - activeBudget.spent);
 				if (candidate.worker === "claude") {
 					result = await runClaude(ctx.cwd, config, candidate, "edit", `${handoff ? `${handoff}\n\n` : ""}${basePrompt}`, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
@@ -1742,7 +1832,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				recordRun(result, spec.role ?? "implement");
 				usage.push(result.usage);
 				if (signal?.aborted) throw new Error("Operation aborted; partial work was preserved.");
-				if (/max[_ -]?(turns|budget)|budget limit|error_max_turns|turn limit exceeded/i.test(result.errorMessage ?? "")) throw new Error("Worker execution budget reached; partial work was preserved.");
+				stoppedBy = executionLimit(result);
+				if (stoppedBy) break;
 				kind = runFailed(result) ? failureKindOf(result) : undefined;
 				if (kind !== "transient" || attempt >= config.transientRetryAttempts) break;
 				if (result.sessionId) {
@@ -1755,7 +1846,14 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				}
 				await waitForRetry(config.transientRetryDelayMs * 2 ** attempt, signal);
 			}
-			if (!result) continue;
+			if (!result) {
+				// The budget ran out before this candidate could start: stop the chain, keep whatever came before.
+				if (stoppedBy) {
+					limitReached = stoppedBy;
+					break;
+				}
+				continue;
+			}
 			if (resumeId) {
 				resumed = true;
 				resumeAvailable = false;
@@ -1763,6 +1861,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			recordWorkerHealth(candidate, result, kind);
 			final = result;
 			finalCandidate = candidate;
+			if (stoppedBy) {
+				// An execution limit is neither a provider failure nor a verdict on the code: no failover, session kept.
+				limitReached = stoppedBy;
+				attempts.push({ label, ok: false, detail: `stopped: ${stoppedBy}` });
+				break;
+			}
 			attempts.push({ label, ok: !kind, kind, detail: kind ? (result.errorMessage || result.stderr).trim().slice(0, 300) : undefined });
 			if (!kind) break;
 			// Coding/test/context failures must be diagnosed by the supervisor, never hidden by switching models.
@@ -1773,19 +1877,23 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const partial = filesChangedBetween(before, now).filter((file) => pathInAllowedScope(file, spec.allowedPaths));
 			handoff = handoffNote(label, kind, partial, partial.length ? spec.checkpoint ? (await changesSince(ctx.cwd, spec.allowedPaths, spec.checkpoint, config.maxDiffBytes)).diff : await scopedDiff(ctx.cwd, partial, config.maxDiffBytes) : "");
 		}
-		if (!final || !finalCandidate) throw new Error(`No worker could be started for profile ${spec.profileName}: ${attempts.map((item) => `${item.label} (${item.detail ?? item.kind})`).join("; ") || "empty chain"}.`);
+		if (!final || !finalCandidate) {
+			if (limitReached) throw new Error(`Delegation stopped before a worker could start: ${limitReached}.`);
+			throw new Error(`No worker could be started for profile ${spec.profileName}: ${attempts.map((item) => `${item.label} (${item.detail ?? item.kind})`).join("; ") || "empty chain"}.`);
+		}
 		if (providerFailureSeen && finalCandidate.worker === "gemini") metrics.geminiFallbacks++;
-		const failed = runFailed(final);
+		const failed = runFailed(final) || Boolean(limitReached);
 		const after = await getGitSnapshot(ctx.cwd);
 		const scopeViolations = compareGitSnapshots(before, after, spec.allowedPaths);
 		const chainLine = attempts.length > 1 ? `Worker chain: ${attempts.map((item) => `${item.label} ${item.ok ? "✓" : `✗ ${item.kind ?? ""}${item.detail?.startsWith("skipped") ? " (skipped)" : item.detail?.startsWith("declined") ? "declined by user" : ""}`}`).join(" → ")}\n\n` : "";
 		let primaryOutput = `Routing: ${routed.reason}.\n${chainLine}${final.output || final.errorMessage || final.stderr || "The worker returned no output."}`;
+		if (limitReached) primaryOutput += `\n\nSTOPPED AT ${limitReached.toUpperCase()}: partial work and the worker session are preserved. Review what was done, then delegate the rest with continuePrevious=true so the same session finishes without re-exploring.`;
 		if (scopeViolations.length) primaryOutput += `\n\nSCOPE/GIT SAFETY VIOLATION: ${scopeViolations.join("; ")}. Review and correct manually; no automatic revert was attempted.`;
-		return { failed: failed || scopeViolations.length > 0, final, finalCandidate, primaryOutput, attempts, usage, before, after, scopeViolations, resumed };
+		return { failed: failed || scopeViolations.length > 0, final, finalCandidate, primaryOutput, attempts, usage, before, after, scopeViolations, resumed, limitReached };
 	}
 
 	/** Read-only consultation with failover across reviewers; any working-tree mutation is reported as a violation. */
-	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; diffComplete?: boolean; requireVerdict?: boolean; role?: UsageRole } = {}): Promise<ConsultOutcome> {
+	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; diffComplete?: boolean; diffLabel?: string; requireVerdict?: boolean; role?: UsageRole; maxTurns?: number } = {}): Promise<ConsultOutcome> {
 		const { usable, blocked } = rankCandidates(order, workerHealthKeys, health, config.creditHeadroom);
 		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: "skipped: exhausted" }));
 		const usage: Array<Usage | undefined> = [];
@@ -1794,11 +1902,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		let reviewer: string | undefined;
 		let failed = true;
 		const pathList = paths.map((item) => `- ${item}`).join("\n");
-		const diffBlock = options.diff ? `\n\nCHANGES UNDER REVIEW (diff against HEAD)\n\`\`\`diff\n${options.diff}\n\`\`\`\nBase the review on these changes; read files only for the surrounding context you need.` : "";
+		const diffBlock = options.diff ? `\n\nCHANGES UNDER REVIEW (${options.diffLabel ?? "made by this delegation"})\n\`\`\`diff\n${options.diff}\n\`\`\`\nBase the review on these changes; read files only for the surrounding context you need.` : "";
 		const verdictLine = options.requireVerdict ? "\nEnd with exactly one final line: VERDICT: PASS (no material defect) | MINOR (only minor issues) | MAJOR (bugs, missed requirements, regressions or unsafe behavior)." : "";
 		let material: string | undefined | null = null;
-		for (const { candidate } of usable) {
-			if (isFlagship(candidate.model) || availability(health, workerHealthKeys(candidate), config.creditHeadroom).state === "blocked") continue;
+		for (const { candidate: configured } of usable) {
+			if (isFlagship(configured.model) || availability(health, workerHealthKeys(configured), config.creditHeadroom).state === "blocked") continue;
+			const candidate: WorkerCandidate = options.maxTurns ? { ...configured, maxTurns: options.maxTurns } : configured;
 			const label = candidateLabel(candidate);
 			const prompt = `${header}\n${question}\nRelevant paths:\n${pathList}${diffBlock}\n\nInspect only the listed paths and directly relevant symbols. Do not edit, write, stage, commit, push, merge, switch branches, or run mutating commands. Return concise findings ordered by severity, concrete evidence with file/symbol references, recommended action, verification ideas, and remaining uncertainty. Do not summarize unrelated code.${verdictLine}`;
 			if (candidate.worker === "api") {
@@ -1830,10 +1939,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			attempts.push({ label, ok: !kind, kind, detail: kind ? (result.errorMessage || result.stderr).trim().slice(0, 300) : undefined });
 			text = result.output || result.errorMessage || result.stderr || "The reviewer returned no output.";
 			reviewer = label;
-			failed = Boolean(kind) || !result.output.trim() || Boolean(options.requireVerdict && parseVerdict(result.output) === "none");
-			if (!kind && failed) { text += "\nReviewer did not produce a complete verdict; trying the next reviewer."; continue; }
-			if (!kind || (!FAILOVER_KINDS.has(kind) && kind !== "transient")) break;
-			metrics.providerFailovers++;
+			failed = Boolean(kind) || Boolean(result.incomplete) || !result.output.trim() || Boolean(options.requireVerdict && parseVerdict(result.output) === "none");
+			if (!failed) break;
+			// Unlike an implementation, a failed review hides nothing by moving on: without the next reviewer there
+			// would be no review at all. Only provider failures count as failovers.
+			if (kind && (FAILOVER_KINDS.has(kind) || kind === "transient")) metrics.providerFailovers++;
+			text += `\nReviewer ${label} did not produce a complete ${options.requireVerdict ? "verdict" : "answer"}; trying the next reviewer.`;
 		}
 		const after = await getGitSnapshot(ctx.cwd);
 		const violations = compareGitSnapshots(before, after, []);
@@ -1863,10 +1974,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	 */
 	function reviewOrder(implementer: WorkerCandidate, profile: ExecutionProfileName): WorkerCandidate[] {
 		const claude = reviewers("claude", [profile, "large", "critical"]);
-		const claudeOrdered = [...claude.filter((item) => item.model !== implementer.model), ...claude.filter((item) => item.model === implementer.model)];
 		const gemini = reviewers("gemini", [profile, "large", "critical"]);
-		if (implementer.worker === "gemini") return [...claudeOrdered, ...gemini];
-		return profile === "critical" ? [...gemini, ...claudeOrdered] : [...claudeOrdered, ...gemini];
+		const order = implementer.worker === "gemini" || profile !== "critical" ? [...claude, ...gemini] : [...gemini, ...claude];
+		// The implementer's own model reviews only as a last resort, after every other model of either family.
+		return [...order.filter((item) => item.model !== implementer.model), ...order.filter((item) => item.model === implementer.model)];
 	}
 
 	function consultOrder(reviewer: "auto" | WorkerKind, profileName: ExecutionProfileName): WorkerCandidate[] {
@@ -1903,13 +2014,13 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	/** A flagship supervisor is eligible only while the user's approval for the current open task lasts. */
 	function flagshipGranted(candidate: SupervisorCandidate): boolean {
 		const grant = supervisorFlagshipGrant;
-		return Boolean(grant && openTask()?.promptSeq === promptSeq && openTask()?.profile === "critical" && openTask()?.id === grant.taskId && grant.provider === candidate.provider && grant.model === candidate.model);
+		return Boolean(grant && drivesThisPrompt(openTask()) && openTask()?.profile === "critical" && openTask()?.id === grant.taskId && grant.provider === candidate.provider && grant.model === candidate.model);
 	}
 
 	function bestSupervisor(ctx: ExtensionContext): { best?: ResolvedSupervisor; ranked: RankedCandidate<ResolvedSupervisor>[]; blocked: RankedCandidate<ResolvedSupervisor>[] } {
 		const eligible = resolveSupervisors(ctx).resolved.filter((item) => !isFlagship(item.candidate.model) || flagshipGranted(item.candidate));
 		const current = openTask();
-		const preferences = current?.promptSeq === promptSeq ? config.supervisorProfiles[current.profile] ?? [] : [];
+		const preferences = drivesThisPrompt(current) ? config.supervisorProfiles[current!.profile] ?? [] : [];
 		const priority = (item: ResolvedSupervisor) => { const index = preferences.findIndex(p => p.provider === item.candidate.provider && p.model === item.candidate.model); return index < 0 ? preferences.length : index; };
 		eligible.sort((a, b) => priority(a) - priority(b));
 		// An approved flagship is the user's explicit choice for this task, so it goes ahead of the normal order.
@@ -2070,7 +2181,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) throw new Error("interactive confirmation is required.");
 			const approved = await ctx.ui.confirm("Every supervisor model is out of credits. Continue with external workers?", `Task: ${taskPacket.objective}\n\nAllowed paths:\n${allowedPaths.join("\n")}`);
 			if (!approved) throw new Error("rejected by the human operator.");
-			const result = await executeDelegation({ task: taskPacket.objective, profile: taskPacket.profile, assessment: taskPacket.assessment, implementationGuide: taskPacket.implementationGuide, acceptanceCriteria: taskPacket.acceptanceCriteria, allowedPaths, continuePrevious: Boolean(workerSession && workerSession.taskId === taskPacket.id) }, ctx.signal, undefined, ctx);
+			const recoveryNote = `[EXTERNAL RECOVERY] The supervisor ran out of credits while handling this user request; finish only what the task above authorizes:\n${truncateUtf8(task, 2000)}`;
+			const result = await executeDelegation({ recoveryNote, task: taskPacket.objective, profile: taskPacket.profile, assessment: taskPacket.assessment, implementationGuide: taskPacket.implementationGuide, acceptanceCriteria: taskPacket.acceptanceCriteria, allowedPaths, continuePrevious: Boolean(workerSession && workerSession.taskId === taskPacket.id) }, ctx.signal, undefined, ctx);
 			pi.sendMessage({ customType: 'supervisor-provider-recovery', content: result.content, display: true, details: { usage: result.usage, requiresSupervisorAcceptance: true } });
 		} catch (error) {
 			pi.sendMessage({ customType: "supervisor-provider-recovery", content: `Automatic external recovery stopped safely: ${error instanceof Error ? error.message : String(error)}`, display: true });
@@ -2185,12 +2297,30 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			summary: Type.String({ minLength: 10, description: "Evidence for acceptance, or what is still missing." }),
 			manualReview: Type.Optional(Type.Boolean({ description: "For a required independent review that was unavailable: true only if you independently reviewed the full change and explain the evidence in summary." })),
 		}),
-		async execute(_id, params, _signal, _update, ctx) {
+		async execute(_id, params, signal, _update, ctx) {
 			if (!enabled || !taskPacket) throw new Error("No supervised task to complete.");
 			if (delegationRunning) throw new Error("Wait for the running delegation before completing the task.");
+			let taskReview = "";
 			if (params.decision === "accept") {
 				if (taskPacket.phase !== "implemented" || taskPacket.verification === "failed" || taskPacket.reviewVerdict === "major") throw new Error("Task cannot be accepted: implementation or material findings remain unresolved.");
-				if (config.independentReviewProfiles.includes(taskPacket.profile) && (!taskPacket.reviewVerdict || taskPacket.reviewVerdict === "none") && !params.manualReview) throw new Error("Independent review unavailable: review the complete change before accepting with manualReview and evidence.");
+				// Review requirements follow the strongest profile the task ever had, and cover the whole task: after
+				// several delegations, per-delegation reviews saw only their own delta.
+				const reviewProfile = taskPacket.maxProfile ?? taskPacket.profile;
+				const reviewed = (taskPacket.reviewVerdict === "pass" || taskPacket.reviewVerdict === "minor") && taskPacket.reviewScope === "task";
+				if (config.independentReviewProfiles.includes(reviewProfile) && !reviewed) {
+					const review = await reviewWholeTask(ctx, reviewProfile, signal);
+					if (review) {
+						taskReview = `${review.text}\n\n`;
+						if (review.verdict === "major") {
+							updateTaskPacket({ phase: "failed", reviewVerdict: "major", reviewScope: "task" });
+							return { content: [{ type: "text", text: truncateUtf8(`Task NOT accepted: the review of the whole task found material defects.\n\n${review.text}`, config.maxOutputBytes) }], details: { taskId: taskPacket.id, decision: params.decision, accepted: false }, isError: true };
+						}
+						if (review.verdict !== "none") updateTaskPacket({ reviewVerdict: review.verdict, reviewScope: "task" });
+						else if (!params.manualReview) return { content: [{ type: "text", text: truncateUtf8(`Task NOT accepted: ${review.text}\nReview the complete change yourself, then accept with manualReview=true and the evidence in summary.`, config.maxOutputBytes) }], details: { taskId: taskPacket.id, decision: params.decision, accepted: false }, isError: true };
+					} else if (!params.manualReview) {
+						throw new Error("A review of the whole task is required but its starting state is unknown (e.g. after a restart): review the complete change yourself, then accept with manualReview=true and the evidence in summary.");
+					}
+				}
 				const repo = await repoKey(ctx.cwd);
 				if (config.learning.enabled) await mutateLearning(ctx, state => {
 					for (const item of state.outcomes) if (item.repo === repo && item.taskId === taskPacket!.id) item.accepted = true;
@@ -2200,12 +2330,14 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				workerSession = undefined;
 			}
 			supervisorFlagshipGrant = undefined;
+			carriedTaskId = undefined;
 			// Paused tasks also stop imposing their effort on this or the next prompt.
-			if (taskPacket) updateTaskPacket({ promptSeq: -1 });
+			if (taskPacket) updateTaskPacket({ promptSeq: -1, paused: params.decision === "pause" });
 			applySupervisorEffort();
-			await ensureBestSupervisor(ctx, `task ${params.decision === "accept" ? "accepted" : "paused"}`);
+			// The supervisor model is not switched here: the final answer would reread the whole conversation without
+			// prompt cache. The next prompt selects the best supervisor anyway.
 			persist(); updateStatus(ctx);
-			return { content: [{ type: "text", text: `Task ${params.decision === "accept" ? "accepted and completed" : "paused"}. Flagship authorization released; supervisor effort reset.` }], details: { taskId: taskPacket?.id, decision: params.decision } };
+			return { content: [{ type: "text", text: `${taskReview}Task ${params.decision === "accept" ? "accepted and completed" : "paused"}. Flagship authorization released; supervisor effort reset.` }], details: { taskId: taskPacket?.id, decision: params.decision, accepted: params.decision === "accept" } };
 		},
 	});
 
@@ -2242,16 +2374,61 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		},
 	});
 
+	/**
+	 * Contents of the task's authorized paths when the task started, for a review of the whole task. A later
+	 * delegation's new paths are added with their contents at that point; files under paths already covered are
+	 * never overwritten (a file missing from the checkpoint there did not exist yet). In memory only: after a
+	 * restart the task-level review falls back to the supervisor's manual review.
+	 */
+	const taskCheckpoints = new Map<string, { paths: string[]; checkpoint: Checkpoint }>();
+
+	async function extendTaskCheckpoint(cwd: string, taskId: string, allowedPaths: string[], current: Checkpoint): Promise<void> {
+		const known = taskCheckpoints.get(taskId);
+		if (!known) {
+			taskCheckpoints.clear(); // Only the current task is ever reviewed as a whole: bound the memory used.
+			taskCheckpoints.set(taskId, { paths: [...allowedPaths], checkpoint: { files: { ...current.files }, complete: current.complete, omitted: [...current.omitted] } });
+			return;
+		}
+		const extra = allowedPaths.filter((item) => !pathInAllowedScope(item, known.paths));
+		if (!extra.length) return;
+		const added = await checkpoint(cwd, extra);
+		for (const [file, content] of Object.entries(added.files)) {
+			if (!pathInAllowedScope(file, known.paths) && known.checkpoint.files[file] === undefined) known.checkpoint.files[file] = content;
+		}
+		known.checkpoint.complete &&= added.complete;
+		known.checkpoint.omitted.push(...added.omitted);
+		known.paths.push(...extra);
+	}
+
+	/** Independent review of everything the open task changed since it started; undefined when that start is unknown. */
+	async function reviewWholeTask(ctx: ExtensionContext, profile: ExecutionProfileName, signal: AbortSignal | undefined): Promise<{ text: string; verdict: ReviewVerdict } | undefined> {
+		const task = taskPacket;
+		const start = task ? taskCheckpoints.get(task.id) : undefined;
+		if (!task || !start || !task.implementer) return undefined;
+		const changes = await changesSince(ctx.cwd, start.paths, start.checkpoint, config.maxDiffBytes);
+		if (!changes.files.length) return { text: "Review of the whole task: no changes in the authorized paths.", verdict: "pass" };
+		const criteria = task.acceptanceCriteria.length ? task.acceptanceCriteria.map((item) => `- ${item}`).join("\n") : "- Satisfy the authorized task and repository requirements.";
+		const question = `Task: ${task.objective}\nAcceptance criteria:\n${criteria}\nThe task took ${task.delegationCount ?? 1} delegation(s); earlier reviews saw only single steps. Review the combined result: correctness bugs, missed requirements, regressions, inconsistencies between the steps, unsafe behavior, type/API problems and inadequate tests. If no material defect is found, say so explicitly and list residual risks.`;
+		delegationRunning = true;
+		let review: ConsultOutcome;
+		try {
+			review = await runConsultation(ctx, reviewOrder(task.implementer, profile), "[INDEPENDENT READ-ONLY CODE REVIEW OF THE WHOLE TASK]", question, changes.complete ? changes.files : start.paths, signal, { diff: changes.diff, diffComplete: changes.complete, diffLabel: "made by the whole task", requireVerdict: true, role: "review", maxTurns: config.workerMaxTurns[profile] });
+		} finally {
+			delegationRunning = false;
+		}
+		if (review.verdict !== "none") metrics.reviewVerdicts[review.verdict] = (metrics.reviewVerdicts[review.verdict] ?? 0) + 1;
+		persist();
+		if (review.reviewer && !review.failed) return { text: `Review of the whole task (${review.reviewer}), verdict ${review.verdict.toUpperCase()}:\n${review.text}`, verdict: review.verdict };
+		return { text: `REVIEW OF THE WHOLE TASK UNAVAILABLE: ${review.text}${review.violations.length ? `\nREAD-ONLY VIOLATION: ${review.violations.join("; ")}` : ""}`, verdict: "none" };
+	}
+
 	async function executeDelegation(params: any, parentSignal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
 		if (delegationRunning) throw new Error('A delegation is already running; wait for its result.');
 		delegationRunning = true;
-		const controller = new AbortController();
-		const deadline = config.delegationTimeoutMinutes > 0 ? Date.now() + config.delegationTimeoutMinutes * 60_000 : Infinity;
-		activeBudget = { spent: 0, deadline };
-		const timer = Number.isFinite(deadline) ? setTimeout(() => controller.abort(), Math.max(1, deadline - Date.now())) : undefined;
-		const signal = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal;
-		try { return await performDelegation(params, signal, onUpdate, ctx); }
-		finally { if (timer) clearTimeout(timer); activeBudget = undefined; delegationRunning = false; }
+		// No timer kills a running worker: budgetExceeded() stops the delegation between phases, keeping the session.
+		activeBudget = { spent: 0, deadline: config.delegationTimeoutMinutes > 0 ? Date.now() + config.delegationTimeoutMinutes * 60_000 : Infinity };
+		try { return await performDelegation(params, parentSignal, onUpdate, ctx); }
+		finally { activeBudget = undefined; delegationRunning = false; }
 	}
 
 	async function performDelegation(params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
@@ -2259,9 +2436,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor may authorize a worker.");
 			const allowedPaths = normalizeAllowedPaths(params.allowedPaths, false);
 			const previousTask = openTask();
-			// Same task: another delegation of this prompt, a continuation, or the first delegation of a task planned
-			// earlier (plan_task, then the user confirms in a new prompt).
-			const belongsToTask = previousTask?.promptSeq === promptSeq || Boolean(params.continuePrevious) || previousTask?.phase === "planned";
+			// Same task: another delegation of this prompt, a continuation, or unfinished work carried into this prompt
+			// (planned, or failed): a failed task must keep its baseline, or a fresh one would hide its regressions.
+			const belongsToTask = drivesThisPrompt(previousTask) || Boolean(params.continuePrevious) || previousTask?.phase === "planned";
 			const assessed = assessTask(params.profile ?? (belongsToTask ? previousTask?.profile : undefined) ?? config.defaultExecutionProfile, params.assessment ?? (belongsToTask ? previousTask?.assessment : undefined));
 			const profileName = assessed.profile;
 			const { guide: implementationGuide } = validateImplementationGuide(params.implementationGuide, allowedPaths, config.minImplementationGuideChars[profileName]);
@@ -2307,6 +2484,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				acceptanceCriteria: criteria,
 				allowedPaths: [...allowedPaths],
 				phase: "implementing",
+				baseline: open?.baseline,
+				delegationCount: (open?.delegationCount ?? 0) + 1,
+				maxProfile: PROFILE_NAMES[Math.max(PROFILE_NAMES.indexOf(profileName), PROFILE_NAMES.indexOf(open?.maxProfile ?? profileName))],
+				implementer: open?.implementer,
 				updatedAt: Date.now(),
 			};
 			metrics.delegations++;
@@ -2319,17 +2500,30 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			persist();
 
 			try {
-				const repoContext = await repoContextFor(ctx.cwd);
+				const repoContext = await repoContextFor(ctx.cwd, allowedPaths);
 				const verifyCommands = config.autoVerify ? extractVerifyCommands(implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS) : [];
 				// Baseline first: checks that already failed are reported, never blamed on (or credited to) the worker.
+				// A check counts as pre-existing only if it fails now AND failed when the task started: whatever an
+				// earlier delegation of the same task broke is still a regression of the task, to be fixed here.
+				const taskBaseline: Record<string, boolean> = { ...taskPacket.baseline };
 				const baseline = new Map<string, boolean>();
-				for (const command of verifyCommands) baseline.set(command, (await runCheck(ctx, command, signal)).ok);
+				for (const command of verifyCommands) {
+					const ok = (await runCheck(ctx, command, signal)).ok;
+					taskBaseline[command] ??= ok;
+					baseline.set(command, ok || taskBaseline[command]);
+				}
+				updateTaskPacket({ baseline: taskBaseline });
 				const beforeContent = await checkpoint(ctx.cwd, allowedPaths);
-				const spec: ImplementationSpec = { task: params.task, guide: implementationGuide, criteria, allowedPaths, profileName, assessment: assessed.assessment, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, resumeWorker: workerSession?.worker ?? "claude", resumeModel: workerSession?.model, repoContext, checkpoint: beforeContent };
+				await extendTaskCheckpoint(ctx.cwd, taskPacket.id, allowedPaths, beforeContent);
+				const spec: ImplementationSpec = { task: params.recoveryNote ? `${params.task}\n\n${params.recoveryNote}` : params.task, guide: implementationGuide, criteria, allowedPaths, profileName, assessment: assessed.assessment, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, resumeWorker: workerSession?.worker ?? "claude", resumeModel: workerSession?.model, repoContext, checkpoint: beforeContent };
 				const outcome = await executeImplementation(ctx, spec, signal, (text, label) => onUpdate?.({ content: [{ type: "text", text: truncateUtf8(text, 4000) }], details: { running: true, profile: profileName, worker: label } }));
 				if (outcome.resumed) metrics.resumedDelegations++;
 				let final = outcome.final as RunResult;
 				let implementer = outcome.finalCandidate as WorkerCandidate;
+				// Learning credits the delegation to the model that did the work; a model that only rescued a
+				// correction after a provider failure must not be charged with the first model's regression.
+				const initialImplementer = implementer;
+				let limitReached = outcome.limitReached;
 				const usage = [...outcome.usage];
 				let sessionId = final.sessionId;
 				let failed = outcome.failed;
@@ -2345,6 +2539,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					let regressions = checks.filter((check) => !check.ok && baseline.get(check.command) !== false);
 					const notes: string[] = [];
 					while (regressions.length && correctionRounds < config.maxCorrectionRounds) {
+						const over = budgetExceeded();
+						if (over) {
+							limitReached = over;
+							notes.push(`No further correction round: ${over} reached; the worker session is preserved.`);
+							break;
+						}
 						correctionRounds++;
 						metrics.correctionRounds++;
 						onUpdate?.({ content: [{ type: "text", text: `Correction round ${correctionRounds}: ${regressions.map((check) => check.command).join(", ")} failing` }], details: { running: true, profile: profileName, worker: candidateLabel(implementer) } });
@@ -2352,6 +2552,11 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 						usage.push(...correction.usage);
 						if (correction.final) { final = correction.final; sessionId = final.sessionId; }
 						if (correction.finalCandidate) implementer = correction.finalCandidate;
+						if (correction.limitReached) {
+							limitReached = correction.limitReached;
+							notes.push(`Correction round ${correctionRounds} stopped at the ${correction.limitReached}; the worker session is preserved.`);
+							break;
+						}
 						if (correction.failed) {
 							providerFailure = runFailed(final) && (FAILOVER_KINDS.has(failureKindOf(final)) || failureKindOf(final) === "transient");
 							notes.push(`Correction round ${correctionRounds} failed: ${correction.primaryOutput.slice(0, 200)}`);
@@ -2374,27 +2579,33 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					? { worker: implementer.worker, sessionId, cwd: ctx.cwd, allowedPaths: [...allowedPaths], model: implementer.model, taskId: taskPacket?.id }
 					: undefined;
 				const report = `${outcome.primaryOutput}${verificationText ? `\n\n${verificationText}` : ""}`;
-				updateTaskPacket({ phase: failed ? "failed" : "implemented", primaryWorker: candidateLabel(implementer), lastReport: report, verification });
+				updateTaskPacket({ phase: failed ? "failed" : "implemented", primaryWorker: candidateLabel(implementer), implementer, lastReport: report, verification });
 
 				let reviewText = "";
 				let reviewVerdict: ReviewVerdict = "none";
-				if (!failed && config.independentReviewProfiles.includes(profileName)) {
+				const reviewBudget = budgetExceeded();
+				if (!failed && config.independentReviewProfiles.includes(profileName) && reviewBudget) {
+					reviewText = `INDEPENDENT REVIEW SKIPPED (${reviewBudget} reached). complete_task will review the whole task before accepting it.`;
+				} else if (!failed && config.independentReviewProfiles.includes(profileName)) {
 					updateTaskPacket({ phase: "reviewing" });
 					const question = `Task: ${params.task}\nAcceptance criteria:\n${criteria.length ? criteria.map((item) => `- ${item}`).join("\n") : "- Satisfy the authorized task and repository requirements."}\n${verificationText ? `\nAutomatic checks: ${verification}.\n` : ""}\nLook for correctness bugs, missed requirements, regressions, unsafe behavior, type/API problems, and inadequate tests. If no material defect is found, say so explicitly and list residual risks.`;
 					const changes = await changesSince(ctx.cwd, allowedPaths, beforeContent, config.maxDiffBytes);
 					const reviewPaths = [...new Set([...changes.files, ...allowedPaths.filter(p => !fs.existsSync(path.join(ctx.cwd, p)) || !fs.statSync(path.join(ctx.cwd, p)).isDirectory())])];
-					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, changes.complete ? reviewPaths : allowedPaths, signal, { diff: changes.diff, diffComplete: changes.complete, requireVerdict: true, role: "review" });
+					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, changes.complete ? reviewPaths : allowedPaths, signal, { diff: changes.diff, diffComplete: changes.complete, requireVerdict: true, role: "review", maxTurns: config.workerMaxTurns[profileName] });
 					usage.push(...review.usage);
 					reviewVerdict = review.verdict;
 					reviewText = review.reviewer && !review.failed
 						? `Independent review (${review.reviewer}), verdict ${reviewVerdict.toUpperCase()}:\n${review.text}`
 						: `INDEPENDENT REVIEW UNAVAILABLE: ${review.text}${review.violations.length ? `\nREAD-ONLY VIOLATION: ${review.violations.join("; ")}` : ""}\nReview the diff yourself before accepting.`;
 					if (review.violations.length || reviewVerdict === "major") failed = true;
-					updateTaskPacket({ phase: failed ? "failed" : "implemented", lastReport: `${report}\n\n${reviewText}`, reviewVerdict });
+					// The first delegation's diff is the whole task so far; later ones cover only their own delta.
+					updateTaskPacket({ phase: failed ? "failed" : "implemented", lastReport: `${report}\n\n${reviewText}`, reviewVerdict, reviewScope: taskPacket.delegationCount === 1 ? "task" : "delegation" });
 				}
 
 				const combined = combineUsage(usage);
-				const learningNotes = await learnFromDelegation(ctx, { implementer, final, profileName, verification, correctionRounds, reviewVerdict, failed, providerFailure, combined });
+				// The turn limit says the model/effort did not finish the work; time and cost limits are the extension's own.
+				const budgetStop = Boolean(limitReached && !limitReached.startsWith("worker turn limit"));
+				const learningNotes = await learnFromDelegation(ctx, { implementer: initialImplementer, final, profileName, verification, correctionRounds, reviewVerdict, failed, providerFailure, budgetStop, combined });
 				if (verification === "passed" && !failed) metrics.firstPassDelegations++;
 				if (failed) metrics.failedDelegations++;
 				if (reviewVerdict !== "none") metrics.reviewVerdicts[reviewVerdict] = (metrics.reviewVerdicts[reviewVerdict] ?? 0) + 1;
@@ -2410,7 +2621,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""} — already run by the extension on the final code: ${verifyCommands.join(", ")}. Do not re-run these; use run_verification only for other checks.\n`
 					: "Automatic verification: none (no allowlisted command in VERIFY); run_verification before accepting.\n";
 				const text = truncateUtf8([
-					`${candidateLabel(implementer)} (${profileName}) ${failed ? "failed" : "completed"}.\n${safetyLine}${changedLine}${verificationLine}${usageLine}`,
+					`${candidateLabel(implementer)} (${profileName}) ${limitReached ? "stopped" : failed ? "failed" : "completed"}.\n${limitReached ? `STOPPED: ${limitReached} reached. Partial work${workerSession ? " and the worker session are" : " is"} preserved; delegate the rest with continuePrevious=true.\n` : ""}${safetyLine}${changedLine}${verificationLine}${usageLine}`,
 					outcome.primaryOutput,
 					verificationText,
 					reviewText,
@@ -2419,7 +2630,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				].filter(Boolean).join("\n\n"), config.maxOutputBytes);
 				return {
 					content: [{ type: "text", text }],
-					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: afterAll, scopeViolations, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict },
+					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: afterAll, scopeViolations, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict, limitReached, sessionPreserved: Boolean(workerSession && workerSession.taskId === taskPacket?.id) },
 					isError: failed,
 					usage: combined,
 				};
@@ -2467,7 +2678,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				throw new Error(`Command not allowlisted. Allowed prefixes: ${config.verificationCommands.join(", ")} (verificationCommands in config.json).`);
 			}
 			const check = await runCheck(ctx, command, signal);
-			if (!check.ok && taskPacket) updateTaskPacket({ verification: "failed", phase: "failed" });
+			// A failure blocks acceptance of the open task, unless the same check was already red when the task started.
+			// A completed task is never reopened by a later check.
+			const open = openTask();
+			if (!check.ok && open && open.baseline?.[command] !== false) updateTaskPacket({ verification: "failed", phase: "failed" });
 			const status = check.timedOut ? `timed out after ${config.verificationTimeoutMinutes} min` : `exit code ${check.exitCode}`;
 			const warning = check.changed.length ? `\n\nNote: the command changed files: ${check.changed.join(", ")}` : "";
 			return {
@@ -2646,7 +2860,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		if (!enabled) return;
 		lastUserPrompt = event.prompt;
 		promptSeq++;
-		supervisorFlagshipGrant = undefined; // A fresh user request starts conservatively until classified/continued.
+		// Unfinished work keeps its supervision, so continuing it does not switch models twice (each switch rereads
+		// the whole conversation without prompt cache). Anything else starts conservatively until classified.
+		carriedTaskId = carriesOver(openTask()) ? openTask()?.id : undefined;
+		if (!carriedTaskId) supervisorFlagshipGrant = undefined;
 		supervisorFailoversThisRun = 0;
 		await ensureBestSupervisor(ctx, "best available for this prompt");
 		applySupervisorEffort();
