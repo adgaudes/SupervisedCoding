@@ -73,12 +73,13 @@ L’assessment può solo **alzare** il profilo scelto: sicurezza, concorrenza, m
 
 Per ogni delega:
 
-1. **Contesto del repository.** Il worker riceve `AGENTS.md`/`CLAUDE.md` (in `--safe-mode` non li caricherebbe da solo) e le lezioni imparate in quel repository.
-2. **Baseline.** I comandi di `VERIFY` presenti in `verificationCommands` (es. `npm test`, `npx tsc --noEmit`) vengono eseguiti **prima** della modifica, per distinguere i fallimenti già esistenti.
+1. **Contesto del repository.** Il worker riceve `AGENTS.md`/`CLAUDE.md` (in `--safe-mode` non li caricherebbe da solo) della radice e di ogni cartella lungo il percorso dei file autorizzati, più le lezioni imparate in quel repository. Se il limite di 12 KB costringe a ometterne qualcuno, il worker viene avvisato di leggerli.
+2. **Baseline.** I comandi di `VERIFY` presenti in `verificationCommands` (es. `npm test`, `npx tsc --noEmit`) vengono eseguiti **prima** della modifica, per distinguere i fallimenti già esistenti. La baseline vale per l’intero **task**: un controllo è "già fallito" solo se era rosso anche quando il task è iniziato. Ciò che una delega precedente dello stesso task ha rotto resta una regressione da correggere.
 3. **Implementazione** con la catena di worker del profilo.
-4. **Verifica e auto-correzione.** Gli stessi comandi vengono rieseguiti. Se qualcosa che prima passava ora fallisce, lo **stesso** worker riprende la propria sessione (Claude o Gemini) ricevendo solo l’output dell’errore, e corregge fino a `maxCorrectionRounds` volte (default 2). Gli è vietato indebolire o cancellare test. Se durante una correzione il worker esaurisce i crediti, la correzione passa al candidato successivo della catena con il diff del lavoro fatto. I fallimenti già presenti prima vengono segnalati ma non attribuiti al worker: l’esito è `unchanged_failures`, che non vale mai come successo.
-5. **Review indipendente** (large/critical). Il revisore riceve il **diff di questa sola delega** (non quello cumulativo contro HEAD) e chiude con `VERDICT: PASS | MINOR | MAJOR`. Il revisore API viene usato solo se diff e file cambiati entrano completi nel materiale, altrimenti tocca a un revisore CLI, che può leggere il repository. Una review senza verdetto finale, o troncata dal limite di output, passa al revisore successivo. Un verdetto MAJOR rende fallita la delega.
-6. **Esito registrato** per l’apprendimento. Conta come accettato solo dopo `complete_task` con `accept`, che il supervisore non può usare con regressioni aperte, verdetto MAJOR o, nei profili con review, senza review (salvo `manualReview` motivata).
+4. **Verifica e auto-correzione.** Gli stessi comandi vengono rieseguiti. Se qualcosa che prima passava ora fallisce, lo **stesso** worker riprende la propria sessione (Claude o Gemini) ricevendo solo l’output dell’errore, e corregge fino a `maxCorrectionRounds` volte (default 2). Gli è vietato indebolire o cancellare test. Se durante una correzione il worker esaurisce i crediti, la correzione passa al candidato successivo della catena con il diff del lavoro fatto. I fallimenti già presenti all’inizio del task vengono segnalati ma non attribuiti al worker: l’esito è `unchanged_failures`, che non vale mai come successo.
+5. **Review indipendente** (large/critical). Il revisore riceve il **diff di questa sola delega** (non quello cumulativo contro HEAD) e chiude con `VERDICT: PASS | MINOR | MAJOR`. Il revisore API viene usato solo se diff e file cambiati entrano completi nel materiale, altrimenti tocca a un revisore CLI, che può leggere il repository. Un revisore che non produce un verdetto completo (errore, limite di turni, output troncato, verdetto mancante) passa la mano al successivo. Il modello dell’implementatore rivede solo come ultima risorsa, dopo l’altra famiglia. Un verdetto MAJOR rende fallita la delega.
+6. **Accettazione** con `complete_task`. Il supervisore non può accettare con regressioni aperte o verdetto MAJOR. Se il task ha avuto più deleghe, o l’ultima non è stata rivista, e il suo profilo più alto richiede la review, `complete_task` fa rivedere il **diff dell’intero task** prima di accettare: con MAJOR il task non viene accettato, e senza review disponibile serve `manualReview` motivata.
+7. **Esito registrato** per l’apprendimento; conta come accettato solo dopo `complete_task` con `accept`.
 
 Se il task fallisce ancora dopo le correzioni, l’estensione **non** passa da sola a un modello più potente: di solito la causa è la guida (ambiguità, un dettaglio mancante), e deve correggerla il supervisore.
 
@@ -88,10 +89,10 @@ L’estensione non riaddestra i modelli, ma impara dai **propri risultati**. I d
 
 **Calibrazione dell’effort dei worker** (per repository, tipo di task, profilo e modello):
 
-- ogni delega registra se i test sono passati al primo colpo, quanti giri di correzione sono serviti, il verdetto della review e, dopo `complete_task`, l’accettazione del supervisore;
-- conta un solo campione per task (le deleghe dello stesso task sono correlate); i guasti dei provider e gli esiti più vecchi di 90 giorni sono esclusi;
-- se la qualità scende sotto 0,7 su almeno 4 task, l’effort **sale** di un livello (es. Sonnet `high` → `xhigh`);
-- scende di un livello solo dopo **20 task consecutivi accettati, riusciti al primo colpo e verificati da test reali**, al massimo un livello sotto `config.json`, e **mai** nei profili large/critical: la qualità viene prima dei token;
+- ogni delega registra se i test sono passati al primo colpo, quanti giri di correzione sono serviti, il verdetto della review e, dopo `complete_task`, l’accettazione del supervisore. L’esito va al modello che ha fatto il lavoro, anche se una correzione è poi passata a un altro modello per crediti esauriti;
+- conta un solo campione per task (le deleghe dello stesso task sono correlate), con la qualità della sua delega **peggiore**: un fallimento rimediato con un’altra delega resta un fallimento. I guasti dei provider, gli arresti per i limiti di tempo o costo della delega e gli esiti più vecchi di 90 giorni sono esclusi;
+- se la qualità scende sotto 0,7 su almeno 4 task di **qualsiasi tipo** nel repository, l’effort **sale** di un livello (es. Sonnet `high` → `xhigh`): un modello in difficoltà va aiutato subito;
+- scende di un livello solo dopo **20 task consecutivi dello stesso tipo, accettati, con ogni delega riuscita al primo colpo e verificata da test reali**, al massimo un livello sotto `config.json`, e **mai** nei profili large/critical: la qualità viene prima dei token;
 - dopo ogni cambio contano solo gli esiti registrati dopo il cambio (nessuna oscillazione); se modifichi `config.json`, il valore nuovo diventa la base;
 - con `learning.autoTuneEffort: false` le calibrazioni salvate non vengono applicate.
 
@@ -112,8 +113,8 @@ L’estensione non riaddestra i modelli, ma impara dai **propri risultati**. I d
 | large | architettura, debugging difficile | high | Opus 5.5 high → Sonnet 5 xhigh → Gemini | Claude read-only, modello diverso |
 | critical | sicurezza, concorrenza, migrazioni, complessità eccezionale | xhigh | **Fable 5.1 xhigh** (con autorizzazione) → Opus 5.5 xhigh → Gemini → Sonnet 5 max | famiglia diversa: Gemini via API (poi CLI), poi Claude |
 
-- L’effort del supervisore segue il profilo del task su cui sta lavorando. Ogni nuovo prompt dell’utente riparte da `default` (`medium`) finché il supervisore non pianifica, delega o riprende un task; `complete_task` lo riporta a `default`.
-- `supervisorProfiles` può indicare supervisori preferiti per un profilo (es. un modello più economico per small); negli altri casi vale `supervisorChain`.
+- L’effort del supervisore segue il profilo del task su cui sta lavorando. Un task non finito (pianificato o fallito) lo conserva nel prompt successivo. Un task già implementato ma non accettato, o messo in pausa, no: il nuovo prompt riparte da `default` (`medium`) finché il supervisore non delega o riprende un task. `complete_task` lo riporta a `default`.
+- `supervisorProfiles` (vuoto di default) può indicare supervisori preferiti per un profilo. Attenzione: ogni cambio di modello del supervisore rilegge l’intera conversazione senza cache del prompt; conviene usarlo solo dopo averne misurato il vantaggio. `complete_task` non cambia mai modello prima della risposta finale.
 - Per una singola delega il supervisore può alzare l’effort del worker (`effort`) quando quella modifica specifica lo richiede; abbassarlo è ammesso solo nel profilo small.
 - Un task small, locale, meccanico o di documentazione, con rischio e incertezza bassi, usa effort `low` per il worker.
 - La lunghezza minima della guida dipende dal profilo (small 150 caratteri, gli altri 400): nessun riempitivo sui task semplici.
@@ -129,7 +130,7 @@ I modelli in `flagshipModels` (Claude Fable 5.1/5, GPT-6 Astra):
 
 - **No**: si usa il modello successivo più potente non di punta (es. Opus 5.5 xhigh al posto di Fable, GPT-5.5 al posto di Astra);
 - la risposta vale per tutto il task (correzioni, deleghe successive, failover): non viene chiesta due volte;
-- un supervisore di punta approvato vale solo per quel task critical: ogni nuovo prompt riparte con il supervisore normale, e il supervisore di punta torna (senza nuova domanda) solo se il supervisore riprende lo stesso task; `complete_task` rilascia l’autorizzazione;
+- un supervisore di punta approvato vale solo per quel task critical. Resta attivo nel prompt successivo finché il task non è finito (pianificato o fallito). Se invece il task è già implementato, il nuovo prompt riparte con il supervisore normale, e quello di punta torna, senza nuova domanda, solo se il supervisore riprende lo stesso task. `complete_task` rilascia l’autorizzazione;
 - senza interfaccia (modalità non interattiva) la risposta è sempre No;
 - se il modello di punta non ha crediti, la domanda non viene nemmeno fatta.
 
@@ -152,11 +153,11 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 
 ## Budget per delega
 
-- Ogni worker Claude riceve un limite di turni per profilo (`workerMaxTurns`, `--max-turns`).
-- L’intera delega (baseline, implementazione, correzioni, review) ha una scadenza complessiva (`delegationTimeoutMinutes`, default 120) e, se impostato, un tetto di costo cumulativo (`delegationBudgetUsd`, 0 = disattivato), passato a Claude come `--max-budget-usd` residuo.
-- Raggiunto un limite, la delega si ferma **senza** passare a un altro modello: il lavoro fatto resta nel working tree e decide il supervisore. Un limite dell’estensione non è un credito esaurito del provider.
+- Ogni worker Claude, e ogni revisore Claude, riceve un limite di turni per profilo (`workerMaxTurns`: small 40, medium 80, large 120, critical 160; `--max-turns`). Sono valori prudenziali, da ritarare su misure reali.
+- L’intera delega (baseline, implementazione, correzioni, review) ha una scadenza complessiva (`delegationTimeoutMinutes`, default 120) e, se impostato, un tetto di costo cumulativo (`delegationBudgetUsd`, 0 = disattivato), passato a Claude come `--max-budget-usd` residuo. Scadenza e tetto vengono controllati **tra una fase e l’altra**: un worker in esecuzione non viene mai interrotto per questo, ma dopo il limite non partono nuovi tentativi, correzioni o review. Una review saltata viene fatta da `complete_task`.
+- Raggiunto un limite, la delega si ferma **senza** passare a un altro modello: il lavoro fatto resta nel working tree e **la sessione del worker resta riprendibile**. Il supervisore vede lo stato e fa finire il lavoro alla stessa sessione con `continuePrevious=true`, senza rifare l’esplorazione. Un limite dell’estensione non è un credito esaurito del provider.
 - L’output dei processi è limitato in memoria (`maxProcessOutputBytes`), la review API a `reviewMaxTokens`.
-- `status` segnala le invocazioni senza dati d’uso (totali incompleti, non costo zero). Ogni invocazione viene anche registrata in `data/usage.jsonl`, con task, ruolo, provider, modello, billing e consumi per modello.
+- `status` segnala le invocazioni avviate senza dati d’uso (totali incompleti, non costo zero). Ogni invocazione viene anche registrata in `data/usage.jsonl`, con task, ruolo, provider, modello, billing e consumi per modello; oltre 5 MB il file ruota in `usage.jsonl.1`.
 
 ## Tool del supervisore
 
@@ -164,9 +165,9 @@ Non vengono mai usati modelli di punta per consultazioni, review o sonde dei cre
 |---|---|
 | `plan_task` | registra task, profilo e assessment per task large/critical o con più deleghe; imposta l’effort del supervisore, per i task critical propone il supervisore di punta |
 | `delegate_implementation` | implementazione tramite la catena del profilo, con failover e review automatica; accetta profilo e assessment anche senza `plan_task` |
-| `complete_task` | `accept` chiude il task e lo registra come accettato; `pause` lo lascia aperto per un seguito. Entrambi rilasciano il supervisore di punta e riportano l’effort a `default` |
+| `complete_task` | `accept` chiude il task e lo registra come accettato, dopo la review dell’intero task quando serve; `pause` lo lascia aperto per un seguito. Entrambi rilasciano il supervisore di punta e riportano l’effort a `default` |
 | `consult_readonly` | parere read-only mirato (Claude di default, Gemini se richiesto o in fallback) |
-| `run_verification` | esegue un comando di test, typecheck, lint o build da `verificationCommands` non già eseguito da `VERIFY`; operatori shell rifiutati; se fallisce, il task risulta fallito finché una nuova delega non lo sistema |
+| `run_verification` | esegue un comando di test, typecheck, lint o build da `verificationCommands` non già eseguito da `VERIFY`; operatori shell rifiutati; se fallisce, il task aperto risulta fallito finché una nuova delega non lo sistema (salvo che quel controllo fosse rosso già all’inizio del task; un task accettato non viene riaperto) |
 | `record_lesson` | registra una lezione del repository per i worker futuri |
 | `supervisor_git` | ispezione Git read-only |
 | `request_git_commit`, `request_git_push` | con conferma umana; niente merge né force-push |
@@ -215,7 +216,7 @@ Le sessioni create con il nome precedente (`codex-claude-supervisor`) mantengono
 - `learning.ts`: esiti, calibrazione effort, lezioni, verdetti, estrazione comandi `VERIFY`;
 - `routing.ts`: assessment del task e ordine dei worker basato su evidenze;
 - `changes.ts`: checkpoint dei file autorizzati e diff della singola delega;
-- `AUDIT.md`: audit del 24 settembre 2026 da cui derivano le correzioni A1–A12;
+- `AUDIT.md`, `AUDIT-2.md`: i due audit del 24 settembre 2026 da cui derivano le correzioni A1–A12 e B1–B13;
 - `tests/`: test unitari, d’integrazione e di regressione dell’audit (CLI Claude/Gemini simulate, host Pi simulato, repository Git reali);
 - `data/learning.json`, `data/usage.jsonl`: dati di apprendimento e registro delle invocazioni (creati all’uso, esclusi da Git).
 
