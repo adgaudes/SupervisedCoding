@@ -657,3 +657,12 @@ test("escalation: a model with poor quality at its highest effort yields to the 
 	assert.match(escalated.reason, /escalated to gpt-5\.5/);
 	assert.equal(routeWithEvidence(candidates, atMax, "r", "large", "feature").candidates[0].model, "opus", "evidence is per task kind");
 });
+
+test("preferWorker selects a model family, whatever tool runs it", async () => {
+	configure({}, { "gpt-5.5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", preferWorker: "gpt", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.isError, false);
+	assert.deepEqual(calls().map((call) => [call.cli, call.model]), [["pi", "gpt-5.5"]]);
+});

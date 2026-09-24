@@ -1386,7 +1386,7 @@ interface ImplementationSpec {
 	criteria: string[];
 	allowedPaths: string[];
 	profileName: ExecutionProfileName;
-	preferWorker?: WorkerKind;
+	preferWorker?: Exclude<ConsultReviewer, "auto">;
 	/** Supervisor override of the profile's Claude effort for this delegation. */
 	effort?: WorkerEffort;
 	resumeSessionId?: string;
@@ -1429,9 +1429,11 @@ interface ConsultOutcome {
 	verdict: ReviewVerdict;
 }
 
-function orderChain(chain: WorkerCandidate[], prefer?: WorkerKind): WorkerCandidate[] {
+/** The supervisor's preferred model family goes first; the rest of the chain stays as fallback, in order. */
+function orderChain(chain: WorkerCandidate[], prefer?: Exclude<ConsultReviewer, "auto">): WorkerCandidate[] {
 	if (!prefer) return chain;
-	return [...chain.filter((item) => item.worker === prefer), ...chain.filter((item) => item.worker !== prefer)];
+	const family = CONSULT_FAMILIES[prefer];
+	return [...chain.filter((item) => modelFamily(item) === family), ...chain.filter((item) => modelFamily(item) !== family)];
 }
 
 function describeBlocked(blocked: RankedCandidate<WorkerCandidate>[]): string {
@@ -2809,7 +2811,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			profile: Type.Optional(StringEnum(PROFILE_NAMES, { description: `Complexity profile; defaults to the plan_task profile, else ${config.defaultExecutionProfile}. Prefer the stronger profile whenever quality is uncertain.` })),
 			assessment: Type.Optional(assessmentSchema),
 			effort: Type.Optional(StringEnum(WORKER_EFFORTS, { description: "Raise the profile's Claude effort only when this specific change clearly needs more reasoning (tricky algorithm, subtle concurrency). Lowering is honored only for the small profile; otherwise the profile's effort is kept, because quality comes first." })),
-			preferWorker: Type.Optional(StringEnum(["claude", "gemini"] as const, { description: "Only when one family is clearly better suited (e.g. gemini for very large context). Other candidates remain as fallback." })),
+			preferWorker: Type.Optional(StringEnum(["claude", "gpt", "gemini"] as const, { description: "Model family to try first, only when it is clearly better suited (e.g. gemini for very large context). Other candidates remain as fallback." })),
 			continuePrevious: Type.Optional(Type.Boolean({ description: "Resume the previous Claude or Gemini session for a correction/follow-up of the same open task. Each call carries the currently authorized paths." })),
 			implementationGuide: Type.String({ minLength: Math.min(...Object.values(config.minImplementationGuideChars)), description: "Guide using FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:. Be concise where possible, but include every detail needed for reliable execution and mention every allowed path." }),
 			acceptanceCriteria: Type.Optional(Type.Array(Type.String({ description: "Concrete, non-duplicative checks" }))),
