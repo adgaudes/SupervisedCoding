@@ -1,0 +1,241 @@
+{
+  "supervisorChain": [
+    {
+      "provider": "openai-codex",
+      "model": "gpt-6-astra"
+    },
+    {
+      "provider": "openai-codex",
+      "model": "gpt-5.5"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-pro-preview"
+    },
+    {
+      "provider": "openai-codex",
+      "model": "gpt-6-sol"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.8-flash"
+    }
+  ],
+  "flagshipModels": [
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "gpt-6-astra"
+  ],
+  "supervisorEffort": {
+    "default": "medium",
+    "small": "medium",
+    "medium": "medium",
+    "large": "high",
+    "critical": "xhigh"
+  },
+  "supervisorAutoSelect": true,
+  "supervisorFailover": true,
+  "probeOnActivate": true,
+  "claudeProbeModel": "claude-haiku-4-5",
+  "workerChains": {
+    "small": [
+      {
+        "worker": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "medium"
+      },
+      {
+        "worker": "gemini",
+        "model": ""
+      },
+      {
+        "worker": "claude",
+        "model": "claude-opus-5-5",
+        "effort": "low"
+      }
+    ],
+    "medium": [
+      {
+        "worker": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "high"
+      },
+      {
+        "worker": "claude",
+        "model": "claude-opus-5-5",
+        "effort": "medium"
+      },
+      {
+        "worker": "gemini",
+        "model": ""
+      }
+    ],
+    "large": [
+      {
+        "worker": "claude",
+        "model": "claude-opus-5-5",
+        "effort": "high"
+      },
+      {
+        "worker": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "xhigh"
+      },
+      {
+        "worker": "gemini",
+        "model": ""
+      }
+    ],
+    "critical": [
+      {
+        "worker": "claude",
+        "model": "claude-fable-5-1",
+        "effort": "xhigh"
+      },
+      {
+        "worker": "claude",
+        "model": "claude-opus-5-5",
+        "effort": "xhigh"
+      },
+      {
+        "worker": "gemini",
+        "model": ""
+      },
+      {
+        "worker": "claude",
+        "model": "claude-sonnet-5",
+        "effort": "max"
+      }
+    ]
+  },
+  "defaultExecutionProfile": "medium",
+  "independentReviewProfiles": [
+    "large",
+    "critical"
+  ],
+  "minImplementationGuideChars": {
+    "small": 150,
+    "medium": 400,
+    "large": 400,
+    "critical": 400
+  },
+  "creditHeadroom": 0.9,
+  "exhaustedCooldownMinutes": 60,
+  "unavailableCooldownMinutes": 1440,
+  "transientRetryAttempts": 4,
+  "transientRetryDelayMs": 5000,
+  "workerTimeoutMinutes": 90,
+  "consultTimeoutMinutes": 20,
+  "verificationTimeoutMinutes": 20,
+  "automaticSupervisorRecovery": true,
+  "recoveryMaxAgeMinutes": 120,
+  "verificationCommands": [
+    "npm test",
+    "npm run test",
+    "npm run lint",
+    "npm run typecheck",
+    "npm run check",
+    "npm run build",
+    "npx tsc",
+    "npx vitest run",
+    "npx eslint",
+    "npx jest",
+    "pnpm test",
+    "pnpm run test",
+    "pnpm run lint",
+    "pnpm run typecheck",
+    "yarn test",
+    "node --test",
+    "pytest",
+    "python -m pytest",
+    "py -m pytest",
+    "ruff check",
+    "mypy",
+    "cargo test",
+    "cargo check",
+    "cargo clippy",
+    "go test",
+    "go vet",
+    "dotnet test",
+    "dotnet build"
+  ],
+  "workerCommand": "claude",
+  "geminiCommand": "gemini",
+  "workerPermissionMode": "dontAsk",
+  "workerTools": [
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Bash"
+  ],
+  "workerAllowedTools": [
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Bash(npm test *)",
+    "Bash(npx tsc *)",
+    "Bash(npx vitest *)",
+    "Bash(npx eslint *)",
+    "Bash(pytest *)",
+    "Bash(git status *)",
+    "Bash(git diff *)",
+    "Bash(git log *)"
+  ],
+  "workerDisallowedTools": [
+    "Bash(git add *)",
+    "Bash(git commit *)",
+    "Bash(git push *)",
+    "Bash(git merge *)",
+    "Bash(git rebase *)",
+    "Bash(git reset *)",
+    "Bash(git checkout *)",
+    "Bash(git switch *)",
+    "Bash(git restore *)",
+    "Bash(git clean *)",
+    "Bash(git tag *)",
+    "Bash(git cherry-pick *)",
+    "Bash(git revert *)",
+    "Bash(gh pr merge *)"
+  ],
+  "claudeReadOnlyTools": [
+    "Read",
+    "Glob",
+    "Grep"
+  ],
+  "claudeReadOnlyAllowedTools": [
+    "Read",
+    "Glob",
+    "Grep"
+  ],
+  "claudeReadOnlyDisallowedTools": [
+    "Edit",
+    "Write",
+    "Bash(*)"
+  ],
+  "contextWarningPercent": 40,
+  "allowedSupervisorProviders": [
+    "*"
+  ],
+  "supervisorTools": [
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "plan_task",
+    "consult_readonly",
+    "delegate_implementation",
+    "run_verification",
+    "supervisor_git",
+    "request_git_commit",
+    "request_git_push"
+  ],
+  "maxOutputBytes": 51200
+}
