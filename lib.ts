@@ -272,7 +272,9 @@ export function availability(health: HealthMap, keys: string[], headroom: number
 		if (item.status === "exhausted" && (item.blockedUntil ?? 0) > now) return { state: "blocked", until: item.blockedUntil, reason: item.reason };
 		// Readings taken before a limit reset (or an expired block) no longer describe the account.
 		if (item.status === "exhausted" || (item.resetsAt !== undefined && item.resetsAt <= now)) continue;
-		if (item.status === "warning" || (item.utilization !== undefined && item.utilization >= headroom)) degraded = true;
+		// A provider "warning" (e.g. Claude's allowed_warning at ~90%) only matters when the real utilization is unknown;
+		// otherwise the configured headroom decides, so a strong worker is not dropped while it still has room.
+		if (item.utilization !== undefined ? item.utilization >= headroom : item.status === "warning") degraded = true;
 	}
 	return { state: degraded ? "degraded" : "ok" };
 }
