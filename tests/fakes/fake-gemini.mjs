@@ -5,12 +5,14 @@ import * as path from "node:path";
 const args = process.argv.slice(2);
 const index = args.indexOf("--model");
 const model = index >= 0 ? args[index + 1] : "gemini-default";
+const resumeIndex = args.indexOf("--resume");
+const resume = resumeIndex >= 0 ? args[resumeIndex + 1] : undefined;
 const prompt = fs.readFileSync(0, "utf8");
 const planFile = process.env.FAKE_PLAN;
 const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
 const step = (plan[model] ?? []).shift() ?? { action: "text", text: "Nothing scripted for this model." };
 fs.writeFileSync(planFile, JSON.stringify(plan));
-fs.appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ cli: "gemini", model, mode: args[args.indexOf("--approval-mode") + 1], prompt })}\n`);
+fs.appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ cli: "gemini", model, mode: args[args.indexOf("--approval-mode") + 1], resume, prompt })}\n`);
 for (const [file, content] of Object.entries(step.write ?? {})) {
 	fs.mkdirSync(path.dirname(path.join(process.cwd(), file)), { recursive: true });
 	fs.writeFileSync(path.join(process.cwd(), file), content);

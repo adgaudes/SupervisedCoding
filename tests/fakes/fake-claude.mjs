@@ -16,7 +16,7 @@ const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
 const step = (plan[model] ?? []).shift() ?? { action: "text", text: "Nothing scripted for this model." };
 fs.writeFileSync(planFile, JSON.stringify(plan));
 const sessionId = resume ?? `sess-${model}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-fs.appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ cli: "claude", model, effort: option("--effort"), resume, mode: option("--permission-mode"), tools: option("--tools"), prompt })}\n`);
+fs.appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ cli: "claude", model, effort: option("--effort"), maxTurns: option("--max-turns"), resume, mode: option("--permission-mode"), tools: option("--tools"), prompt })}\n`);
 
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
 emit({ type: "system", subtype: "init", model, session_id: sessionId });

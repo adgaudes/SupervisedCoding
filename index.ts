@@ -1140,8 +1140,10 @@ async function runApiReview(ctx: ExtensionContext, candidate: WorkerCandidate, r
 	try {
 		const content = `${prompt}\n\nFILES (current content)\n${material || "(none)"}`;
 		const message = await ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content, timestamp: Date.now() }] }, { reasoning: reasoning === "off" ? undefined : reasoning, signal: controller.signal, maxTokens }).result();
-		const output = message.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n").trim();
-		const errorMessage = message.stopReason === "length" ? "Review output limit reached; review is incomplete." : message.stopReason === "error" || message.stopReason === "aborted" ? message.errorMessage ?? (timedOut ? `API review timed out after ${Math.round(timeoutMs / 60_000)} minutes.` : "API review failed.") : undefined;
+		const text = message.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n").trim();
+		// A truncated review is not a provider failure: the appended last line voids any verdict, so the next reviewer runs.
+		const output = message.stopReason === "length" ? `${text}\n[Review output limit reached; review is incomplete.]` : text;
+		const errorMessage = message.stopReason === "error" || message.stopReason === "aborted" ? message.errorMessage ?? (timedOut ? `API review timed out after ${Math.round(timeoutMs / 60_000)} minutes.` : "API review failed.") : undefined;
 		const billing: Billing = ctx.modelRegistry.isUsingOAuth(model) ? "subscription" : "api";
 		return { ...base, exitCode: errorMessage ? 1 : 0, output, errorMessage, costUsd: numberField(message.usage?.cost?.total), usage: message.usage, signal: { text: errorMessage ?? "" }, timedOut, turns: output ? 1 : 0, billing };
 	} catch (error) {
@@ -1195,6 +1197,8 @@ interface ImplementationSpec {
 	handoff?: string;
 	role?: UsageRole;
 	checkpoint?: Checkpoint;
+	/** Whole prompt for a resumed session, which already holds guide and context; fresh candidates get guide and handoff. */
+	resumePrompt?: string;
 	/** Repository rules and lessons for fresh workers. */
 	repoContext?: string;
 }
@@ -1301,7 +1305,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		if (!activeBudget) return own;
 		const remaining = activeBudget.deadline - Date.now();
 		if (remaining <= 0 || (config.delegationBudgetUsd > 0 && activeBudget.spent >= config.delegationBudgetUsd)) throw new Error("Delegation budget reached. Work is preserved; supervisor must assess before continuing.");
-		return Math.min(own || Infinity, remaining);
+		// 0 means "no timeout" to runProcess; an infinite value would overflow setTimeout and fire at once.
+		const bounded = Math.min(own || Infinity, remaining);
+		return Number.isFinite(bounded) ? bounded : 0;
 	};
 
 	function statusText(ctx: ExtensionContext): string {
@@ -1486,7 +1492,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const instructions = '[CORRECTION ROUND ' + round + '] Checks now failing:\n' + failures + '\nFix the cause only inside the allowlist. Never weaken, skip or delete tests. Preserve correct work. If the requirements are ambiguous, stop and explain.';
 		const chain = [implementer, ...config.workerChains[spec.profileName].filter(item => item.worker !== implementer.worker || item.model !== implementer.model)];
 		const diff = spec.checkpoint ? (await changesSince(ctx.cwd, spec.allowedPaths, spec.checkpoint, config.maxDiffBytes)).diff : await scopedDiff(ctx.cwd, spec.allowedPaths, config.maxDiffBytes);
-		return executeImplementation(ctx, { ...spec, candidates: chain, guide: spec.guide + '\n\n' + instructions, resumeSessionId: sessionId, resumeWorker: implementer.worker as 'claude' | 'gemini', resumeModel: implementer.model, role: 'correct', handoff: '[CURRENT WORK]\n' + diff + '\n\n' + instructions }, signal);
+		return executeImplementation(ctx, { ...spec, candidates: chain, guide: spec.guide + '\n\n' + instructions, resumeSessionId: sessionId, resumeWorker: implementer.worker as 'claude' | 'gemini', resumeModel: implementer.model, role: 'correct', resumePrompt: instructions, handoff: '[CURRENT WORK]\n' + diff + '\n\n' + instructions }, signal);
 	}
 
 	/** What learning knows about this repository, for the supervisor at planning time. */
@@ -1718,6 +1724,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			}
 			let resumeId = resumeAvailable && candidate.worker === (spec.resumeWorker ?? "claude") && (!spec.resumeModel || spec.resumeModel === candidate.model) ? spec.resumeSessionId : undefined;
 			let basePrompt = buildWorkerPrompt(spec.task, spec.guide, spec.criteria, spec.allowedPaths, Boolean(resumeId), spec.repoContext);
+			if (resumeId && spec.resumePrompt) {
+				basePrompt = spec.resumePrompt;
+				handoff = "";
+			}
 			let result: RunResult | undefined;
 			let kind: FailureKind | undefined;
 			for (let attempt = 0; attempt <= config.transientRetryAttempts; attempt++) {
@@ -2249,8 +2259,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor may authorize a worker.");
 			const allowedPaths = normalizeAllowedPaths(params.allowedPaths, false);
 			const previousTask = openTask();
-			const samePrompt = previousTask?.promptSeq === promptSeq;
-			const assessed = assessTask(params.profile ?? ((samePrompt || params.continuePrevious) ? previousTask?.profile : undefined) ?? config.defaultExecutionProfile, params.assessment ?? ((samePrompt || params.continuePrevious) ? previousTask?.assessment : undefined));
+			// Same task: another delegation of this prompt, a continuation, or the first delegation of a task planned
+			// earlier (plan_task, then the user confirms in a new prompt).
+			const belongsToTask = previousTask?.promptSeq === promptSeq || Boolean(params.continuePrevious) || previousTask?.phase === "planned";
+			const assessed = assessTask(params.profile ?? (belongsToTask ? previousTask?.profile : undefined) ?? config.defaultExecutionProfile, params.assessment ?? (belongsToTask ? previousTask?.assessment : undefined));
 			const profileName = assessed.profile;
 			const { guide: implementationGuide } = validateImplementationGuide(params.implementationGuide, allowedPaths, config.minImplementationGuideChars[profileName]);
 			const contextUsage = ctx.getContextUsage();
@@ -2272,7 +2284,6 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				// A follow-up step of the same open task may reuse the session on new paths (it already knows the code);
 				// scope is still enforced after the run. A different task never inherits a session.
 				const sameTask = Boolean(workerSession.taskId && workerSession.taskId === openTask()?.id);
-				const outsidePreviousScope = allowedPaths.filter((item) => !pathInAllowedScope(item, workerSession?.allowedPaths ?? []));
 				if (!sameTask) throw new Error("Cannot continue a different or completed task. Plan a fresh task.");
 				resumeSessionId = workerSession.sessionId;
 			} else {
@@ -2283,7 +2294,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			// A delegation belongs to the open task (planned with plan_task or already in progress): its flagship answers carry over.
 			// Same task: planned with plan_task, a correction (continuePrevious), or another delegation of the same user prompt.
 			const current = openTask();
-			const open = current && (params.continuePrevious || current.promptSeq === promptSeq) ? current : undefined;
+			const open = current && belongsToTask ? current : undefined;
 			taskPacket = {
 				id: open?.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 				promptSeq,

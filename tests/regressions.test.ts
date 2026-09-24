@@ -51,7 +51,7 @@ function configure(overrides: Record<string, unknown>, plan: Record<string, Step
 	fs.writeFileSync(planFile, JSON.stringify(plan));
 }
 
-function calls(): Array<{ cli: string; model: string; effort?: string; resume?: string; mode?: string; tools?: string; prompt: string }> {
+function calls(): Array<{ cli: string; model: string; effort?: string; maxTurns?: string; resume?: string; mode?: string; tools?: string; prompt: string }> {
 	return fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
@@ -248,5 +248,123 @@ test("AUDIT: unrelated prompts cannot inherit a flagship grant", async () => {
   await host.handlers.get("before_agent_start")({prompt:"An unrelated small question"},host.ctx);
   assert.equal(host.ctx.model.id,"gemini-3.8-flash"); assert.equal(host.questions.length,1);
   assert.equal(host.ctx.auditState.taskPacket.phase,"implemented");
+});
+
+const FAKE_CLAUDE = fs.readFileSync(path.join(here, "fakes", "fake-claude.mjs"), "utf8");
+const FAKE_GEMINI = fs.readFileSync(path.join(here, "fakes", "fake-gemini.mjs"), "utf8");
+const geminiOnly = { ...baseConfig.workerChains, medium: [{ worker: "gemini", model: "g1" }] };
+
+test("AUDIT A9: a Gemini implementer's correction resumes its own session", async () => {
+	configure({ workerChains: geminiOnly }, { g1: [{ write: { "value.txt": "bad" } }, { write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(result.details.verification, "fixed");
+	const [first, correction] = calls();
+	assert.equal(first.resume, undefined);
+	assert.equal(correction.resume, "gemini-session");
+	assert.match(correction.prompt, /\[CORRECTION ROUND 1\]/);
+});
+
+test("a resumed correction receives only the correction, not the guide and diff again", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	const correction = calls()[1];
+	assert.ok(correction.resume);
+	assert.match(correction.prompt, /^\[CORRECTION ROUND 1\][\s\S]*node --test check\.test\.mjs/);
+	assert.doesNotMatch(correction.prompt, /FILE GUIDE|\[CURRENT WORK\]/);
+});
+
+test("AUDIT A10: workers get the profile's turn limit, and reaching it stops the chain with work preserved", async () => {
+	const fake = path.join(root, "maxturns-claude.mjs");
+	fs.writeFileSync(fake, FAKE_CLAUDE.replace('if (step.action === "credits") {', 'if (step.action === "maxturns") { emit({ type: "result", subtype: "error_max_turns", is_error: true, session_id: sessionId, usage }); process.exit(1); }\nif (step.action === "credits") {'));
+	configure({ workerCommandArgs: [fake] }, { "claude-sonnet-5": [{ action: "maxturns", write: { "a.txt": "partial" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await assert.rejects(host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) }), /execution budget reached/);
+	assert.deepEqual(calls().map((call) => [call.model, call.maxTurns]), [["claude-sonnet-5", String(baseConfig.workerMaxTurns.medium)]]);
+	assert.equal(fs.readFileSync(path.join(host.ctx.cwd, "a.txt"), "utf8"), "partial");
+});
+
+test("zero timeouts mean no limit, not an immediate kill", async () => {
+	configure({ workerTimeoutMinutes: 0, delegationTimeoutMinutes: 0 }, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(fs.readFileSync(path.join(host.ctx.cwd, "a.txt"), "utf8"), "done");
+});
+
+test("AUDIT A6/A10: an API review cut off by its output limit gives no verdict and the next reviewer runs", async () => {
+	configure({ independentReviewProfiles: ["critical"], reviewApi: baseConfig.reviewApi }, { "claude-fable-5-1": [{ write: { "a.txt": "done" } }], "gemini-3.1-pro-preview": [{ text: "No material defect.\nVERDICT: PASS" }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	const limits: number[] = [];
+	host.ctx.modelRegistry.streamSimple = (_model: any, _context: any, options: any) => ({
+		result: async () => {
+			limits.push(options.maxTokens);
+			return { role: "assistant", content: [{ type: "text", text: "Partial analysis\nVERDICT: PASS" }], stopReason: "length", usage: { input: 500, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 550, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.002 } } };
+		},
+	});
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "critical", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.deepEqual(limits, [baseConfig.reviewMaxTokens]);
+	assert.equal(result.details.reviewVerdict, "pass");
+	assert.ok(calls().some((call) => call.cli === "gemini" && call.mode === "plan"), "the CLI reviewer produced the verdict");
+});
+
+test("AUDIT A11: the delegation diff leaves out earlier uncommitted edits to the same file", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "PRE\nNEW\n" } }] });
+	const repo = makeRepo({ "a.txt": "one\ntwo\n" });
+	fs.writeFileSync(path.join(repo, "a.txt"), "PRE\ntwo\n");
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	const text = result.content[0].text;
+	assert.match(text, /DIFF \(this delegation only\)[\s\S]*-two[\s\S]*\+NEW/);
+	assert.doesNotMatch(text, /^[-+]PRE/m);
+});
+
+test("AUDIT A12: Gemini usage is attributed to every model it reports", async () => {
+	const fake = path.join(root, "two-model-gemini.mjs");
+	fs.writeFileSync(fake, FAKE_GEMINI.replace("const stats = { models: { [model]: { tokens: { input: 1000, candidates: 50, thoughts: 10, cached: 0 } } } };", 'const stats = { models: { [model]: { tokens: { input: 1000, candidates: 50, thoughts: 10, cached: 0 } }, "gemini-helper": { tokens: { input: 200, candidates: 5, thoughts: 0, cached: 0 } } } };'));
+	configure({ geminiCommandArgs: [fake], workerChains: geminiOnly }, { g1: [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	const metrics = host.ctx.auditState.metrics;
+	const byModel = Object.values(metrics.byModel) as Array<{ model: string; input: number }>;
+	assert.equal(byModel.find((entry) => entry.model === "g1")?.input, 1000);
+	assert.equal(byModel.find((entry) => entry.model === "gemini-helper")?.input, 200);
+	assert.equal(metrics.geminiCalls, 1, "one invocation, however many models it used");
+});
+
+test("AUDIT A2/A12: a supervisor probe is capped and accounted", async () => {
+	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }], probeOnActivate: true }, {});
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	const limits: number[] = [];
+	host.ctx.modelRegistry.complete = async (_model: any, _context: any, options: any) => {
+		limits.push(options.maxTokens);
+		return { stopReason: "stop", content: [{ type: "text", text: "OK" }], usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+	};
+	await host.on();
+	assert.deepEqual(limits, [baseConfig.probeMaxTokens]);
+	const metrics = host.ctx.auditState.metrics;
+	assert.ok((Object.values(metrics.byModel) as Array<{ model: string; runs: number }>).some((entry) => entry.model === "gpt-5.5" && entry.runs === 1));
+	assert.ok(metrics.byRole.probe);
+});
+
+test("a task planned in one prompt keeps its profile and identity when delegated after the user's confirmation", async () => {
+	configure({}, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await host.handlers.get("before_agent_start")({ prompt: "Plan the rework" }, host.ctx);
+	const planned = await host.call("plan_task", { task: "Rework a.txt", profile: "large", rationale: "test" });
+	await host.handlers.get("before_agent_start")({ prompt: "Yes, go ahead" }, host.ctx);
+	const result = await host.call("delegate_implementation", { task: "Rework a.txt", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.details.profile, "large");
+	assert.equal(result.details.taskPacketId, planned.details.taskId);
+	assert.equal(calls()[0].model, baseConfig.workerChains.large[0].model);
 });
 
