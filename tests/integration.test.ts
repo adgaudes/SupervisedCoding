@@ -336,3 +336,14 @@ test("supervisor out of credits: switch to the next model and continue the run",
 	assert.equal(none, undefined);
 	assert.equal(host.ctx.model.id, "gemini-3.1-pro-preview");
 });
+
+test("a guide without SYMBOLS/PRESERVE is completed with safe defaults instead of costing a supervisor turn", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "x.txt": "x\n" } }] });
+	const host = makeHost(makeRepo({ "x.txt": "old\n" }));
+	await host.on();
+	const lean = "FILE: x.txt\nCHANGES:\n- Replace the whole content of the file x.txt with one single line that contains only the letter x; this sentence deliberately pads the guide so that it passes the minimum length for the medium profile, which requires four hundred characters of structured guidance before any worker may start working on the requested change in this small test repository.\nVERIFY:\n- Read the file back.";
+	const result = await host.call("delegate_implementation", { task: "Rewrite x.txt", profile: "medium", implementationGuide: lean, allowedPaths: ["x.txt"] });
+	assert.equal(result.isError, false);
+	assert.match(calls()[0].prompt, /PRESERVE:\n- Existing public API/);
+	assert.match(result.content[0].text, /DIFF \(allowed paths vs HEAD\)[\s\S]*-old[\s\S]*\+x/, "the supervisor sees the diff without extra turns");
+});

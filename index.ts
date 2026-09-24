@@ -216,6 +216,8 @@ interface TaskPacket {
 	lastReport?: string;
 	/** Why the supervisor chose this profile (from plan_task). */
 	rationale?: string;
+	/** User prompt that created the task (see promptSeq). */
+	promptSeq?: number;
 	/** User answers to "use flagship model X?" for this task, keyed by model id; asked at most once per task. */
 	flagshipDecisions?: Record<string, boolean>;
 	updatedAt: number;
@@ -754,20 +756,32 @@ function parseJsonObject(value: string): Record<string, any> | undefined {
 	}
 }
 
-function validateImplementationGuide(guide: string, allowedPaths: string[], minChars: number): void {
+const GUIDE_DEFAULTS: Record<string, string> = {
+	SYMBOL: "SYMBOLS: the functions, classes and tests named in CHANGES.",
+	PRESERVE: "PRESERVE:\n- Existing public API, behavior outside the task, formatting conventions and pre-existing changes.\n- Existing tests: never weaken, skip or delete them.",
+};
+
+/**
+ * Validate a guide and return it ready for the worker. FILE, CHANGES and VERIFY carry the task and are required;
+ * SYMBOLS and PRESERVE get conservative defaults instead of blocking, because a rejected delegation costs a whole
+ * supervisor turn and the worker prompt already enforces preservation.
+ */
+function validateImplementationGuide(guide: string, allowedPaths: string[], minChars: number): { guide: string; defaulted: string[] } {
 	const trimmed = guide.trim();
 	if (trimmed.length < minChars) {
 		throw new Error(`Delegation blocked: implementationGuide is too short (${trimmed.length}/${minChars} chars).`);
 	}
-	const requiredSections = ["FILE", "SYMBOL", "CHANGE", "PRESERVE", "VERIFY"];
-	const missing = requiredSections.filter((section) => !new RegExp(`(^|\\n)\\s*${section}S?\\s*:`, "i").test(trimmed));
+	const has = (section: string) => new RegExp(`(^|\\n)\\s*${section}S?\\s*:`, "i").test(trimmed);
+	const missing = ["FILE", "CHANGE", "VERIFY"].filter((section) => !has(section));
 	if (missing.length) {
-		throw new Error(`Delegation blocked: implementationGuide is missing structured sections: ${missing.join(", ")}. Use FILE, SYMBOLS, CHANGES, PRESERVE, VERIFY.`);
+		throw new Error(`Delegation blocked: implementationGuide is missing required sections: ${missing.join(", ")}. Use FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:.`);
 	}
 	const absentPaths = allowedPaths.filter((file) => !trimmed.includes(file));
 	if (absentPaths.length) {
 		throw new Error(`Delegation blocked: every allowed path must appear in the file guide. Missing: ${absentPaths.join(", ")}`);
 	}
+	const defaulted = Object.keys(GUIDE_DEFAULTS).filter((section) => !has(section));
+	return { guide: [trimmed, ...defaulted.map((section) => GUIDE_DEFAULTS[section])].join("\n"), defaulted };
 }
 
 interface ProcessOutcome {
@@ -1161,6 +1175,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	let supervisorFailoversThisRun = 0;
 	let settingModel = false;
 	let supervisorFlagshipGrant: FlagshipGrant | undefined;
+	/** Incremented per user prompt: delegations of one prompt form one task unless plan_task/continuePrevious say otherwise. */
+	let promptSeq = 0;
 	const lastLimitHeaders: Record<string, Record<string, string>> = {};
 	// Learning is global (across sessions and projects), stored next to the extension, never in the session log.
 	let learning: LearningState = loadLearning(learningPath);
@@ -1946,6 +1962,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				acceptanceCriteria: [],
 				allowedPaths: [],
 				phase: "planned",
+				promptSeq,
 				flagshipDecisions: {},
 				updatedAt: Date.now(),
 			};
@@ -2034,7 +2051,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor may authorize a worker.");
 			const allowedPaths = normalizeAllowedPaths(params.allowedPaths, false);
 			const profileName = params.profile ?? openTask()?.profile ?? config.defaultExecutionProfile;
-			validateImplementationGuide(params.implementationGuide, allowedPaths, config.minImplementationGuideChars[profileName]);
+			const { guide: implementationGuide } = validateImplementationGuide(params.implementationGuide, allowedPaths, config.minImplementationGuideChars[profileName]);
 			const contextUsage = ctx.getContextUsage();
 			if (contextUsage?.percent !== null && contextUsage?.percent !== undefined && contextUsage.percent >= config.contextWarningPercent) {
 				ctx.ui.notify(`Supervisor context is ${Math.round(contextUsage.percent)}% full. Keep review concise; compact before another broad exploration if needed.`, "warning");
@@ -2063,14 +2080,17 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 			const criteria = params.acceptanceCriteria ?? [];
 			// A delegation belongs to the open task (planned with plan_task or already in progress): its flagship answers carry over.
-			const open = openTask();
+			// Same task: planned with plan_task, a correction (continuePrevious), or another delegation of the same user prompt.
+			const current = openTask();
+			const open = current && (current.phase === "planned" || params.continuePrevious || current.promptSeq === promptSeq) ? current : undefined;
 			taskPacket = {
 				id: open?.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+				promptSeq: open?.promptSeq ?? promptSeq,
 				rationale: open?.rationale,
 				flagshipDecisions: open?.flagshipDecisions,
 				objective: params.task,
 				profile: profileName,
-				implementationGuide: params.implementationGuide,
+				implementationGuide: implementationGuide,
 				acceptanceCriteria: criteria,
 				allowedPaths: [...allowedPaths],
 				phase: "implementing",
@@ -2082,11 +2102,11 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 			try {
 				const repoContext = await repoContextFor(ctx.cwd);
-				const verifyCommands = config.autoVerify ? extractVerifyCommands(params.implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS) : [];
+				const verifyCommands = config.autoVerify ? extractVerifyCommands(implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS) : [];
 				// Baseline first: checks that already failed are reported, never blamed on (or credited to) the worker.
 				const baseline = new Map<string, boolean>();
 				for (const command of verifyCommands) baseline.set(command, (await runCheck(ctx, command, signal)).ok);
-				const spec = { task: params.task, guide: params.implementationGuide, criteria, allowedPaths, profileName, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, repoContext };
+				const spec = { task: params.task, guide: implementationGuide, criteria, allowedPaths, profileName, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, repoContext };
 				const outcome = await executeImplementation(ctx, spec, signal, (text, label) => onUpdate?.({ content: [{ type: "text", text: truncateUtf8(text, 4000) }], details: { running: true, profile: profileName, worker: label } }));
 				if (outcome.resumed) metrics.resumedDelegations++;
 				const final = outcome.final as RunResult;
@@ -2158,12 +2178,16 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				const usageLine = combined ? `Combined tokens: ${combined.input} in + ${combined.output} out + ${combined.cacheRead} cache-read; reported cost $${combined.cost.total.toFixed(2)}` : "Usage unavailable";
 				const safetyLine = scopeViolations.length ? `SAFETY VIOLATIONS: ${scopeViolations.join("; ")}\n` : "";
 				const changedLine = afterAll.available ? `Changed files: ${afterAll.changedFiles.join(", ") || "none"}\n` : "Git unavailable: scope enforcement degraded outside Git repositories.\n";
+				// The supervisor reviews the change right here instead of spending extra turns on supervisor_git.
+				const resultDiff = afterAll.available ? await scopedDiff(ctx.cwd, allowedPaths, 12_000) : "";
+				const diffSection = resultDiff && !resultDiff.includes("[Diff truncated") ? `DIFF (allowed paths vs HEAD)\n\`\`\`diff\n${resultDiff}\n\`\`\`` : resultDiff ? "DIFF: too large to include; inspect it with supervisor_git (diff-stat first)." : "";
 				const verificationLine = verifyCommands.length ? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""}\n` : "Automatic verification: none (no allowlisted command in VERIFY); run_verification before accepting.\n";
 				const text = truncateUtf8([
 					`${candidateLabel(implementer)} (${profileName}) ${failed ? "failed" : "completed"}.\n${safetyLine}${changedLine}${verificationLine}${usageLine}`,
 					outcome.primaryOutput,
 					verificationText,
 					reviewText,
+					diffSection,
 					learningNotes.length ? `Learning: ${learningNotes.join("; ")}` : "",
 				].filter(Boolean).join("\n\n"), config.maxOutputBytes);
 				return {
@@ -2370,6 +2394,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!enabled) return;
 		lastUserPrompt = event.prompt;
+		promptSeq++;
 		supervisorFailoversThisRun = 0;
 		await ensureBestSupervisor(ctx, "best available for this prompt");
 		applySupervisorEffort();
@@ -2379,7 +2404,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task (no broad exploration, never paste source into handoffs).\n2. Call plan_task with the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Then review diff-stat/diff-names and scoped diffs; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Commit/push only through the confirmation tools; never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Every extra turn resends the whole context.\n2. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
 				display: false,
 			},
 		};
