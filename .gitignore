@@ -1,4 +1,4 @@
-# Dati di apprendimento locali (esiti, lezioni per repository): non versionati
+# Learning data of versions before 0.1.0 (now kept in <pi-agent-dir>/supervised-coding)
 data/
 node_modules/
 .npm-cache/

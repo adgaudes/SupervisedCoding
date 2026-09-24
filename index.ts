@@ -52,9 +52,30 @@ import { checkpoint, changesSince, type Checkpoint } from "./changes.ts";
 
 const execFile = promisify(execFileCallback);
 const extensionDir = path.dirname(fileURLToPath(import.meta.url));
-/** Overridable so integration tests can run the real extension against fake CLIs and a scratch data directory. */
+/**
+ * User data and personal settings live in Pi's agent directory, outside the package, so installing or updating the
+ * extension never overwrites them: <agent-dir>/supervised-coding/{config.json, learning.json, usage.jsonl, pi-sessions}.
+ * config.json next to this file holds the defaults. Both paths are overridable so tests use scratch files.
+ */
+const userDir = path.join(process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"), "supervised-coding");
 const configPath = process.env.SUPERVISED_CODING_CONFIG ?? path.join(extensionDir, "config.json");
-const learningPath = process.env.SUPERVISED_CODING_DATA ?? path.join(extensionDir, "data", "learning.json");
+const userConfigPath = process.env.SUPERVISED_CODING_CONFIG ? undefined : path.join(userDir, "config.json");
+const learningPath = process.env.SUPERVISED_CODING_DATA ?? path.join(userDir, "learning.json");
+
+/** Earlier versions kept learning data inside the extension folder: copy it once to the user directory. */
+function migrateLegacyData(): void {
+	if (process.env.SUPERVISED_CODING_DATA) return;
+	const legacyDir = path.join(extensionDir, "data");
+	try {
+		if (fs.existsSync(learningPath) || !fs.existsSync(path.join(legacyDir, "learning.json"))) return;
+		fs.mkdirSync(userDir, { recursive: true });
+		for (const name of ["learning.json", "usage.jsonl"]) {
+			if (fs.existsSync(path.join(legacyDir, name))) fs.copyFileSync(path.join(legacyDir, name), path.join(userDir, name));
+		}
+	} catch {
+		// The old data stays where it is; learning starts fresh rather than blocking the extension.
+	}
+}
 const EXTENSION_NAME = "SupervisedCoding";
 const STATE_TYPE = "supervised-coding";
 const POLICY_TYPE = "supervised-coding-policy";
@@ -66,7 +87,7 @@ const WORKER_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const MAX_STORED_REPORT_CHARS = 8000;
 /** data/usage.jsonl rotates to usage.jsonl.1 beyond this size, so the invocation log stays bounded. */
 const USAGE_LOG_MAX_BYTES = 5 * 1024 * 1024;
-const FLAGSHIP_YES = "SI";
+const FLAGSHIP_YES = "Yes";
 const FLAGSHIP_NO = "No";
 /** Shell metacharacters that could chain or redirect commands in run_verification. */
 const UNSAFE_COMMAND_CHARS = /[;&|`$<>\r\n%^()]/;
@@ -81,16 +102,16 @@ type WorkerEffort = "low" | "medium" | "high" | "xhigh" | "max";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ExecutionProfileName = (typeof PROFILE_NAMES)[number];
 /**
- * claude = Claude Code CLI; gemini = Gemini CLI; pi = any model configured in Pi, run through Pi's own CLI
- * (GPT, Gemini or any other provider: every model can implement or review); api = a read-only reviewer called
- * directly through a Pi provider (no CLI fixed prompt overhead).
+ * claude = Claude Code CLI; pi = any model configured in Pi (e.g. GPT through an OpenAI Codex subscription), run
+ * through Pi's own CLI; api = a read-only reviewer called directly through a Pi provider (no CLI prompt overhead).
+ * Every model can implement or review: roles follow the task, never the model family.
  */
-type WorkerKind = "claude" | "gemini" | "pi" | "api";
-type SessionWorker = "claude" | "gemini" | "pi";
+type WorkerKind = "claude" | "pi" | "api";
+type SessionWorker = "claude" | "pi";
 
 interface WorkerCandidate {
 	worker: WorkerKind;
-	/** Claude model id, or Gemini model id ("" = Gemini CLI default routing). */
+	/** Model id (Claude Code model, or the model of the Pi provider). */
 	model: string;
 	effort?: WorkerEffort;
 	/** Pi provider, for "pi" workers and "api" reviewers. */
@@ -108,15 +129,13 @@ interface Config {
 	workerCommand: string;
 	/** Extra leading arguments for workerCommand (e.g. a script path when workerCommand is node). */
 	workerCommandArgs: string[];
-	geminiCommand: string;
-	geminiCommandArgs: string[];
 	/** Pi's CLI for "pi" workers ("pi" = the Pi installation running this extension). */
 	piCommand: string;
 	piCommandArgs: string[];
 	/** Tools of a "pi" implementer and of a "pi" read-only reviewer (Pi has no per-command shell allowlist). */
 	piWorkerTools: string[];
 	piReadOnlyTools: string[];
-	/** Read-only reviews through a Pi provider API; the Gemini CLI remains the fallback. null disables it. */
+	/** Read-only reviews through a Pi provider API, used only with complete review material. null disables it. */
 	reviewApi: { provider: string; model: string; reasoning: ThinkingLevel } | null;
 	/** Run the guide's VERIFY commands before and after each delegation and let the worker fix regressions. */
 	autoVerify: boolean;
@@ -146,7 +165,7 @@ interface Config {
 	independentReviewProfiles: ExecutionProfileName[];
 	/** Ordered by preference (best first); only candidates with configured Pi auth are considered. */
 	supervisorChain: SupervisorCandidate[];
-	/** Top-tier models used only for critical tasks and only after the user answers SI. */
+	/** Top-tier models used only for critical tasks and only after the user answers Yes. */
 	flagshipModels: string[];
 	/** Supervisor reasoning effort per task profile ("default" = no open task). */
 	supervisorEffort: Record<ExecutionProfileName | "default", ThinkingLevel>;
@@ -182,11 +201,7 @@ interface SupervisorMetrics {
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
 	costUsd: number;
-	geminiCalls: number;
-	geminiInputTokens: number;
-	geminiOutputTokens: number;
-	geminiCachedTokens: number;
-	geminiFallbacks: number;
+	piRuns: number;
 	providerFailovers: number;
 	supervisorFailovers: number;
 	readOnlyConsultations: number;
@@ -294,7 +309,6 @@ interface FlagshipGrant {
 interface RunResult {
 	worker: WorkerKind;
 	provider?: string;
-	modelUsages?: Array<{ model: string; usage: Usage; costUsd: number }>;
 	model: string;
 	exitCode: number;
 	output: string;
@@ -332,11 +346,7 @@ const EMPTY_METRICS: SupervisorMetrics = {
 	cacheReadTokens: 0,
 	cacheWriteTokens: 0,
 	costUsd: 0,
-	geminiCalls: 0,
-	geminiInputTokens: 0,
-	geminiOutputTokens: 0,
-	geminiCachedTokens: 0,
-	geminiFallbacks: 0,
+	piRuns: 0,
 	providerFailovers: 0,
 	supervisorFailovers: 0,
 	readOnlyConsultations: 0,
@@ -360,74 +370,64 @@ const EMPTY_METRICS: SupervisorMetrics = {
 
 /**
  * Starting quality order per profile (config.json normally overrides it). Claude Code leads where its harness
- * matters (per-command shell permissions, so the worker can run the tests itself); GPT through Pi follows on a
- * different subscription, so a Claude limit never stops the work; learning escalates or reorders with evidence.
+ * matters (per-command shell permissions, so the worker can run the tests itself); GPT through Pi alternates with
+ * it on a different subscription, so one provider's limit never stops the work. Learning escalates or reorders
+ * with evidence.
  */
 const DEFAULT_WORKER_CHAINS: Record<ExecutionProfileName, WorkerCandidate[]> = {
 	small: [
 		{ worker: "claude", model: "claude-sonnet-5", effort: "medium" },
 		{ worker: "pi", provider: "openai-codex", model: "gpt-6-sol", effort: "medium" },
-		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "low" },
 	],
 	medium: [
 		{ worker: "claude", model: "claude-sonnet-5", effort: "high" },
 		{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "high" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "medium" },
-		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
+		{ worker: "pi", provider: "openai-codex", model: "gpt-6-sol", effort: "high" },
 	],
 	large: [
 		{ worker: "claude", model: "claude-opus-5-5", effort: "high" },
 		{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" },
 		{ worker: "claude", model: "claude-sonnet-5", effort: "xhigh" },
-		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 	],
 	critical: [
 		{ worker: "claude", model: "claude-fable-5-1", effort: "xhigh" },
 		{ worker: "pi", provider: "openai-codex", model: "gpt-6-astra", effort: "xhigh" },
 		{ worker: "claude", model: "claude-opus-5-5", effort: "xhigh" },
 		{ worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" },
-		{ worker: "gemini", model: "gemini-3.1-pro-preview" },
 		{ worker: "claude", model: "claude-sonnet-5", effort: "max" },
 	],
 };
 
-type LegacyConfig = Partial<Config> & {
-	workerModel?: string;
-	workerEffort?: WorkerEffort;
-	geminiModel?: string;
-	geminiReviewProfiles?: ExecutionProfileName[];
-	geminiImplementationFallback?: boolean;
-	executionProfiles?: Partial<Record<ExecutionProfileName, { workerModel: string; workerEffort: WorkerEffort }>>;
-	budgetProfiles?: Partial<Record<ExecutionProfileName, { workerModel: string; workerEffort: WorkerEffort }>>;
-	defaultBudgetProfile?: ExecutionProfileName;
-};
+type RawConfig = Partial<Config>;
 
-/** Pre-chain configs (executionProfiles + Gemini fallback flag) become single-Claude-plus-Gemini chains. */
-function legacyChains(raw: LegacyConfig): Record<ExecutionProfileName, WorkerCandidate[]> | undefined {
-	const profiles = raw.executionProfiles ?? raw.budgetProfiles;
-	if (!profiles) return undefined;
-	const withGemini = raw.geminiImplementationFallback ?? true;
-	return Object.fromEntries(PROFILE_NAMES.map((name) => {
-		const profile = profiles[name];
-		const chain: WorkerCandidate[] = profile ? [{ worker: "claude", model: profile.workerModel, effort: profile.workerEffort }] : [...DEFAULT_WORKER_CHAINS[name]];
-		if (profile && withGemini) chain.push({ worker: "gemini", model: raw.geminiModel ?? "" });
-		return [name, chain];
-	})) as Record<ExecutionProfileName, WorkerCandidate[]>;
+/** Plain objects are merged one level deep (e.g. one profile of workerChains); arrays and scalars are replaced. */
+function mergeConfig(base: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
+	const merged: Record<string, unknown> = { ...base };
+	for (const [key, value] of Object.entries(override)) {
+		const current = merged[key];
+		const plain = (item: unknown) => Boolean(item) && typeof item === "object" && !Array.isArray(item);
+		merged[key] = plain(current) && plain(value) ? { ...(current as object), ...(value as object) } : value;
+	}
+	return merged;
 }
 
 function loadConfig(): Config {
-	const raw = JSON.parse(fs.readFileSync(configPath, "utf8")) as LegacyConfig;
-	const chainsSource = raw.workerChains ?? legacyChains(raw) ?? DEFAULT_WORKER_CHAINS;
+	const defaults = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+	// Personal settings live outside the package, so updates never overwrite them.
+	const personal = userConfigPath && fs.existsSync(userConfigPath) ? JSON.parse(fs.readFileSync(userConfigPath, "utf8")) as Record<string, unknown> : {};
+	const raw = mergeConfig(defaults, personal) as RawConfig;
+	const chainsSource = raw.workerChains ?? DEFAULT_WORKER_CHAINS;
 	const workerChains = Object.fromEntries(PROFILE_NAMES.map((name) => [name, chainsSource[name]?.length ? chainsSource[name] : DEFAULT_WORKER_CHAINS[name]])) as Record<ExecutionProfileName, WorkerCandidate[]>;
 	for (const [name, chain] of Object.entries(workerChains)) {
 		for (const candidate of chain) {
-			if (candidate.worker !== "claude" && candidate.worker !== "gemini" && candidate.worker !== "pi") throw new Error(`Invalid worker '${String(candidate.worker)}' in workerChains.${name} (${configPath}).`);
+			if (candidate.worker !== "claude" && candidate.worker !== "pi") throw new Error(`Invalid worker '${String(candidate.worker)}' in workerChains.${name} (${configPath}).`);
 			if (candidate.worker === "claude" && !candidate.model) throw new Error(`Claude candidates need a model in workerChains.${name} (${configPath}).`);
 			if (candidate.worker === "pi" && (!candidate.provider || !candidate.model)) throw new Error(`Pi candidates need a provider and a model in workerChains.${name} (${configPath}).`);
 		}
 	}
-	const requestedDefault = raw.defaultExecutionProfile ?? raw.defaultBudgetProfile;
+	const requestedDefault = raw.defaultExecutionProfile;
 	const rawMinGuide = (raw as { minImplementationGuideChars?: number | Partial<Record<ExecutionProfileName, number>> }).minImplementationGuideChars;
 	const guideDefaults: Record<ExecutionProfileName, number> = { small: 150, medium: 400, large: 400, critical: 400 };
 	const minImplementationGuideChars = Object.fromEntries(PROFILE_NAMES.map((name) => [name, typeof rawMinGuide === "number" ? rawMinGuide : rawMinGuide?.[name] ?? guideDefaults[name]])) as Record<ExecutionProfileName, number>;
@@ -469,14 +469,12 @@ function loadConfig(): Config {
 	return {
 		workerCommand: raw.workerCommand ?? "claude",
 		workerCommandArgs: raw.workerCommandArgs ?? [],
-		geminiCommand: raw.geminiCommand ?? "gemini",
-		geminiCommandArgs: raw.geminiCommandArgs ?? [],
 		piCommand: raw.piCommand ?? "pi",
 		piCommandArgs: raw.piCommandArgs ?? [],
 		// No shell by default: Pi cannot restrict it to the verification commands, and the extension runs VERIFY itself.
 		piWorkerTools: raw.piWorkerTools ?? ["read", "edit", "write", "grep", "find", "ls"],
 		piReadOnlyTools: raw.piReadOnlyTools ?? ["read", "grep", "find", "ls"],
-		reviewApi: raw.reviewApi === null ? null : { provider: "google", model: "gemini-3.1-pro-preview", reasoning: "high", ...raw.reviewApi },
+		reviewApi: raw.reviewApi === null ? null : { provider: "openai-codex", model: "gpt-5.5", reasoning: "high", ...raw.reviewApi },
 		autoVerify: raw.autoVerify ?? true,
 		maxCorrectionRounds: raw.maxCorrectionRounds ?? 2,
 		repoRulesFiles: raw.repoRulesFiles ?? ["AGENTS.md", "CLAUDE.md"],
@@ -504,7 +502,7 @@ function loadConfig(): Config {
 		claudeReadOnlyDisallowedTools: raw.claudeReadOnlyDisallowedTools ?? ["Edit", "Write", "Bash(*)"],
 		workerChains,
 		defaultExecutionProfile: requestedDefault && PROFILE_NAMES.includes(requestedDefault) ? requestedDefault : "medium",
-		independentReviewProfiles: raw.independentReviewProfiles ?? raw.geminiReviewProfiles ?? ["large", "critical"],
+		independentReviewProfiles: raw.independentReviewProfiles ?? ["large", "critical"],
 		supervisorChain: (raw.supervisorChain ?? []).map(({ provider, model }) => ({ provider, model })),
 		flagshipModels,
 		supervisorEffort: { default: "medium", small: "medium", medium: "medium", large: "high", critical: "xhigh", ...raw.supervisorEffort },
@@ -543,16 +541,6 @@ function resolveClaudeCommand(configured: string): string {
 		path.join(os.homedir(), ".local", "bin", "claude.exe"),
 	].filter((item): item is string => Boolean(item));
 	return candidates.find((item) => fs.existsSync(item)) ?? "claude";
-}
-
-function resolveGeminiInvocation(configured: string): { command: string; prefix: string[] } {
-	if (configured !== "gemini" || process.platform !== "win32") return { command: configured, prefix: [] };
-	const appData = process.env.APPDATA;
-	if (appData) {
-		const script = path.join(appData, "npm", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js");
-		if (fs.existsSync(script)) return { command: process.execPath, prefix: [script] };
-	}
-	return { command: "gemini", prefix: [] };
 }
 
 /** Keep the end of long command output: test runners print failures and summaries last. */
@@ -851,41 +839,6 @@ function usageFromClaude(event: Record<string, any>, costUsd: number): Usage | u
 	return { input, output, cacheRead, cacheWrite, totalTokens: input + output + cacheRead + cacheWrite, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: costUsd } };
 }
 
-function geminiUsage(stats: Record<string, any> | undefined): { usage?: Usage; model?: string; modelUsages?: Array<{ model: string; usage: Usage; costUsd: number }> } {
-	const models = stats?.models && typeof stats.models === "object" ? Object.entries(stats.models) : [];
-	if (!models.length) return {};
-	let input = 0;
-	let output = 0;
-	let cached = 0;
-	let reasoning = 0;
-	const modelUsages: Array<{ model: string; usage: Usage; costUsd: number }> = [];
-	for (const [model, data] of models) {
-		const tokens = (data as any)?.tokens;
-		const i = numberField(tokens?.input), o = numberField(tokens?.candidates) + numberField(tokens?.thoughts), c = numberField(tokens?.cached);
-		modelUsages.push({ model, costUsd: 0, usage: { input: i, output: o, cacheRead: c, cacheWrite: 0, reasoning: numberField(tokens?.thoughts), totalTokens: i + o + c, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
-		input += numberField(tokens?.input);
-		output += numberField(tokens?.candidates) + numberField(tokens?.thoughts);
-		cached += numberField(tokens?.cached);
-		reasoning += numberField(tokens?.thoughts);
-	}
-	return { model: String(models[0][0]), modelUsages, usage: { input, output, cacheRead: cached, cacheWrite: 0, reasoning, totalTokens: input + output + cached, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-}
-
-function parseJsonObject(value: string): Record<string, any> | undefined {
-	try {
-		return JSON.parse(value) as Record<string, any>;
-	} catch {
-		const start = value.indexOf("{");
-		const end = value.lastIndexOf("}");
-		if (start < 0 || end <= start) return undefined;
-		try {
-			return JSON.parse(value.slice(start, end + 1)) as Record<string, any>;
-		} catch {
-			return undefined;
-		}
-	}
-}
-
 const GUIDE_DEFAULTS: Record<string, string> = {
 	SYMBOL: "SYMBOLS: the functions, classes and tests named in CHANGES.",
 	PRESERVE: "PRESERVE:\n- Existing public API, behavior outside the task, formatting conventions and pre-existing changes.\n- Existing tests: never weaken, skip or delete them.",
@@ -1089,37 +1042,6 @@ async function runClaude(
 	};
 }
 
-async function runGemini(cwd: string, config: Config, candidate: WorkerCandidate, prompt: string, mode: "plan" | "auto_edit", signal: AbortSignal | undefined, timeoutMs: number, resumeSessionId?: string): Promise<RunResult> {
-	const invocation = resolveGeminiInvocation(config.geminiCommand);
-	const args = [...invocation.prefix, ...config.geminiCommandArgs, "--skip-trust", "--approval-mode", mode, "--output-format", "json", "-p", ""];
-	if (candidate.model) args.push("--model", candidate.model);
-	if (resumeSessionId) args.push("--resume", resumeSessionId);
-	const outcome = await runProcess(invocation.command, args, prompt, cwd, signal, timeoutMs, undefined, { maxBytes: config.maxProcessOutputBytes });
-	const parsed = parseJsonObject(outcome.stdout);
-	const response = typeof parsed?.response === "string" ? parsed.response : "";
-	let errorMessage: string | undefined = parsed?.error?.message || (!parsed ? "Gemini CLI returned invalid or truncated JSON." : outcome.exitCode !== 0 ? outcome.stderr.trim() || outcome.stdout.trim() || "Gemini CLI failed." : undefined);
-	if (outcome.timedOut) errorMessage = `Gemini CLI timed out after ${Math.round(timeoutMs / 60_000)} minutes.${errorMessage ? ` ${errorMessage}` : ""}`;
-	if (outcome.aborted) errorMessage = "Gemini worker aborted.";
-	const measured = geminiUsage(parsed?.stats);
-	const httpStatus = typeof parsed?.error?.code === "number" ? parsed.error.code : undefined;
-	return {
-		worker: "gemini",
-		model: measured.model ?? candidate.model,
-		exitCode: outcome.exitCode,
-		output: response,
-		stderr: outcome.stderr,
-		errorMessage,
-		turns: response ? 1 : 0,
-		sessionId: typeof parsed?.session_id === "string" ? parsed.session_id : undefined,
-		costUsd: 0,
-		usage: measured.usage,
-		modelUsages: measured.modelUsages,
-		signal: { text: `${errorMessage ?? ""}\n${outcome.exitCode !== 0 ? outcome.stderr : ""}`, httpStatus, errorCode: typeof parsed?.error?.status === "string" ? parsed.error.status : undefined },
-		billing: "unknown", // Environment variables do not prove which authentication the CLI selected.
-		timedOut: outcome.timedOut,
-	};
-}
-
 /**
  * Pi's CLI as node + script (a `.cmd` shim cannot be spawned without a shell on Windows). "pi" resolves to the
  * managed installation that runs this extension, as Pi's own launcher does.
@@ -1224,6 +1146,32 @@ function runFailed(result: RunResult): boolean {
 	return result.exitCode !== 0 || Boolean(result.errorMessage) || result.timedOut;
 }
 
+/**
+ * One run per distinct check: "npm test" / "npm run test" (also pnpm, yarn) resolve to their package.json script,
+ * so "npm run test" and "node --test" are the same check when the script is "node --test". The first spelling wins.
+ */
+function dedupeVerifyCommands(cwd: string, commands: string[]): string[] {
+	let scripts: Record<string, unknown> = {};
+	try {
+		scripts = (JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8")) as { scripts?: Record<string, unknown> }).scripts ?? {};
+	} catch {
+		// No package.json: every command is its own check.
+	}
+	const effective = (command: string) => {
+		const match = /^(npm|pnpm|yarn)( run)? (\S+)$/.exec(command);
+		if (!match || (match[1] === "npm" && !match[2] && match[3] !== "test")) return command;
+		const script = scripts[match[3]];
+		return typeof script === "string" ? script.trim().replace(/\s+/g, " ") : command;
+	};
+	const seen = new Set<string>();
+	return commands.filter((command) => {
+		const key = effective(command);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
 /** The turn/cost limit the extension itself imposed stopped the run (structured subtype, else the error text). */
 function executionLimit(result: RunResult): string | undefined {
 	const text = runFailed(result) ? result.errorMessage ?? "" : "";
@@ -1254,27 +1202,24 @@ function modelDisplayName(ctx: ExtensionContext, provider: string, model: string
 function candidateLabel(candidate: WorkerCandidate): string {
 	if (candidate.worker === "claude") return `Claude ${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}`;
 	if (candidate.worker === "api") return `${candidate.provider} API ${candidate.model}`;
-	if (candidate.worker === "pi") return `Pi ${candidate.provider}/${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}`;
-	return `Gemini ${candidate.model || "default"}`;
+	return `Pi ${candidate.provider}/${candidate.model}${candidate.effort ? `/${candidate.effort}` : ""}`;
 }
 
 /** Model family, derived from the model id (one provider may serve several families, e.g. through Pi). */
 function modelFamily(candidate: WorkerCandidate): string {
 	const id = candidate.model.toLowerCase();
 	if (/claude|opus|sonnet|haiku|fable/.test(id)) return "anthropic";
-	if (/gpt|codex|^od/.test(id)) return "openai";
-	if (/gemini/.test(id)) return "google";
+	if (/gpt|codex|^o\d/.test(id)) return "openai";
 	return candidate.provider ?? candidate.worker;
 }
 
-type ConsultReviewer = "auto" | "claude" | "gpt" | "gemini";
-const CONSULT_FAMILIES: Record<Exclude<ConsultReviewer, "auto">, string> = { claude: "anthropic", gpt: "openai", gemini: "google" };
+type ConsultReviewer = "auto" | "claude" | "gpt";
+const CONSULT_FAMILIES: Record<Exclude<ConsultReviewer, "auto">, string> = { claude: "anthropic", gpt: "openai" };
 
 function workerHealthKeys(candidate: WorkerCandidate): string[] {
 	if (candidate.worker === "claude") return ["claude-cli", `claude-cli:${claudeFamily(candidate.model)}`, `claude-cli:model:${candidate.model}`];
 	// Pi workers and API reviewers share the Pi provider account (and its credits) with the supervisor.
-	if (candidate.worker === "api" || candidate.worker === "pi") return [`pi:${candidate.provider}`, `pi:model:${candidate.provider}/${candidate.model}`];
-	return ["gemini-cli", `gemini-cli:model:${candidate.model || "default"}`];
+	return [`pi:${candidate.provider}`, `pi:model:${candidate.provider}/${candidate.model}`];
 }
 
 const SKIPPED_DIRS = new Set([".git", "node_modules", "dist", "build", "out", "coverage", ".venv", "__pycache__", "target", ".next"]);
@@ -1378,6 +1323,13 @@ interface AttemptRecord {
 	ok: boolean;
 	kind?: FailureKind;
 	detail?: string;
+	/** Position in the configured chain, so reports list candidates in chain order (blocked ones included). */
+	order?: number;
+}
+
+/** Attempts in chain order: blocked candidates are collected first but must appear where they sit in the chain. */
+function inChainOrder(attempts: AttemptRecord[]): AttemptRecord[] {
+	return [...attempts].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
 
 interface ImplementationSpec {
@@ -1451,6 +1403,7 @@ function findLastAssistantError(messages: unknown[]): { errorMessage: string; pr
 }
 
 export default function supervisedCoding(pi: ExtensionAPI): void {
+	migrateLegacyData();
 	const config = loadConfig();
 	let enabled = false;
 	let toolsBeforeSupervisor: string[] | undefined;
@@ -1533,7 +1486,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	function statusText(ctx: ExtensionContext): string {
 		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
 		const task = openTask() ? ` · ${taskPacket?.profile}` : "";
-		return `${EXTENSION_NAME} ${model}/${pi.getThinkingLevel()}${supervisorMode === "auto" ? " (auto)" : ""}${task} · C${metrics.claudeAttempts} G${metrics.geminiCalls} · ${metrics.providerFailovers + metrics.supervisorFailovers} failovers`;
+		return `${EXTENSION_NAME} ${model}/${pi.getThinkingLevel()}${supervisorMode === "auto" ? " (auto)" : ""}${task} · C${metrics.claudeAttempts} P${metrics.piRuns} · ${metrics.providerFailovers + metrics.supervisorFailovers} failovers`;
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -1585,7 +1538,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		if (decided !== undefined) return decided;
 		if (!ctx.hasUI) return false;
 		metrics.flagshipRequests++;
-		const answer = await ctx.ui.select(`Sarebbe più utile utilizzare ${name} per questa task. Vuoi utilizzarlo?`, [FLAGSHIP_YES, FLAGSHIP_NO]);
+		const answer = await ctx.ui.select(`${name} would be more useful for this task. Use it?`, [FLAGSHIP_YES, FLAGSHIP_NO]);
 		const approved = answer === FLAGSHIP_YES;
 		if (approved) metrics.flagshipApprovals++;
 		if (openTask() && taskPacket) taskPacket = { ...taskPacket, flagshipDecisions: { ...taskPacket.flagshipDecisions, [model]: approved }, updatedAt: Date.now() };
@@ -1610,10 +1563,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			try {
 				if (fs.statSync(usageLog).size > USAGE_LOG_MAX_BYTES) fs.renameSync(usageLog, `${usageLog}.1`);
 			} catch { /* No log yet. */ }
-			fs.appendFileSync(usageLog, JSON.stringify({ at: Date.now(), taskId: taskPacket?.id, role, worker: result.worker, provider: result.provider, model: result.model, billing: result.billing ?? "unknown", usage: result.usage, modelUsages: result.modelUsages, costUsd: result.costUsd, measured: Boolean(result.usage), failed: runFailed(result), timedOut: result.timedOut }) + "\n");
+			fs.appendFileSync(usageLog, JSON.stringify({ at: Date.now(), taskId: taskPacket?.id, role, worker: result.worker, provider: result.provider, model: result.model, billing: result.billing ?? "unknown", usage: result.usage, costUsd: result.costUsd, measured: Boolean(result.usage), failed: runFailed(result), timedOut: result.timedOut }) + "\n");
 		} catch { /* Telemetry must never stop implementation. */ }
-		for (const part of result.modelUsages ?? [{ model: result.model, usage: result.usage, costUsd: result.costUsd }]) recordModelRun({ ...result, ...part }, role);
-		if (result.worker === "gemini" && result.modelUsages) metrics.geminiCalls -= Math.max(0, result.modelUsages.length - 1);
+		recordModelRun(result, role);
 	}
 
 	function recordModelRun(result: RunResult, role: UsageRole): void {
@@ -1642,10 +1594,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			metrics.apiTokens += result.usage?.totalTokens ?? 0;
 			metrics.apiCostUsd += result.costUsd;
 		} else {
-			metrics.geminiCalls++;
-			metrics.geminiInputTokens += result.usage?.input ?? 0;
-			metrics.geminiOutputTokens += result.usage?.output ?? 0;
-			metrics.geminiCachedTokens += result.usage?.cacheRead ?? 0;
+			metrics.piRuns++;
 		}
 	}
 
@@ -1653,7 +1602,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	function recordWorkerHealth(candidate: WorkerCandidate, result: RunResult, kind: FailureKind | undefined): void {
 		const now = Date.now();
 		const source = `${candidateLabel(candidate)} run`;
-		const providerKey = candidate.worker === "claude" ? "claude-cli" : candidate.worker === "api" || candidate.worker === "pi" ? `pi:${candidate.provider}` : "gemini-cli";
+		const providerKey = candidate.worker === "claude" ? "claude-cli" : `pi:${candidate.provider}`;
 		const accountKey = candidate.worker === "claude" ? claudeLimitKey(result.limitInfo, candidate.model) : providerKey;
 		if (result.limit) applyReading(health, accountKey, result.limit, source, cooldownMs(), now);
 		if (!kind) {
@@ -1741,7 +1690,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const hint = profileHint(profileStats(learning, repo), profile);
 		if (hint) lines.push(`Learning: ${hint}`);
 		const adjusted = config.workerChains[profile]
-			.filter((item) => item.worker !== "gemini" && item.effort)
+			.filter((item) => item.effort)
 			.map((item) => ({ item, effort: config.learning.autoTuneEffort ? effectiveEffort(learning, profile, item.model, item.effort as Effort, repo, taskPacket?.assessment?.kind) : item.effort }))
 			.filter(({ item, effort }) => effort !== item.effort)
 			.map(({ item, effort }) => `${item.model} ${item.effort}→${effort}`);
@@ -1796,13 +1745,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			supervisors.set(key, item);
 		}
 
-		// Workers and reviewers; the Gemini CLI reports no cost, so it is estimated from Pi's price list.
-		const estimate = (item: ModelUsage): { cost: number; estimated: boolean } => {
-			if (item.costUsd > 0 || item.worker !== "gemini") return { cost: item.costUsd, estimated: false };
-			const price = ctx.modelRegistry.find("google", item.model)?.cost;
-			if (!price) return { cost: 0, estimated: true };
-			return { cost: (item.input * price.input + item.output * price.output + item.cacheRead * price.cacheRead) / 1_000_000, estimated: true };
-		};
+		// Workers and reviewers: Claude Code and Pi both report the cost of each run (API-equivalent for subscriptions).
+		const estimate = (item: ModelUsage): { cost: number; estimated: boolean } => ({ cost: item.costUsd, estimated: false });
 		const workerRows = Object.values(metrics.byModel).sort((a, b) => tokens(b) - tokens(a));
 		const supervisorTotal = [...supervisors.values()].reduce((sum, item) => sum + tokens(item), 0);
 		const supervisorCost = [...supervisors.values()].reduce((sum, item) => sum + item.costUsd, 0);
@@ -1820,7 +1764,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		lines.push(" Workers and reviewers");
 		if (!workerRows.length) lines.push("  (no worker runs yet)");
 		for (const item of workerRows) {
-			const label = item.worker === "claude" ? `Claude ${item.model}` : item.worker === "api" ? `API ${item.model}` : `Gemini CLI ${item.model}`;
+			const label = item.worker === "claude" ? `Claude ${item.model}` : item.worker === "api" ? `API ${item.provider}/${item.model}` : `Pi ${item.provider}/${item.model}`;
 			const { cost, estimated } = estimate(item);
 			lines.push(row(label, `${item.runs} run${item.runs === 1 ? "" : "s"}`, item, money(cost, estimated)));
 		}
@@ -1844,7 +1788,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			}
 		}
 		for (const item of workerRows) {
-			const label = item.worker === "claude" ? `Claude ${item.model}` : item.worker === "api" ? `API ${item.model}` : `Gemini CLI ${item.model}`;
+			const label = item.worker === "claude" ? `Claude ${item.model}` : item.worker === "api" ? `API ${item.provider}/${item.model}` : `Pi ${item.provider}/${item.model}`;
 			const { cost, estimated } = estimate(item);
 			if (item.billing === "subscription") planModels.push(label);
 			else {
@@ -1886,7 +1830,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	/** Every candidate with a configured effort (Claude --effort, Pi --thinking) is a calibration target. */
 	function tuningTargets(repo?: string, kind?: string): Array<{ profile: string; model: string; configured: Effort; repo?: string; kind?: string }> {
 		return PROFILE_NAMES.flatMap((profile) => config.workerChains[profile]
-			.filter((item) => item.worker !== "gemini" && item.effort)
+			.filter((item) => item.effort)
 			.map((item) => ({ profile, model: item.model, configured: item.effort as Effort, repo, kind })));
 	}
 
@@ -1940,7 +1884,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const { usable, blocked } = rankCandidates(chain, workerHealthKeys, health, config.creditHeadroom);
 		if (!usable.length) throw new Error(`No worker available for profile ${spec.profileName}: all candidates are out of credits or unavailable (${describeBlocked(blocked)}). Use /SupervisedCoding credits refresh after a reset, or /SupervisedCoding credits reset to retry anyway.`);
 		const before = await getGitSnapshot(ctx.cwd);
-		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: `skipped: exhausted until ${formatUntil(item.until)}` }));
+		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: `skipped: exhausted until ${formatUntil(item.until)}`, order: item.index }));
 		const usage: Array<Usage | undefined> = [];
 		let final: RunResult | undefined;
 		let finalCandidate: WorkerCandidate | undefined;
@@ -1949,16 +1893,16 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		let resumeAvailable = Boolean(spec.resumeSessionId);
 		let providerFailureSeen = false;
 		let limitReached: string | undefined;
-		for (const { candidate: configured } of usable) {
+		for (const { candidate: configured, index: order } of usable) {
 			const currentAvailability = availability(health, workerHealthKeys(configured), config.creditHeadroom);
-			if (currentAvailability.state === "blocked") { attempts.push({ label: candidateLabel(configured), ok: false, detail: "skipped: account became unavailable during this chain" }); continue; }
+			if (currentAvailability.state === "blocked") { attempts.push({ label: candidateLabel(configured), ok: false, detail: "skipped: account became unavailable during this chain", order }); continue; }
 			// Effort: the supervisor's explicit override, else what learning calibrated for this profile/model, else config.json.
 			const baseEffort = taskEffort(spec.profileName, spec.assessment, configured.effort);
 			const learnedEffort = config.learning.enabled && config.learning.autoTuneEffort && !spec.candidates ? effectiveEffort(learning, spec.profileName, configured.model, baseEffort, repo, spec.assessment?.kind) : baseEffort;
-			const candidate: WorkerCandidate = { ...configured, maxTurns: config.workerMaxTurns[spec.profileName], ...(configured.worker !== "gemini" ? { effort: resolveEffort(spec.effort, learnedEffort, spec.profileName) } : {}) };
+			const candidate: WorkerCandidate = { ...configured, maxTurns: config.workerMaxTurns[spec.profileName], effort: resolveEffort(spec.effort, learnedEffort, spec.profileName) };
 			const label = candidateLabel(candidate);
-			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.provider ?? (candidate.worker === "claude" ? "anthropic" : "google"), candidate.model)))) {
-				attempts.push({ label, ok: false, detail: "declined: flagship not authorized" });
+			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.provider ?? "anthropic", candidate.model)))) {
+				attempts.push({ label, ok: false, detail: "declined: flagship not authorized", order });
 				continue;
 			}
 			let resumeId = resumeAvailable && candidate.worker === (spec.resumeWorker ?? "claude") && (!spec.resumeModel || spec.resumeModel === candidate.model) ? spec.resumeSessionId : undefined;
@@ -1976,14 +1920,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				if (stoppedBy) break;
 				if (activeBudget && config.delegationBudgetUsd > 0) candidate.maxBudgetUsd = Math.max(0.001, config.delegationBudgetUsd - activeBudget.spent);
 				const fullPrompt = `${handoff ? `${handoff}\n\n` : ""}${basePrompt}`;
-				// Gemini in auto_edit mode and Pi without bash cannot run commands: they must not claim checks passed.
+				// A Pi worker without bash cannot run commands: it must not claim checks passed.
 				const workerNotes = `\n\n[WORKER NOTES]\nEdit only the allowlisted paths and preserve pre-existing changes. Never stage, commit, push, merge, change branches, or rewrite Git history. If shell tools are unavailable, do not claim checks passed: the extension runs the VERIFY commands after you finish; list any other verification the supervisor should run.`;
 				if (candidate.worker === "claude") {
 					result = await runClaude(ctx.cwd, config, candidate, "edit", fullPrompt, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
-				} else if (candidate.worker === "pi") {
-					result = await runPiWorker(ctx, candidate, "edit", `${fullPrompt}${workerNotes}`, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
 				} else {
-					result = await runGemini(ctx.cwd, config, candidate, `${fullPrompt}${workerNotes}`, "auto_edit", signal, minutes(config.workerTimeoutMinutes), resumeId);
+					result = await runPiWorker(ctx, candidate, "edit", `${fullPrompt}${config.piWorkerTools.includes("bash") ? "" : workerNotes}`, resumeId, signal, minutes(config.workerTimeoutMinutes), (text) => onProgress?.(text, label));
 				}
 				recordRun(result, spec.role ?? "implement");
 				usage.push(result.usage);
@@ -2020,10 +1962,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (stoppedBy) {
 				// An execution limit is neither a provider failure nor a verdict on the code: no failover, session kept.
 				limitReached = stoppedBy;
-				attempts.push({ label, ok: false, detail: `stopped: ${stoppedBy}` });
+				attempts.push({ label, ok: false, detail: `stopped: ${stoppedBy}`, order });
 				break;
 			}
-			attempts.push({ label, ok: !kind, kind, detail: kind ? (result.errorMessage || result.stderr).trim().slice(0, 300) : undefined });
+			attempts.push({ label, ok: !kind, kind, detail: kind ? (result.errorMessage || result.stderr).trim().slice(0, 300) : undefined, order });
 			if (!kind) break;
 			// Coding/test/context failures must be diagnosed by the supervisor, never hidden by switching models.
 			if (!FAILOVER_KINDS.has(kind) && kind !== "transient") break;
@@ -2037,21 +1979,20 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (limitReached) throw new Error(`Delegation stopped before a worker could start: ${limitReached}.`);
 			throw new Error(`No worker could be started for profile ${spec.profileName}: ${attempts.map((item) => `${item.label} (${item.detail ?? item.kind})`).join("; ") || "empty chain"}.`);
 		}
-		if (providerFailureSeen && finalCandidate.worker === "gemini") metrics.geminiFallbacks++;
 		const failed = runFailed(final) || Boolean(limitReached);
 		const after = await getGitSnapshot(ctx.cwd);
 		const scopeViolations = compareGitSnapshots(before, after, spec.allowedPaths);
-		const chainLine = attempts.length > 1 ? `Worker chain: ${attempts.map((item) => `${item.label} ${item.ok ? "✓" : `✗ ${item.kind ?? ""}${item.detail?.startsWith("skipped") ? " (skipped)" : item.detail?.startsWith("declined") ? "declined by user" : ""}`}`).join(" → ")}\n\n` : "";
+		const chainLine = attempts.length > 1 ? `Worker chain: ${inChainOrder(attempts).map((item) => `${item.label} ${item.ok ? "✓" : `✗ ${item.kind ?? ""}${item.detail?.startsWith("skipped") ? " (skipped)" : item.detail?.startsWith("declined") ? "declined by user" : ""}`}`).join(" → ")}\n\n` : "";
 		let primaryOutput = `Routing: ${routed.reason}.\n${chainLine}${final.output || final.errorMessage || final.stderr || "The worker returned no output."}`;
 		if (limitReached) primaryOutput += `\n\nSTOPPED AT ${limitReached.toUpperCase()}: partial work and the worker session are preserved. Review what was done, then delegate the rest with continuePrevious=true so the same session finishes without re-exploring.`;
 		if (scopeViolations.length) primaryOutput += `\n\nSCOPE/GIT SAFETY VIOLATION: ${scopeViolations.join("; ")}. Review and correct manually; no automatic revert was attempted.`;
-		return { failed: failed || scopeViolations.length > 0, final, finalCandidate, primaryOutput, attempts, usage, before, after, scopeViolations, resumed, limitReached };
+		return { failed: failed || scopeViolations.length > 0, final, finalCandidate, primaryOutput, attempts: inChainOrder(attempts), usage, before, after, scopeViolations, resumed, limitReached };
 	}
 
 	/** Read-only consultation with failover across reviewers; any working-tree mutation is reported as a violation. */
 	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; diffComplete?: boolean; diffLabel?: string; requireVerdict?: boolean; role?: UsageRole; maxTurns?: number } = {}): Promise<ConsultOutcome> {
 		const { usable, blocked } = rankCandidates(order, workerHealthKeys, health, config.creditHeadroom);
-		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: "skipped: exhausted" }));
+		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: "skipped: exhausted", order: item.index }));
 		const usage: Array<Usage | undefined> = [];
 		const before = await getGitSnapshot(ctx.cwd);
 		let text = usable.length ? "" : `No read-only reviewer available (${describeBlocked(blocked)}).`;
@@ -2061,17 +2002,17 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const diffBlock = options.diff ? `\n\nCHANGES UNDER REVIEW (${options.diffLabel ?? "made by this delegation"})\n\`\`\`diff\n${options.diff}\n\`\`\`\nBase the review on these changes; read files only for the surrounding context you need.` : "";
 		const verdictLine = options.requireVerdict ? "\nEnd with exactly one final line: VERDICT: PASS (no material defect) | MINOR (only minor issues) | MAJOR (bugs, missed requirements, regressions or unsafe behavior)." : "";
 		let material: string | undefined | null = null;
-		for (const { candidate: configured } of usable) {
+		for (const { candidate: configured, index: order } of usable) {
 			if (isFlagship(configured.model) || availability(health, workerHealthKeys(configured), config.creditHeadroom).state === "blocked") continue;
 			const candidate: WorkerCandidate = options.maxTurns ? { ...configured, maxTurns: options.maxTurns } : configured;
 			const label = candidateLabel(candidate);
 			const prompt = `${header}\n${question}\nRelevant paths:\n${pathList}${diffBlock}\n\nInspect only the listed paths and directly relevant symbols. Do not edit, write, stage, commit, push, merge, switch branches, or run mutating commands. Return concise findings ordered by severity, concrete evidence with file/symbol references, recommended action, verification ideas, and remaining uncertainty. Do not summarize unrelated code.${verdictLine}`;
 			if (candidate.worker === "api") {
-				if (options.diffComplete === false || options.diff?.includes("[Diff truncated")) { attempts.push({ label, ok: false, detail: "skipped: incomplete review material requires browsing" }); continue; }
+				if (options.diffComplete === false || options.diff?.includes("[Diff truncated")) { attempts.push({ label, ok: false, detail: "skipped: incomplete review material requires browsing", order }); continue; }
 				// An API reviewer cannot browse: it needs the files inline, and only when they fit.
 				if (material === null) material = collectFiles(ctx.cwd, paths, 250_000);
 				if (material === undefined) {
-					attempts.push({ label, ok: false, detail: "skipped: files too large for an API review" });
+					attempts.push({ label, ok: false, detail: "skipped: files too large for an API review", order });
 					continue;
 				}
 			}
@@ -2082,9 +2023,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					? await runClaude(ctx.cwd, config, candidate, "readonly", prompt, undefined, signal, minutes(config.consultTimeoutMinutes))
 					: candidate.worker === "api"
 						? await runApiReview(ctx, candidate, config.reviewApi?.reasoning ?? "high", prompt, material ?? "", signal, minutes(config.consultTimeoutMinutes), config.reviewMaxTokens)
-						: candidate.worker === "pi"
-							? await runPiWorker(ctx, candidate, "readonly", prompt, undefined, signal, minutes(config.consultTimeoutMinutes))
-							: await runGemini(ctx.cwd, config, candidate, prompt, "plan", signal, minutes(config.consultTimeoutMinutes));
+						: await runPiWorker(ctx, candidate, "readonly", prompt, undefined, signal, minutes(config.consultTimeoutMinutes));
 				recordRun(result, options.role ?? "consult");
 				usage.push(result.usage);
 				if (signal?.aborted) throw new Error("Review aborted.");
@@ -2094,7 +2033,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			}
 			if (!result) continue;
 			recordWorkerHealth(candidate, result, kind);
-			attempts.push({ label, ok: !kind, kind, detail: kind ? (result.errorMessage || result.stderr).trim().slice(0, 300) : undefined });
+			attempts.push({ label, ok: !kind, kind, detail: kind ? (result.errorMessage || result.stderr).trim().slice(0, 300) : undefined, order });
 			text = result.output || result.errorMessage || result.stderr || "The reviewer returned no output.";
 			reviewer = label;
 			failed = Boolean(kind) || Boolean(result.incomplete) || !result.output.trim() || Boolean(options.requireVerdict && parseVerdict(result.output) === "none");
@@ -2106,7 +2045,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		}
 		const after = await getGitSnapshot(ctx.cwd);
 		const violations = compareGitSnapshots(before, after, []);
-		return { failed: failed || violations.length > 0, text, reviewer, attempts, usage, violations, gitAvailable: before.available && after.available, verdict: failed ? "none" : parseVerdict(text) };
+		return { failed: failed || violations.length > 0, text, reviewer, attempts: inChainOrder(attempts), usage, violations, gitAvailable: before.available && after.available, verdict: failed ? "none" : parseVerdict(text) };
 	}
 
 	/**
@@ -2298,7 +2237,6 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!fresh(supervisorHealthKeys(best.candidate))) lines.push(await probeSupervisor(ctx, best));
 			else lines.push(`${best.candidate.model}: using recent credit reading.`);
 		}
-		lines.push("Gemini CLI: no quota API; tracked reactively from errors.");
 		persist();
 		return lines;
 	}
@@ -2504,12 +2442,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "consult_readonly",
 		label: "Read-only consultation",
-		description: "Independent read-only coding analysis by a Claude, GPT or Gemini model without edit or shell tools. Ask for a family different from the one that wrote the code when independence matters. Unavailable/out-of-credit reviewers are skipped automatically. Use for architecture, risk, test strategy, hard debugging, or implementation review — not routine summaries.",
+		description: "Independent read-only coding analysis by a Claude or GPT model without edit or shell tools. Ask for a family different from the one that wrote the code when independence matters. Unavailable/out-of-credit reviewers are skipped automatically. Use for architecture, risk, test strategy, hard debugging, or implementation review — not routine summaries.",
 		parameters: Type.Object({
 			purpose: StringEnum(["architecture", "risk-review", "test-strategy", "debugging", "implementation-review"] as const),
 			question: Type.String({ description: "Narrow, decision-oriented question. Include known evidence; do not ask for a generic repository summary." }),
 			paths: Type.Array(Type.String({ description: "Repository-relative paths to inspect" }), { minItems: 1 }),
-			reviewer: Type.Optional(StringEnum(["auto", "claude", "gpt", "gemini"] as const, { description: "Preferred reviewer family; the others follow if it is unavailable or out of credits. Default auto: the configured order." })),
+			reviewer: Type.Optional(StringEnum(["auto", "claude", "gpt"] as const, { description: "Preferred reviewer family; the others follow if it is unavailable or out of credits. Default auto: the configured order." })),
 			profile: Type.Optional(StringEnum(PROFILE_NAMES, { description: "Model/effort chain for Claude reviewers; stronger for higher risk." })),
 		}),
 		async execute(_id, params, signal, _update, ctx) {
@@ -2661,7 +2599,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 			try {
 				const repoContext = await repoContextFor(ctx.cwd, allowedPaths);
-				const verifyCommands = config.autoVerify ? extractVerifyCommands(implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS) : [];
+				const verifyCommands = config.autoVerify ? dedupeVerifyCommands(ctx.cwd, extractVerifyCommands(implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS)) : [];
 				// Baseline first: checks that already failed are reported, never blamed on (or credited to) the worker.
 				// A check counts as pre-existing only if it fails now AND failed when the task started: whatever an
 				// earlier delegation of the same task broke is still a regression of the task, to be fixed here.
@@ -2805,14 +2743,14 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delegate_implementation",
 		label: "Delegate implementation",
-		description: "Authorize an implementation for the open task. The extension picks the best worker for the profile (Claude Code models, then Gemini), skips providers out of credits, retries transient errors, and hands off to the next candidate on credit/auth/availability failures. Flagship models run only on critical tasks after the user approves them. The profile defaults to the one recorded by plan_task.",
+		description: "Authorize an implementation for the open task. The extension picks the best worker for the profile (Claude or GPT, in the configured quality order adjusted by evidence), skips providers out of credits, retries transient errors, and hands off to the next candidate on credit/auth/availability failures. Flagship models run only on critical tasks after the user approves them. The profile defaults to the one recorded by plan_task.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Concise implementation objective; do not repeat the file guide" }),
 			profile: Type.Optional(StringEnum(PROFILE_NAMES, { description: `Complexity profile; defaults to the plan_task profile, else ${config.defaultExecutionProfile}. Prefer the stronger profile whenever quality is uncertain.` })),
 			assessment: Type.Optional(assessmentSchema),
 			effort: Type.Optional(StringEnum(WORKER_EFFORTS, { description: "Raise the profile's Claude effort only when this specific change clearly needs more reasoning (tricky algorithm, subtle concurrency). Lowering is honored only for the small profile; otherwise the profile's effort is kept, because quality comes first." })),
-			preferWorker: Type.Optional(StringEnum(["claude", "gpt", "gemini"] as const, { description: "Model family to try first, only when it is clearly better suited (e.g. gemini for very large context). Other candidates remain as fallback." })),
-			continuePrevious: Type.Optional(Type.Boolean({ description: "Resume the previous Claude or Gemini session for a correction/follow-up of the same open task. Each call carries the currently authorized paths." })),
+			preferWorker: Type.Optional(StringEnum(["claude", "gpt"] as const, { description: "Model family to try first, only when it is clearly better suited to this change. Other candidates remain as fallback." })),
+			continuePrevious: Type.Optional(Type.Boolean({ description: "Resume the previous worker session (Claude or Pi) for a correction/follow-up of the same open task. Each call carries the currently authorized paths." })),
 			implementationGuide: Type.String({ minLength: Math.min(...Object.values(config.minImplementationGuideChars)), description: "Guide using FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:. Be concise where possible, but include every detail needed for reliable execution and mention every allowed path." }),
 			acceptanceCriteria: Type.Optional(Type.Array(Type.String({ description: "Concrete, non-duplicative checks" }))),
 			allowedPaths: Type.Array(Type.String({ description: "Relative path for every file the worker may modify" }), { minItems: 1 }),
@@ -3009,7 +2947,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				...usageReport(ctx),
 				"",
 				creditsReport(ctx),
-				`Config: ${configPath}`,
+				`Config: ${configPath} (defaults)${userConfigPath ? ` + ${userConfigPath} (personal settings${fs.existsSync(userConfigPath) ? "" : ", not created"})` : ""}`,
 			].join("\n"), "info");
 		},
 	});
@@ -3033,7 +2971,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Every extra turn resends the whole context.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Every extra turn resends the whole context.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
 				display: false,
 			},
 		};

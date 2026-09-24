@@ -1,4 +1,4 @@
-// End-to-end tests of the real extension against fake Claude/Gemini CLIs, a fake Pi host and real Git repositories.
+// End-to-end tests of the real extension against fake Claude Code and Pi CLIs, a fake Pi host and real Git repositories.
 // Run with: node --import ./tests/resolve-pi.mjs --test tests/integration.test.ts
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -36,8 +36,6 @@ function configure(overrides: Record<string, unknown>, plan: Record<string, Step
 		...baseConfig,
 		workerCommand: process.execPath,
 		workerCommandArgs: [path.join(here, "fakes", "fake-claude.mjs")],
-		geminiCommand: process.execPath,
-		geminiCommandArgs: [path.join(here, "fakes", "fake-gemini.mjs")],
 		piCommand: process.execPath,
 		piCommandArgs: [path.join(here, "fakes", "fake-pi.mjs")],
 		supervisorChain: [],
@@ -81,9 +79,9 @@ function makeHost(repo: string) {
 	let thinking = "medium";
 	let activeTools = ["read", "bash", "edit", "write"];
 	const models: Record<string, any> = {
-		"google/gemini-3.1-pro-preview": { provider: "google", id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro" },
+		"anthropic/claude-opus-5-5": { provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5" },
 		"openai-codex/gpt-5.5": { provider: "openai-codex", id: "gpt-5.5", name: "GPT-5.5" },
-		"google/gemini-3.8-flash": { provider: "google", id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+		"openai-codex/gpt-6-sol": { provider: "openai-codex", id: "gpt-6-sol", name: "GPT-6 Sol" },
 	};
 	const ctx: any = {
 		cwd: repo,
@@ -272,9 +270,9 @@ test("repeated poor outcomes raise the worker effort for that profile and model"
 	assert.equal(calls()[1].effort, "xhigh", "the next delegation uses the calibrated effort");
 });
 
-test("critical review goes to the API reviewer with diff and files, without the Gemini CLI", async () => {
+test("critical review goes to the API reviewer with diff and files, without a CLI reviewer", async () => {
 	configure(
-		{ independentReviewProfiles: ["critical"], reviewApi: { provider: "google", model: "gemini-3.1-pro-preview", reasoning: "high" }, workerChains: { ...baseConfig.workerChains, critical: [{ worker: "claude", model: "fake-opus", effort: "xhigh" }, { worker: "gemini", model: "" }] } },
+		{ independentReviewProfiles: ["critical"], reviewApi: { provider: "openai-codex", model: "gpt-5.5", reasoning: "high" }, workerChains: { ...baseConfig.workerChains, critical: [{ worker: "claude", model: "fake-opus", effort: "xhigh" }, { worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" }] } },
 		{ "fake-opus": [{ write: { "core.txt": "critical change\n" } }] },
 	);
 	const host = makeHost(makeRepo({ "core.txt": "before\n" }));
@@ -284,7 +282,7 @@ test("critical review goes to the API reviewer with diff and files, without the 
 	assert.equal(host.apiCalls.length, 1);
 	assert.match(host.apiCalls[0].content, /\+critical change/);
 	assert.match(host.apiCalls[0].content, /=== core\.txt ===\ncritical change/);
-	assert.equal(calls().filter((item) => item.cli === "gemini").length, 0, "no Gemini CLI call");
+	assert.equal(calls().filter((item) => item.cli === "pi").length, 0, "no CLI reviewer call");
 	assert.equal(result.details.reviewVerdict, "major");
 });
 
@@ -301,7 +299,7 @@ test("a follow-up step of the same task resumes the worker session on new paths"
 	await assert.rejects(host.call("delegate_implementation", { task: "Other", continuePrevious: true, implementationGuide: guide(["step3.txt"]), allowedPaths: ["step3.txt"] }), /no compatible previous worker session|different task/);
 });
 
-test("flagship workers run only after SI; No falls back to the strongest non-flagship model", async () => {
+test("flagship workers run only after Yes; No falls back to the strongest non-flagship model", async () => {
 	configure(
 		{ flagshipModels: ["fake-fable"], workerChains: { ...baseConfig.workerChains, critical: [{ worker: "claude", model: "fake-fable", effort: "xhigh" }, { worker: "claude", model: "fake-opus", effort: "xhigh" }] } },
 		{ "fake-fable": [{ write: { "f.txt": "fable\n" } }], "fake-opus": [{ write: { "o.txt": "opus\n" } }] },
@@ -313,32 +311,32 @@ test("flagship workers run only after SI; No falls back to the strongest non-fla
 	await host.call("delegate_implementation", { task: "A", implementationGuide: guide(["o.txt"]), allowedPaths: ["o.txt"] });
 	assert.deepEqual(calls().map((item) => item.model), ["fake-opus"], "declined flagship never starts");
 	assert.equal(host.questions.length, 1);
-	assert.match(host.questions[0], /^Sarebbe più utile utilizzare fake-fable per questa task\. Vuoi utilizzarlo\?$/);
+	assert.match(host.questions[0], /^fake-fable would be more useful for this task\. Use it\?$/);
 	await host.call("delegate_implementation", { task: "A again", implementationGuide: guide(["o.txt"]), allowedPaths: ["o.txt"] });
 	assert.equal(host.questions.length, 1, "the answer holds for the whole task");
 
 	fs.writeFileSync(logFile, "");
 	await host.call("plan_task", { task: "Critical B", profile: "critical", rationale: "test" });
-	host.setAnswer("SI");
+	host.setAnswer("Yes");
 	await host.call("delegate_implementation", { task: "B", implementationGuide: guide(["f.txt"]), allowedPaths: ["f.txt"] });
 	assert.deepEqual(calls().map((item) => item.model), ["fake-fable"]);
 });
 
 test("supervisor out of credits: switch to the next model and continue the run", async () => {
-	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }, { provider: "google", model: "gemini-3.1-pro-preview" }] }, {});
+	configure({ supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }, { provider: "anthropic", model: "claude-opus-5-5" }] }, {});
 	const host = makeHost(makeRepo({}));
 	host.ctx.model = { provider: "openai-codex", id: "gpt-5.5", name: "GPT-5.5" };
 	await host.on();
 	assert.equal(host.ctx.model.id, "gpt-5.5");
 	const settle = host.handlers.get("agent_before_settle");
 	const result = await settle({ outcome: "error", context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: "Codex error: The usage limit has been reached", provider: "openai-codex", model: "gpt-5.5" }] } }, host.ctx);
-	assert.equal(host.ctx.model.id, "gemini-3.1-pro-preview");
+	assert.equal(host.ctx.model.id, "claude-opus-5-5");
 	assert.equal(result.continue, true);
 	assert.match(result.entries[0].content, /\[SUPERVISOR FAILOVER\]/);
 	// A coding error is not a provider failure: no switch.
-	const none = await settle({ outcome: "error", context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: "tool failed: 3 tests failed", provider: "google", model: "gemini-3.1-pro-preview" }] } }, host.ctx);
+	const none = await settle({ outcome: "error", context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: "tool failed: 3 tests failed", provider: "anthropic", model: "claude-opus-5-5" }] } }, host.ctx);
 	assert.equal(none, undefined);
-	assert.equal(host.ctx.model.id, "gemini-3.1-pro-preview");
+	assert.equal(host.ctx.model.id, "claude-opus-5-5");
 });
 
 test("a guide without SYMBOLS/PRESERVE is completed with safe defaults instead of costing a supervisor turn", async () => {

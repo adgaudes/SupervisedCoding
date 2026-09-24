@@ -136,8 +136,8 @@ test("a provider warning below the headroom does not demote a strong worker (see
 	applyReading(health, "claude-cli", { status: "warning", utilization: 0.92, windows: {}, raw: {} }, "test", 60_000, NOW);
 	assert.equal(availability(health, ["claude-cli"], 0.97, NOW).state, "ok");
 	assert.equal(availability(health, ["claude-cli"], 0.9, NOW).state, "degraded");
-	applyReading(health, "gemini-cli", { status: "warning", windows: {}, raw: {} }, "test", 60_000, NOW);
-	assert.equal(availability(health, ["gemini-cli"], 0.97, NOW).state, "degraded", "without a utilization figure the warning still counts");
+	applyReading(health, "pi:openai-codex", { status: "warning", windows: {}, raw: {} }, "test", 60_000, NOW);
+	assert.equal(availability(health, ["pi:openai-codex"], 0.97, NOW).state, "degraded", "without a utilization figure the warning still counts");
 });
 
 test("ranking keeps quality order, skips exhausted providers, demotes near-limit ones", () => {
@@ -145,20 +145,20 @@ test("ranking keeps quality order, skips exhausted providers, demotes near-limit
 	const candidates = [
 		{ name: "opus", keys: ["claude-cli", "claude-cli:opus"] },
 		{ name: "sonnet", keys: ["claude-cli", "claude-cli:sonnet"] },
-		{ name: "gemini", keys: ["gemini-cli"] },
+		{ name: "gpt", keys: ["pi:openai-codex"] },
 	];
 	const keys = (item: { keys: string[] }) => item.keys;
-	assert.deepEqual(rankCandidates(candidates, keys, health, 0.9, NOW).usable.map((item) => item.candidate.name), ["opus", "sonnet", "gemini"]);
+	assert.deepEqual(rankCandidates(candidates, keys, health, 0.9, NOW).usable.map((item) => item.candidate.name), ["opus", "sonnet", "gpt"]);
 
 	markExhausted(health, "claude-cli:opus", "weekly opus limit", NOW + 3_600_000, "test", NOW);
-	assert.deepEqual(rankCandidates(candidates, keys, health, 0.9, NOW).usable.map((item) => item.candidate.name), ["sonnet", "gemini"]);
+	assert.deepEqual(rankCandidates(candidates, keys, health, 0.9, NOW).usable.map((item) => item.candidate.name), ["sonnet", "gpt"]);
 
 	applyReading(health, "claude-cli", { status: "warning", utilization: 0.95, windows: {}, raw: {} }, "test", 60_000, NOW);
-	assert.deepEqual(rankCandidates(candidates, keys, health, 0.9, NOW).usable.map((item) => item.candidate.name), ["gemini", "sonnet"]);
+	assert.deepEqual(rankCandidates(candidates, keys, health, 0.9, NOW).usable.map((item) => item.candidate.name), ["gpt", "sonnet"]);
 
 	markExhausted(health, "claude-cli", "usage limit", NOW + 60_000, "test", NOW);
 	const ranked = rankCandidates(candidates, keys, health, 0.9, NOW);
-	assert.deepEqual(ranked.usable.map((item) => item.candidate.name), ["gemini"]);
+	assert.deepEqual(ranked.usable.map((item) => item.candidate.name), ["gpt"]);
 	assert.equal(ranked.blocked.length, 2);
 
 	// After the reset time the provider becomes usable again.
