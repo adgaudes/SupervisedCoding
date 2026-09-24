@@ -366,6 +366,20 @@ function loadConfig(): Config {
 	if (flagshipOutsideCritical.length) throw new Error(`Flagship models are reserved for the critical profile; remove them from workerChains.${flagshipOutsideCritical.join(", ")} (${configPath}).`);
 	const headroom = raw.creditHeadroom ?? 0.9;
 	if (!(headroom > 0 && headroom <= 1)) throw new Error(`creditHeadroom must be in (0, 1] in ${configPath}.`);
+	const verificationCommands = raw.verificationCommands ?? [
+		"npm test", "npm run test", "npm run lint", "npm run typecheck", "npm run check", "npm run build",
+		"npx tsc", "npx vitest run", "npx eslint", "npx jest",
+		"pnpm test", "pnpm run test", "pnpm run lint", "pnpm run typecheck", "yarn test",
+		"node --test", "pytest", "python -m pytest", "py -m pytest", "ruff check", "mypy",
+		"cargo test", "cargo check", "cargo clippy", "go test", "go vet", "dotnet test", "dotnet build",
+	];
+	const configuredAllowed = raw.workerAllowedTools ?? [
+		"Read", "Edit", "Write", "Glob", "Grep",
+		"Bash(git status *)", "Bash(git diff *)", "Bash(git log *)",
+	];
+	// Workers may always run the checks the extension itself runs, so they can iterate on failures before reporting.
+	const verificationPatterns = verificationCommands.flatMap((command) => [`Bash(${command})`, `Bash(${command} *)`]);
+	const workerAllowedTools = [...configuredAllowed, ...verificationPatterns.filter((item) => !configuredAllowed.includes(item))];
 	return {
 		workerCommand: raw.workerCommand ?? "claude",
 		workerCommandArgs: raw.workerCommandArgs ?? [],
@@ -379,11 +393,7 @@ function loadConfig(): Config {
 		learning: { enabled: true, autoTuneEffort: true, ...raw.learning },
 		workerPermissionMode: raw.workerPermissionMode ?? "dontAsk",
 		workerTools: raw.workerTools ?? ["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
-		workerAllowedTools: raw.workerAllowedTools ?? [
-			"Read", "Edit", "Write", "Glob", "Grep",
-			"Bash(npm test *)", "Bash(npx tsc *)", "Bash(npx vitest *)", "Bash(npx eslint *)",
-			"Bash(pytest *)", "Bash(git status *)", "Bash(git diff *)", "Bash(git log *)",
-		],
+		workerAllowedTools,
 		workerDisallowedTools: raw.workerDisallowedTools ?? [
 			"Bash(git add *)", "Bash(git commit *)", "Bash(git push *)", "Bash(git merge *)",
 			"Bash(git rebase *)", "Bash(git reset *)", "Bash(git checkout *)", "Bash(git switch *)",
@@ -399,13 +409,7 @@ function loadConfig(): Config {
 		supervisorChain: (raw.supervisorChain ?? []).map(({ provider, model }) => ({ provider, model })),
 		flagshipModels,
 		supervisorEffort: { default: "medium", small: "medium", medium: "medium", large: "high", critical: "xhigh", ...raw.supervisorEffort },
-		verificationCommands: raw.verificationCommands ?? [
-			"npm test", "npm run test", "npm run lint", "npm run typecheck", "npm run check", "npm run build",
-			"npx tsc", "npx vitest run", "npx eslint", "npx jest",
-			"pnpm test", "pnpm run test", "pnpm run lint", "pnpm run typecheck", "yarn test",
-			"node --test", "pytest", "python -m pytest", "py -m pytest", "ruff check", "mypy",
-			"cargo test", "cargo check", "cargo clippy", "go test", "go vet", "dotnet test", "dotnet build",
-		],
+		verificationCommands,
 		verificationTimeoutMinutes: raw.verificationTimeoutMinutes ?? 20,
 		supervisorAutoSelect: raw.supervisorAutoSelect ?? true,
 		supervisorFailover: raw.supervisorFailover ?? true,
@@ -966,6 +970,16 @@ function runFailed(result: RunResult): boolean {
 function failureKindOf(result: RunResult): FailureKind {
 	if (result.timedOut) return result.turns === 0 && !result.output ? "unavailable" : "task";
 	return classifyFailure(result.signal);
+}
+
+/**
+ * Worker effort for one delegation. The supervisor may raise it freely, but lowering it below the profile's
+ * (possibly learned) effort is honored only for small tasks: a supervisor saving tokens must never cost quality.
+ */
+function resolveEffort(requested: WorkerEffort | undefined, profileEffort: WorkerEffort | undefined, profile: ExecutionProfileName): WorkerEffort | undefined {
+	if (!requested || !profileEffort) return requested ?? profileEffort;
+	const lower = WORKER_EFFORTS.indexOf(requested) < WORKER_EFFORTS.indexOf(profileEffort);
+	return lower && profile !== "small" ? profileEffort : requested;
 }
 
 function modelDisplayName(ctx: ExtensionContext, provider: string, model: string): string {
@@ -1545,7 +1559,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		for (const { candidate: configured } of usable) {
 			// Effort: the supervisor's explicit override, else what learning calibrated for this profile/model, else config.json.
 			const learnedEffort = config.learning.enabled ? effectiveEffort(learning, spec.profileName, configured.model, configured.effort as Effort | undefined) : configured.effort;
-			const candidate: WorkerCandidate = configured.worker === "claude" ? { ...configured, effort: spec.effort ?? learnedEffort } : configured;
+			const candidate: WorkerCandidate = configured.worker === "claude" ? { ...configured, effort: resolveEffort(spec.effort, learnedEffort, spec.profileName) } : configured;
 			const label = candidateLabel(candidate);
 			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.worker === "claude" ? "anthropic" : "google", candidate.model)))) {
 				attempts.push({ label, ok: false, detail: "declined: flagship not authorized" });
@@ -2008,7 +2022,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			task: Type.String({ description: "Concise implementation objective; do not repeat the file guide" }),
 			profile: Type.Optional(StringEnum(PROFILE_NAMES, { description: `Complexity profile; defaults to the plan_task profile, else ${config.defaultExecutionProfile}. Prefer the stronger profile whenever quality is uncertain.` })),
-			effort: Type.Optional(StringEnum(WORKER_EFFORTS, { description: "Override the profile's Claude effort only when this specific change clearly needs more (tricky algorithm, subtle concurrency) or less (purely mechanical edit) reasoning than its profile." })),
+			effort: Type.Optional(StringEnum(WORKER_EFFORTS, { description: "Raise the profile's Claude effort only when this specific change clearly needs more reasoning (tricky algorithm, subtle concurrency). Lowering is honored only for the small profile; otherwise the profile's effort is kept, because quality comes first." })),
 			preferWorker: Type.Optional(StringEnum(["claude", "gemini"] as const, { description: "Only when one family is clearly better suited (e.g. gemini for very large context). Other candidates remain as fallback." })),
 			continuePrevious: Type.Optional(Type.Boolean({ description: "Resume the immediately preceding Claude session only for a targeted correction to the same task and authorized paths" })),
 			implementationGuide: Type.String({ minLength: Math.min(...Object.values(config.minImplementationGuideChars)), description: "Guide using FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:. Be concise where possible, but include every detail needed for reliable execution and mention every allowed path." }),

@@ -198,11 +198,6 @@
     "Write",
     "Glob",
     "Grep",
-    "Bash(npm test *)",
-    "Bash(npx tsc *)",
-    "Bash(npx vitest *)",
-    "Bash(npx eslint *)",
-    "Bash(pytest *)",
     "Bash(git status *)",
     "Bash(git diff *)",
     "Bash(git log *)"
