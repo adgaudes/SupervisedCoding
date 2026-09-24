@@ -1,4 +1,4 @@
-// Run with: node --test tests/
+// Run with: node --test tests/lib.test.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
@@ -129,6 +129,15 @@ test("nonexistent model (captured from CLI 2.1.281)", () => {
 	const text = "There's an issue with the selected model (claude-bogus-9). It may not exist or you may not have access to it.";
 	assert.equal(classifyFailure({ text, errorCode: "model_not_found", httpStatus: 404 }), "unavailable");
 	assert.equal(classifyFailure({ text, httpStatus: 404 }), "unavailable");
+});
+
+test("a provider warning below the headroom does not demote a strong worker (seen live: Claude allowed_warning at 92%)", () => {
+	const health: HealthMap = {};
+	applyReading(health, "claude-cli", { status: "warning", utilization: 0.92, windows: {}, raw: {} }, "test", 60_000, NOW);
+	assert.equal(availability(health, ["claude-cli"], 0.97, NOW).state, "ok");
+	assert.equal(availability(health, ["claude-cli"], 0.9, NOW).state, "degraded");
+	applyReading(health, "gemini-cli", { status: "warning", windows: {}, raw: {} }, "test", 60_000, NOW);
+	assert.equal(availability(health, ["gemini-cli"], 0.97, NOW).state, "degraded", "without a utilization figure the warning still counts");
 });
 
 test("ranking keeps quality order, skips exhausted providers, demotes near-limit ones", () => {
