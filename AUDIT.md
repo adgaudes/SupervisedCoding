@@ -2,6 +2,8 @@
 
 Revisione analizzata: `e63e03a` (`README: status description`). Letti integralmente README, configurazione e i tre moduli dell'estensione; esaminati test e CLI simulate. Verificata parte dell'integrazione contro Pi 0.87.1 e il conteggio token contro il bundle locale di Gemini CLI 0.61.0. Nessuna chiamata a modelli reali durante i test. Codice operativo e configurazione lasciati invariati.
 
+> **Stato (dopo l'audit).** A1–A12 sono stati corretti. Le nove riproduzioni sono diventate test di regressione del comportamento corretto (`tests/regressions.test.ts`; `audit/reproduce.test.ts` li importa soltanto), e altri test coprono A2, A6, A9, A10, A11 e A12. Tra gli "Altri miglioramenti" sono stati applicati i punti 1 (comandi Git in parallelo), 2 (lock sul file di apprendimento, calibrazione per repository), 3 (`autoTuneEffort: false` disattiva anche le calibrazioni salvate), 5 (recovery con la pipeline ordinaria), 7 (validazione della configurazione), 8 (istruzioni coerenti) e 9 (`supervisorProfiles`); il 6 è documentato nel README. Resta aperto il punto 4 (lezioni per pertinenza, regole dalla gerarchia dei percorsi). La descrizione sotto si riferisce al codice di `e63e03a`.
+
 **Giudizio**
 
 L'architettura rispetta un obiettivo sensato: qualità prima del costo, supervisore che decide e accetta, worker che implementano, verifiche deterministiche e continuità quando finiscono i crediti. Il margine di risparmio più sicuro consiste nel correggere lavoro ripetuto, stato obsoleto e misurazioni imprecise. Abbassare indiscriminatamente modelli o effort sarebbe prematuro: alcuni segnali usati per la calibrazione sono oggi errati.
