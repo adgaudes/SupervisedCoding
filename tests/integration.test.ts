@@ -181,7 +181,7 @@ test("a regression is fixed by the same worker session in a correction round", a
 			{ write: { "value.txt": "ok" }, text: "Restored value.txt." },
 		],
 	});
-	const host = makeHost(repo);
+	const host = makeHost(makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK }));
 	await host.on();
 	const result = await host.call("delegate_implementation", { task: "Add feature.txt", profile: "medium", implementationGuide: guide(["feature.txt", "value.txt"], ["node --test"]), allowedPaths: ["feature.txt", "value.txt"] });
 	assert.equal(result.isError, false, result.content[0].text);
@@ -261,7 +261,7 @@ test("repeated poor outcomes raise the worker effort for that profile and model"
 	const poor = { evidenceVersion: 2, taskKind: "general", at: Date.now(), repo: repo.replace(/\\/g, "/").toLowerCase(), taskId: "seed", profile: "medium", worker: "claude", model: "claude-sonnet-5", effort: "high", verification: "failed", correctionRounds: 2, review: "none", failed: true, tokens: 0, costUsd: 0 };
 	fs.writeFileSync(dataFile, JSON.stringify({ version: 1, outcomes: [0,1,2].map(i => ({...poor, taskId: "seed-" + i})), lessons: [], effortAdjustments: {} }));
 	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "value.txt": "broken" } }, { write: { "other.txt": "x\n" } }] });
-	const host = makeHost(makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK }));
+	const host = makeHost(repo);
 	await host.on();
 	const first = await host.call("delegate_implementation", { task: "Change value.txt", profile: "medium", implementationGuide: guide(["value.txt"], ["node --test"]), allowedPaths: ["value.txt"] });
 	assert.equal(calls()[0].effort, "high");
