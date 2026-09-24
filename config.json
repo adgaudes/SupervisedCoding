@@ -117,6 +117,22 @@
     "large",
     "critical"
   ],
+  "reviewApi": {
+    "provider": "google",
+    "model": "gemini-3.1-pro-preview",
+    "reasoning": "high"
+  },
+  "autoVerify": true,
+  "maxCorrectionRounds": 2,
+  "repoRulesFiles": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "maxDiffBytes": 60000,
+  "learning": {
+    "enabled": true,
+    "autoTuneEffort": true
+  },
   "minImplementationGuideChars": {
     "small": 150,
     "medium": 400,
@@ -164,7 +180,9 @@
     "dotnet build"
   ],
   "workerCommand": "claude",
+  "workerCommandArgs": [],
   "geminiCommand": "gemini",
+  "geminiCommandArgs": [],
   "workerPermissionMode": "dontAsk",
   "workerTools": [
     "Read",
@@ -233,6 +251,7 @@
     "consult_readonly",
     "delegate_implementation",
     "run_verification",
+    "record_lesson",
     "supervisor_git",
     "request_git_commit",
     "request_git_push"
