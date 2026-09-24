@@ -139,6 +139,7 @@
     "reasoning": "high"
   },
   "autoVerify": true,
+  "reuseChecks": true,
   "maxCorrectionRounds": 2,
   "repoRulesFiles": [
     "AGENTS.md",
@@ -279,12 +280,20 @@
     "consult_readonly",
     "delegate_implementation",
     "run_verification",
+    "code_outline",
     "record_lesson",
     "supervisor_git",
     "request_git_commit",
     "request_git_push"
   ],
   "maxOutputBytes": 51200,
+  "outputLimits": {
+    "verificationPassBytes": 2000,
+    "verificationFailBytes": 12000,
+    "consultBytes": 24000,
+    "workerReportBytes": 8000,
+    "outlineBytes": 24000
+  },
   "supervisorProfiles": {},
   "probeTtlMinutes": 15,
   "probeMaxTokens": 128,

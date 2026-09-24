@@ -20,7 +20,7 @@ Its priorities, in order:
 
 - **Any model, any role.** Claude and GPT models can supervise, implement and review. Roles follow the task, never the model family. Claude workers run in Claude Code; GPT workers and any other model configured in Pi run through Pi's own CLI.
 - **Structured delegation.** The supervisor classifies each task (profile, kind, risk, uncertainty, scope) and hands the worker a guide with `FILE`, `SYMBOLS`, `CHANGES`, `PRESERVE` and `VERIFY` sections.
-- **Automatic verification against a task baseline.** Your test, typecheck and lint commands run before and after every change. A check that turned red during the task is a regression, even if an earlier step broke it. Only checks already red when the task began are treated as pre-existing.
+- **Automatic verification against a task baseline.** Your test, typecheck and lint commands run before and after every change. A check that turned red during the task is a regression, even if an earlier step broke it. Only checks already red when the task began, and still failing the same way, are treated as pre-existing: a new failing test inside a red command is a regression, while passing tests added by the worker are not. A check that already ran on exactly the same code in the same prompt is not run again.
 - **Self-correction in context.** The worker that caused a regression fixes it in its own session (up to 2 rounds by default), without weakening or deleting tests.
 - **Independent review across families.** Large and critical work is reviewed by a model of another family first, and never by the implementer's own model unless nothing else is available. Before a large or critical task done in several steps is accepted, its whole diff is reviewed as one.
 - **Explicit acceptance.** A task closes only through `complete_task`. It cannot be accepted with open regressions, a MAJOR finding or a missing review.
@@ -113,7 +113,7 @@ Outcomes live in the Pi agent directory (see [Data and privacy](#data-and-privac
 - `allowedPaths` must be relative, without `..`, and cannot be `.` for normal delegations. They are enforced **after** each run: branch, HEAD, index and files outside the allowlist are checked. Files ignored by Git and writes outside the repository are not covered — it is a guard rail, not a sandbox.
 - Claude workers run with `--safe-mode --restricted`, an allowlist of tools, the verification commands as the only shell commands, and every mutating Git command denied. Claude reviewers get `Read`, `Glob` and `Grep` only.
 - Pi workers run with `--no-extensions --no-skills --no-context-files --no-approve` and, by default, **no shell** (`read`, `edit`, `write`, `grep`, `find`, `ls`), because Pi cannot restrict a shell to the verification commands; the extension runs them instead. Pi reviewers get `read`, `grep`, `find`, `ls`.
-- `run_verification` accepts one plain allowlisted command, with `CI=1`, and reports any file it changed.
+- `run_verification` accepts one plain allowlisted command, with `CI=1`, and reports any file it changed. A command that moves the branch or HEAD, or changes the index, fails the task and ends the worker session.
 - Commits and pushes go only through `request_git_commit` / `request_git_push`, with your confirmation. No merge, no force-push.
 
 ## Installation
@@ -192,8 +192,9 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `plan_task` | records a large, critical or multi-step task with its profile and assessment; sets the supervisor's effort; proposes a flagship supervisor for critical work |
 | `delegate_implementation` | runs the profile's worker chain with verification, self-correction, review and failover; `preferWorker` (`claude` / `gpt`) puts a family first |
 | `complete_task` | `accept` closes the task (after the whole-task review when needed); `pause` keeps it open for later. Both release the flagship supervisor and reset the effort |
-| `consult_readonly` | a focused read-only opinion from any model; `reviewer` (`claude` / `gpt`) picks the preferred family |
+| `consult_readonly` | a focused read-only opinion from any model, or an audit of many files read in the consultant's context instead of the supervisor's (`purpose: audit`); `reviewer` (`claude` / `gpt`) picks the preferred family |
 | `run_verification` | one allowlisted test, typecheck, lint or build command not already covered by `VERIFY` |
+| `code_outline` | functions, classes, methods, types and tests of source files (headings for Markdown) with their line ranges, so the supervisor reads only the ranges it needs; deterministic, no model call |
 | `record_lesson` | a durable repository pitfall for future workers |
 | `supervisor_git` | read-only Git inspection |
 | `request_git_commit`, `request_git_push` | only with your confirmation |
@@ -211,11 +212,13 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `reviewApi` | API reviewer through Pi (default `openai-codex/gpt-5.5`); `null` disables it |
 | `learning.enabled`, `learning.autoTuneEffort`, `learning.autoRouteModels`, `learning.minModelSamples` | learning, effort calibration, evidence-based reordering |
 | `autoVerify`, `maxCorrectionRounds`, `verificationCommands`, `verificationTimeoutMinutes` | automatic verification and allowlisted commands |
+| `reuseChecks` | reuse a check's result within one prompt when it already ran on exactly the same repository state (HEAD, index, every changed or untracked file); off when the supervisor has `bash` |
 | `workerMaxTurns`, `delegationTimeoutMinutes`, `delegationBudgetUsd` | budgets |
 | `creditHeadroom`, `exhaustedCooldownMinutes`, `unavailableCooldownMinutes`, `probeTtlMinutes`, `probeMaxTokens` | credit handling |
 | `transientRetryAttempts`, `transientRetryDelayMs`, `workerTimeoutMinutes`, `consultTimeoutMinutes` | retries and timeouts (0 = none) |
 | `workerCommand`, `piCommand`, `piWorkerTools`, `piReadOnlyTools`, `worker*`, `claudeReadOnly*` | CLIs and tool permissions |
 | `repoRulesFiles`, `minImplementationGuideChars`, `maxDiffBytes`, `maxOutputBytes`, `reviewMaxTokens`, `maxProcessOutputBytes` | prompts and output limits |
+| `outputLimits` | per-tool caps on what reaches the supervisor's context: passing and failing `run_verification` output, consultations and reviews, the worker's report, `code_outline` |
 | `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `supervisorTools`, `contextWarningPercent` | supervisor behavior |
 
 ## Data and privacy
@@ -276,7 +279,7 @@ Le sue priorità, in ordine:
 
 - **Qualsiasi modello, qualsiasi ruolo.** Claude e GPT possono supervisionare, implementare e rivedere. I ruoli seguono il task, mai la famiglia del modello. I worker Claude girano in Claude Code; i worker GPT, e qualsiasi altro modello configurato in Pi, girano tramite la CLI di Pi.
 - **Deleghe strutturate.** Il supervisore classifica ogni task (profilo, tipo, rischio, incertezza, portata) e passa al worker una guida con le sezioni `FILE`, `SYMBOLS`, `CHANGES`, `PRESERVE` e `VERIFY`.
-- **Verifica automatica rispetto alla baseline del task.** I comandi di test, typecheck e lint girano prima e dopo ogni modifica. Un controllo diventato rosso durante il task è una regressione, anche se l'ha causato un passo precedente. Solo i controlli già rossi all'inizio del task sono considerati preesistenti.
+- **Verifica automatica rispetto alla baseline del task.** I comandi di test, typecheck e lint girano prima e dopo ogni modifica. Un controllo diventato rosso durante il task è una regressione, anche se l'ha causato un passo precedente. Sono considerati preesistenti solo i controlli già rossi all'inizio del task che falliscono ancora nello stesso modo: un nuovo test fallito dentro un comando già rosso è una regressione, mentre i test aggiunti dal worker che passano non lo sono. Un controllo già eseguito sullo stesso identico codice nello stesso prompt non viene rieseguito.
 - **Auto-correzione nel contesto.** Il worker che ha causato una regressione la corregge nella propria sessione (fino a 2 giri di default), senza indebolire o cancellare test.
 - **Review indipendente tra famiglie.** I lavori large e critical vengono rivisti prima da un modello di un'altra famiglia, e mai dal modello dell'implementatore se c'è un'alternativa. Prima di accettare un task large o critical svolto in più passi, il suo diff complessivo viene rivisto per intero.
 - **Accettazione esplicita.** Un task si chiude solo con `complete_task`, che non accetta regressioni aperte, verdetti MAJOR o review mancanti.
@@ -369,7 +372,7 @@ Gli esiti stanno nella cartella dell'agente Pi (vedi [Dati e privacy](#dati-e-pr
 - `allowedPaths` devono essere relativi, senza `..`, e non possono essere `.` nelle deleghe normali. Vengono controllati **dopo** ogni esecuzione: branch, HEAD, index e file fuori allowlist. File ignorati da Git e scritture fuori dal repository non sono coperti: è una protezione, non una sandbox.
 - I worker Claude girano con `--safe-mode --restricted`, un'allowlist di strumenti, i soli comandi di verifica come comandi di shell e ogni comando Git che modifica lo stato vietato. I revisori Claude hanno solo `Read`, `Glob` e `Grep`.
 - I worker Pi girano con `--no-extensions --no-skills --no-context-files --no-approve` e, di default, **senza shell** (`read`, `edit`, `write`, `grep`, `find`, `ls`), perché Pi non può limitare una shell ai comandi di verifica: li esegue l'estensione. I revisori Pi hanno `read`, `grep`, `find`, `ls`.
-- `run_verification` accetta un solo comando semplice e autorizzato, con `CI=1`, e segnala i file che il comando modifica.
+- `run_verification` accetta un solo comando semplice e autorizzato, con `CI=1`, e segnala i file che il comando modifica. Un comando che sposta il branch o HEAD, o modifica l'index, fa fallire il task e chiude la sessione del worker.
 - Commit e push passano solo da `request_git_commit` / `request_git_push`, con la tua conferma. Niente merge né force-push.
 
 ## Installazione
@@ -448,8 +451,9 @@ Se scegli un modello a mano, la selezione del supervisore diventa `manual` (il f
 | `plan_task` | registra un task large, critical o in più passi con profilo e assessment; imposta l'effort del supervisore; propone un supervisore di punta nei lavori critical |
 | `delegate_implementation` | esegue la catena di worker del profilo con verifica, auto-correzione, review e failover; `preferWorker` (`claude` / `gpt`) mette una famiglia in testa |
 | `complete_task` | `accept` chiude il task (dopo la review complessiva quando serve); `pause` lo lascia aperto per dopo. Entrambi rilasciano il supervisore di punta e azzerano l'effort |
-| `consult_readonly` | un parere mirato in sola lettura da qualsiasi modello; `reviewer` (`claude` / `gpt`) sceglie la famiglia preferita |
+| `consult_readonly` | un parere mirato in sola lettura da qualsiasi modello, oppure un audit di molti file letti nel contesto del consulente anziché in quello del supervisore (`purpose: audit`); `reviewer` (`claude` / `gpt`) sceglie la famiglia preferita |
 | `run_verification` | un comando autorizzato di test, typecheck, lint o build non già coperto da `VERIFY` |
+| `code_outline` | funzioni, classi, metodi, tipi e test dei file sorgente (titoli per il Markdown) con i loro intervalli di righe, così il supervisore legge solo gli intervalli che servono; deterministico, senza chiamate a modelli |
 | `record_lesson` | un'insidia duratura del repository per i worker futuri |
 | `supervisor_git` | ispezione Git in sola lettura |
 | `request_git_commit`, `request_git_push` | solo con la tua conferma |
@@ -467,11 +471,13 @@ Se scegli un modello a mano, la selezione del supervisore diventa `manual` (il f
 | `reviewApi` | revisore API tramite Pi (default `openai-codex/gpt-5.5`); `null` lo disattiva |
 | `learning.enabled`, `learning.autoTuneEffort`, `learning.autoRouteModels`, `learning.minModelSamples` | apprendimento, calibrazione dell'effort, riordino basato su evidenze |
 | `autoVerify`, `maxCorrectionRounds`, `verificationCommands`, `verificationTimeoutMinutes` | verifica automatica e comandi autorizzati |
+| `reuseChecks` | riusa il risultato di un controllo, nello stesso prompt, se è già stato eseguito sullo stesso identico stato del repository (HEAD, index, ogni file modificato o non tracciato); disattivato se il supervisore ha `bash` |
 | `workerMaxTurns`, `delegationTimeoutMinutes`, `delegationBudgetUsd` | budget |
 | `creditHeadroom`, `exhaustedCooldownMinutes`, `unavailableCooldownMinutes`, `probeTtlMinutes`, `probeMaxTokens` | gestione dei crediti |
 | `transientRetryAttempts`, `transientRetryDelayMs`, `workerTimeoutMinutes`, `consultTimeoutMinutes` | retry e timeout (0 = nessuno) |
 | `workerCommand`, `piCommand`, `piWorkerTools`, `piReadOnlyTools`, `worker*`, `claudeReadOnly*` | CLI e permessi degli strumenti |
 | `repoRulesFiles`, `minImplementationGuideChars`, `maxDiffBytes`, `maxOutputBytes`, `reviewMaxTokens`, `maxProcessOutputBytes` | prompt e limiti di output |
+| `outputLimits` | limiti per tool su ciò che entra nel contesto del supervisore: output di `run_verification` riuscito o fallito, consulenze e review, report del worker, `code_outline` |
 | `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `supervisorTools`, `contextWarningPercent` | comportamento del supervisore |
 
 ## Dati e privacy

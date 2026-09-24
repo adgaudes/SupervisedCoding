@@ -3,8 +3,9 @@
  * supervisor are passed to future workers. Pure logic plus small JSON persistence; no Pi imports.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORT_LEVELS)[number];
@@ -320,24 +321,115 @@ export function parseVerdict(text: string): ReviewVerdict {
 }
 
 /**
+ * Headers that end the VERIFY section. Only these uppercase guide headers do: labels inside the section
+ * ("Commands:", "Run these commands:") are ordinary lines.
+ */
+const GUIDE_SECTION_HEADER = /^\s*(?:#{1,6}\s*)?\**\s*(?:FILE|FILES|FILE GUIDE|SYMBOL|SYMBOLS|CHANGE|CHANGES|PRESERVE|ACCEPTANCE|ACCEPTANCE CRITERIA|NOTE|NOTES|RISK|RISKS|RESIDUAL RISKS|CONTEXT|CONSTRAINTS|OUT OF SCOPE|NON-GOALS|TASK|OBJECTIVE|PATH ALLOWLIST|ALLOWED PATHS|VERIFY)\s*\**\s*:/;
+
+/** Words that start prose after a bare command ("npm test should pass"): never passed to the command as arguments. */
+const PROSE_WORDS = new Set(["should", "must", "will", "shall", "can", "and", "or", "then", "to", "with", "without", "in", "on", "for", "from", "after", "before", "until", "when", "which", "that", "is", "are", "all", "still", "again", "passes", "pass", "passing", "succeeds", "succeed", "green", "ok", "fails", "fail", "expected", "expect", "e.g.", "i.e."]);
+
+/**
+ * Keep a bare command up to the first word of prose. Conservative: running a broader command is harmless, while
+ * prose passed as arguments makes the check fail for the wrong reason. Backticked commands are never trimmed.
+ */
+function stripProse(command: string, allowedPrefixes: string[]): string {
+	const words = command.split(" ");
+	const kept: string[] = [];
+	for (const word of words) {
+		if (PROSE_WORDS.has(word.toLowerCase()) || /^[(—–]/.test(word)) {
+			// "cargo test --features all": an option left without its value would break the command; drop it too,
+			// unless it is part of the allowlisted command itself ("node --test").
+			const shorter = kept.slice(0, -1).join(" ");
+			if (kept.length > 1 && kept[kept.length - 1].startsWith("-") && allowedPrefixes.some((item) => shorter === item || shorter.startsWith(`${item} `))) kept.pop();
+			break;
+		}
+		// "npm test, then lint": a word ending a clause is the command's last word.
+		if (/[,:]$/.test(word)) { kept.push(word.slice(0, -1)); break; }
+		kept.push(word);
+	}
+	return kept.join(" ");
+}
+
+/**
  * Pull verification commands out of a guide's VERIFY section: backticked commands or bullet lines that
  * start with an allowlisted prefix. Unknown or unsafe commands are ignored (the supervisor can still run them).
+ * A line with backticks contributes only its backticked commands; a bare command loses any trailing prose.
  */
 export function extractVerifyCommands(guide: string, allowedPrefixes: string[], unsafe: RegExp): string[] {
-	const section = /(^|\n)\s*VERIFY\s*:([\s\S]*?)(?=\n\s*[A-Z][A-Z ]{2,}\s*:|$)/i.exec(guide)?.[2] ?? "";
-	const candidates: string[] = [];
-	for (const match of section.matchAll(/`([^`\n]+)`/g)) candidates.push(match[1]);
-	for (const line of section.split("\n")) candidates.push(line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ""));
+	const lines = guide.split(/\r?\n/);
+	const start = lines.findIndex((line) => /^\s*(?:#{1,6}\s*)?\**\s*VERIFY\s*\**\s*:/i.test(line));
+	if (start < 0) return [];
+	const section = [lines[start].replace(/^[^:]*:/, "")];
+	for (const line of lines.slice(start + 1)) {
+		if (GUIDE_SECTION_HEADER.test(line)) break;
+		section.push(line);
+	}
+	const candidates: Array<{ command: string; bare: boolean }> = [];
+	for (const line of section) {
+		const quoted = [...line.matchAll(/`([^`\n]+)`/g)].map((match) => match[1]);
+		if (quoted.length) candidates.push(...quoted.map((command) => ({ command, bare: false })));
+		else candidates.push({ command: line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ""), bare: true });
+	}
 	const result: string[] = [];
-	for (const raw of candidates) {
-		const command = raw.trim().replace(/\s+/g, " ");
-		if (!command || unsafe.test(command)) continue;
-		const prefix = allowedPrefixes.find((item) => command === item || command.startsWith(`${item} `));
-		if (!prefix) continue;
+	for (const candidate of candidates) {
+		let command = candidate.command.trim().replace(/\s+/g, " ");
+		if (!allowedPrefixes.some((item) => command === item || command.startsWith(`${item} `))) continue;
 		// Drop trailing prose after the command ("npm test — all green").
 		// ("--" is kept: npm uses it to forward arguments, e.g. "npm test -- --grep parser").
-		const clean = command.split(/\s+(?:—|->|→)\s*/)[0].trim();
-		if (!result.includes(clean)) result.push(clean);
+		command = command.split(/\s+(?:—|->|→)\s*/)[0].trim();
+		if (candidate.bare) command = stripProse(command, allowedPrefixes);
+		// The prefix must survive the cleanup, and the unsafe check sees exactly what would run.
+		if (!command || unsafe.test(command) || !allowedPrefixes.some((item) => command === item || command.startsWith(`${item} `))) continue;
+		if (!result.includes(command)) result.push(command);
 	}
 	return result.slice(0, 4);
+}
+
+const TEMP_ROOTS = [os.tmpdir(), "/tmp", "/var/tmp"].map((dir) => dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\\|\//g, "[\\\\/]"));
+/** An OS temp root and the (usually random) directory under it. */
+const TEMP_PATH = new RegExp(`(?:${[...TEMP_ROOTS, "/var/folders/[^/\\s]+/[^/\\s]+/T", "[A-Za-z]:[\\\\/]Users[\\\\/][^\\\\/\\s]+[\\\\/]AppData[\\\\/]Local[\\\\/]Temp"].join("|")})(?:[\\\\/][^\\\\/\\s:'")\\]]+)?`, "gi");
+
+/** Output of a check without volatile parts: colors, clock times, durations, temp directories, addresses, line:column. */
+function normalizeCheckOutput(output: string): string[] {
+	return output
+		.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+		.replace(TEMP_PATH, "<tmp>")
+		.replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, "<time>")
+		.replace(/\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b/g, "<time>")
+		.replace(/\bduration_ms\b[:\s]*[\d.]+/g, "duration_ms <n>")
+		.replace(/\b\d+(?:\.\d+)?\s?(?:ms|µs|us|ns|s|secs?|seconds?|m|mins?|minutes?)\b/g, "<duration>")
+		.replace(/\b0x[0-9a-f]+\b/gi, "0x<addr>")
+		// TAP numbers shift when a test is added before the failing one ("not ok 3 - name").
+		.replace(/^(\s*(?:not )?ok) \d+\b/gm, "$1")
+		// Stack frames move when an unrelated line of the file is edited; the failure itself does not.
+		.replace(/(\.[A-Za-z]\w{0,5}):\d+(?::\d+)?/g, "$1:<line>")
+		.split(/\r?\n/)
+		.map((line) => line.replace(/\s+/g, " ").trim())
+		.filter(Boolean);
+}
+
+/** Lines naming a failing test or error in common runners: TAP, node --test, jest/vitest, pytest, go, cargo, tsc. */
+const FAILURE_LINE = /^(?:not ok\b|[✖×✗✘]\s|FAIL(?:ED)?\b|--- FAIL:|●\s|test .* \.\.\. FAILED$)|\berror TS\d+:/;
+/**
+ * Failure counts of common runners ("# fail 2", "Tests: 1 failed, 3 passed", "Found 2 errors"). Pass and total
+ * counts are left out: a worker that adds passing tests must not turn an unchanged failure into a regression.
+ */
+const FAILURE_COUNT = /(?:#|ℹ)\s*(?:fail|cancelled)\s+\d+|\b\d+\s+(?:failed|failing|failures?|errors?|problems?)\b/gi;
+
+/**
+ * Signature of a failed check, to tell whether a check red since the task started still fails the same way.
+ * Deliberately conservative: it covers the exit status line, every recognizable failing test/error line and the
+ * failure counts, so a new failing test, a different error or a different count all change it. When no failing
+ * line is recognizable (an unknown runner), the normalized end of the output stands in for them. Only volatile
+ * noise (durations, times, temp paths) and passing tests are ignored; a failure that changed for any other
+ * reason is treated as a regression of the task, never silently accepted.
+ */
+export function failureSignature(output: string): string {
+	const lines = normalizeCheckOutput(output);
+	const failures = [...new Set(lines.filter((line) => FAILURE_LINE.test(line)))].sort().slice(0, 100);
+	const counts = lines.flatMap((line) => line.match(FAILURE_COUNT) ?? []).map((item) => item.toLowerCase().replace(/\s+/g, " ")).slice(-40);
+	// The end of a recognized runner's output lists passing tests and totals too: it would change with every test added.
+	const tail = failures.length ? [] : lines.slice(-20);
+	return createHash("sha256").update(JSON.stringify({ head: lines[0] ?? "", failures, counts, tail })).digest("hex");
 }

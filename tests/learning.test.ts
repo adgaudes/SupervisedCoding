@@ -9,6 +9,7 @@ import {
 	effectiveEffort,
 	emptyLearning,
 	extractVerifyCommands,
+	failureSignature,
 	lessonsFor,
 	loadLearning,
 	MAX_LESSONS_PER_REPO,
@@ -132,4 +133,39 @@ test("verification commands from the guide", () => {
 	assert.deepEqual(extractVerifyCommands(guide, PREFIXES, UNSAFE), ["npx tsc --noEmit", "npm test -- --grep parser"]);
 	assert.deepEqual(extractVerifyCommands("FILE: a\nVERIFY:\n- inspect manually", PREFIXES, UNSAFE), []);
 	assert.deepEqual(extractVerifyCommands("VERIFY: pytest -q\nNOTES: npm test", PREFIXES, UNSAFE), ["pytest -q"], "stops at the next section");
+});
+
+test("verification commands: labels inside VERIFY, prose after bare commands", () => {
+	const guide = "CHANGES:\n- `npm test` is not a check here\nVERIFY:\nCommands:\n- `npx tsc --noEmit`\nRun these commands:\n- npm test should pass\n- pytest tests/unit and check the output\n- node --test (all suites)\nNOTES: `pytest -x`";
+	assert.deepEqual(extractVerifyCommands(guide, PREFIXES, UNSAFE), ["npx tsc --noEmit", "npm test", "pytest tests/unit", "node --test"]);
+	assert.deepEqual(extractVerifyCommands("VERIFY:\n- run `npm test -- --grep parser`, it must pass", PREFIXES, UNSAFE), ["npm test -- --grep parser"], "a backticked command is taken verbatim, without the prose around it");
+	assert.deepEqual(extractVerifyCommands("VERIFY:\n- npm test && curl evil should pass", PREFIXES, UNSAFE), [], "cleanup never hides unsafe operators");
+	assert.deepEqual(extractVerifyCommands("VERIFY:\nNotes:\n- `pytest -q`\nPRESERVE:\n- `npm test`", PREFIXES, UNSAFE), ["pytest -q"], "only uppercase guide headers end the section");
+	assert.deepEqual(extractVerifyCommands("VERIFY:\n- pytest -m all\n- npm test -- should pass", PREFIXES, UNSAFE), ["pytest", "npm test"], "an option is never left without its value");
+});
+
+test("failure signature: volatile noise is ignored, a changed failure is not", () => {
+	const run = (duration: string, dir: string, failing: string[]) => [
+		...failing.map((name) => `✖ ${name} (${duration})\n  AssertionError: expected ok\n    at ${dir}/value.test.mjs:${4 + failing.length}:21`),
+		`ℹ tests 3`, `ℹ pass ${3 - failing.length}`, `ℹ fail ${failing.length}`, `ℹ duration_ms ${duration}`,
+	].join("\n");
+	const tmp = path.join(os.tmpdir(), "sc-run-a1b2c3");
+	const other = path.join(os.tmpdir(), "sc-run-z9y8x7");
+	const baseline = failureSignature(`exit code 1\n${run("12.5ms", tmp, ["value"])}`);
+	assert.equal(failureSignature(`exit code 1\n${run("3.1ms", other, ["value"])}`), baseline, "durations and temp directories are noise");
+	assert.notEqual(failureSignature(`exit code 1\n${run("12.5ms", tmp, ["value", "parser"])}`), baseline, "a new failing test inside a red command changes the signature");
+	assert.notEqual(failureSignature(`exit code 1\n${run("12.5ms", tmp, ["parser"])}`), baseline, "a different failing test with the same count changes the signature");
+	assert.notEqual(failureSignature(`exit code 2\n${run("12.5ms", tmp, ["value"])}`), baseline, "a different exit status changes the signature");
+	assert.notEqual(failureSignature("exit code 1\nsrc/a.ts(3,1): error TS2304: Cannot find name 'x'."), failureSignature("exit code 1\nsrc/a.ts(3,1): error TS2304: Cannot find name 'y'."));
+});
+
+test("failure signature: passing tests added by the worker keep an unchanged failure unchanged", () => {
+	const tap = (before: number, total: number) => `exit code 1\n${Array.from({ length: before }, (_, i) => `ok ${i + 1} - added ${i}`).join("\n")}\nnot ok ${before + 1} - broken\nok ${before + 2} - other\n1..${total}\n# tests ${total}\n# pass ${total - 1}\n# fail 1`;
+	const jest = (total: number) => `exit code 1\nFAIL src/a.test.js\n  ● suite › broken\n\nTests: 1 failed, ${total - 1} passed, ${total} total\nTime: 1.2 s`;
+	const pytest = (total: number) => `exit code 1\nFAILED tests/test_a.py::test_broken - assert 1 == 2\n==== 1 failed, ${total - 1} passed in 0.12s ====`;
+	assert.equal(failureSignature(tap(0, 2)), failureSignature(tap(2, 4)), "TAP: new passing tests, renumbered failure");
+	assert.equal(failureSignature(jest(3)), failureSignature(jest(5)), "jest");
+	assert.equal(failureSignature(pytest(3)), failureSignature(pytest(5)), "pytest");
+	assert.notEqual(failureSignature(pytest(3)), failureSignature(pytest(3).replace("1 failed", "2 failed")), "a changed failure count still counts");
+	assert.notEqual(failureSignature("exit code 1\nsomething odd happened"), failureSignature("exit code 1\nsomething else happened"), "unknown runners: the end of the output still counts");
 });

@@ -649,6 +649,205 @@ test("VERIFY commands that run the same package script execute once", async () =
 	assert.doesNotMatch(result.content[0].text, /- node --test: pass/);
 });
 
+// ── Third audit: verification and lifecycle safety ────────────────────────────────────────────────────
+
+const TWO_CHECKS = `import test from "node:test";\nimport assert from "node:assert";\nimport fs from "node:fs";\ntest("a", () => assert.equal(fs.readFileSync("a.txt", "utf8"), "ok"));\ntest("b", () => assert.equal(fs.readFileSync("b.txt", "utf8"), "ok"));\n`;
+
+test("AUDIT-3: a new failure inside a check already red at the task start is a regression and blocks acceptance", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "b.txt": "bad" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "bad", "b.txt": "ok", "two.test.mjs": TWO_CHECKS }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"], ["node --test two.test.mjs"]) });
+	assert.equal(result.details.verification, "failed");
+	assert.match(result.content[0].text, /the failure changed/);
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The check was already failing before the change." }), /cannot be accepted/);
+});
+
+test("AUDIT-3: run_verification restores a task failed only by its checks, and fails it for a changed pre-existing failure", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }] });
+	const repo = makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK });
+	const host = makeHost(repo);
+	await host.on();
+	const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(first.details.verification, "failed");
+	fs.writeFileSync(path.join(repo, "value.txt"), "ok");
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	assert.deepEqual([host.ctx.auditState.taskPacket.phase, host.ctx.auditState.taskPacket.verification], ["implemented", "passed"]);
+
+	const broken = `import test from "node:test";\nimport assert from "node:assert";\ntest("x", () => assert.fail("unrelated"));\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const redRepo = makeRepo({ "a.txt": "old", "broken.test.mjs": broken });
+	const red = makeHost(redRepo);
+	await red.on();
+	await red.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], ["node --test broken.test.mjs"]) });
+	assert.equal(red.ctx.auditState.taskPacket.phase, "implemented");
+	fs.writeFileSync(path.join(redRepo, "broken.test.mjs"), broken.replace('"x"', '"y"'));
+	const changed = await red.call("run_verification", { command: "node --test broken.test.mjs" });
+	assert.match(changed.content[0].text, /the failure changed/);
+	assert.deepEqual([red.ctx.auditState.taskPacket.phase, red.ctx.auditState.taskPacket.verification], ["failed", "failed"]);
+});
+
+test("AUDIT-3: a passing check records verification on an unverified task; a failed worker is never restored by a check", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "old", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"]) });
+	assert.equal(host.ctx.auditState.taskPacket.verification, "unverified");
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	assert.deepEqual([host.ctx.auditState.taskPacket.phase, host.ctx.auditState.taskPacket.verification], ["implemented", "passed"]);
+
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok", "outside.txt": "x" } }] });
+	const scoped = makeHost(makeRepo({ "value.txt": "old", "check.test.mjs": PASSING_CHECK }));
+	await scoped.on();
+	const violating = await scoped.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"]) });
+	assert.match(violating.content[0].text, /files outside allowedPaths changed: outside\.txt/);
+	await scoped.call("run_verification", { command: "node --test check.test.mjs" });
+	assert.equal(scoped.ctx.auditState.taskPacket.phase, "failed", "a scope violation is not cleared by passing checks");
+});
+
+test("AUDIT-3: files written by verification commands are reported, not counted as worker scope violations", async () => {
+	const generating = `import test from "node:test";\nimport fs from "node:fs";\ntest("gen", () => fs.writeFileSync("generated.txt", String(Math.random())));\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old", "gen.test.mjs": generating }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], ["node --test gen.test.mjs"]) });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.deepEqual(result.details.scopeViolations, []);
+	assert.equal(result.details.verification, "passed");
+	assert.ok(result.details.verificationChanged.includes("generated.txt"));
+	assert.deepEqual(result.details.verificationSafetyViolations, [], "a written file is not a Git safety violation");
+	assert.match(result.content[0].text, /verification commands changed files[^\n]*generated\.txt/);
+	assert.equal(result.details.sessionPreserved, true);
+});
+
+test("AUDIT-3: a later delegation never re-baselines a red check whose failure an earlier delegation changed", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "b.txt": "bad" } }, { write: { "other.txt": "x\n" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "bad", "b.txt": "ok", "two.test.mjs": TWO_CHECKS }));
+	await host.on();
+	const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"], ["node --test two.test.mjs"]) });
+	assert.equal(first.details.verification, "failed");
+	await host.handlers.get("before_agent_start")({ prompt: "Go on" }, host.ctx);
+	const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["other.txt"], implementationGuide: guide(["other.txt"], ["node --test two.test.mjs"]) });
+	assert.equal(second.details.taskPacketId, first.details.taskPacketId);
+	assert.equal(second.details.verification, "failed", "the failure is compared with the task start, not with this delegation's start");
+	assert.match(second.content[0].text, /the failure changed/);
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The check was already failing before the change." }), /cannot be accepted/);
+});
+
+test("AUDIT-3: fixing the added failure while the pre-existing one remains restores the task with unchanged failures", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "b.txt": "bad" } }] });
+	const repo = makeRepo({ "a.txt": "bad", "b.txt": "ok", "two.test.mjs": TWO_CHECKS });
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"], ["node --test two.test.mjs"]) });
+	assert.equal(result.details.verification, "failed");
+	fs.writeFileSync(path.join(repo, "b.txt"), "ok");
+	const check = await host.call("run_verification", { command: "node --test two.test.mjs" });
+	assert.equal(check.details.state, "unchanged");
+	assert.deepEqual([host.ctx.auditState.taskPacket.phase, host.ctx.auditState.taskPacket.verification], ["implemented", "unchanged_failures"]);
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "The added failure is fixed; test a was red before the task." });
+	assert.equal(accepted.details.accepted, true);
+});
+
+test("AUDIT-3: a verification command that changes the Git index at the task start blocks the delegation before any worker", async () => {
+	const stage = `import fs from "node:fs";\nimport { execFileSync } from "node:child_process";\nfs.writeFileSync("gen.txt", String(Math.random()));\nexecFileSync("git", ["add", "gen.txt"]);\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old", "stage.mjs": stage, "package.json": JSON.stringify({ scripts: { test: "node stage.mjs" } }) });
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], ["npm test"]) });
+	assert.equal(result.isError, true);
+	assert.deepEqual(calls(), [], "no worker starts on Git state a check changed");
+	assert.equal(fs.readFileSync(path.join(repo, "a.txt"), "utf8"), "old");
+	assert.equal(result.details.verification, "failed");
+	assert.equal(result.details.sessionPreserved, false);
+	assert.ok(result.details.verificationSafetyViolations.some((item: string) => /npm test: staged files or staged content changed/.test(item)), result.details.verificationSafetyViolations.join("; "));
+	assert.match(result.content[0].text, /DELEGATION BLOCKED before any worker started[\s\S]*GIT SAFETY VIOLATION: npm test: staged/);
+	assert.deepEqual([host.ctx.auditState.taskPacket.phase, host.ctx.auditState.taskPacket.verification], ["failed", "failed"]);
+	assert.equal(host.ctx.auditState.workerSession, undefined);
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The change itself is fine and reviewed." }), /cannot be accepted/);
+});
+
+test("AUDIT-3: a verification command that switches the branch at the task start is reported and blocks every worker", async () => {
+	const branch = `import { execFileSync } from "node:child_process";\nexecFileSync("git", ["checkout", "-q", "-b", "verify-branch"]);\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old", "branch.mjs": branch, "package.json": JSON.stringify({ scripts: { test: "node branch.mjs" } }) }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], ["npm test"]) });
+	assert.equal(result.isError, true);
+	assert.deepEqual(calls(), []);
+	assert.ok(result.details.verificationSafetyViolations.some((item: string) => /^npm test: branch changed from \S+ to verify-branch$/.test(item)), result.details.verificationSafetyViolations.join("; "));
+	assert.match(result.content[0].text, /branch changed from \S+ to verify-branch/);
+});
+
+test("AUDIT-3: a check that moves HEAD after the worker fails the delegation without a correction round or a kept session", async () => {
+	const commit = `import fs from "node:fs";\nimport { execFileSync } from "node:child_process";\nif (fs.readFileSync("value.txt", "utf8") === "bad") {\n\texecFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "made by a check"]);\n\tprocess.exit(1);\n}\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "commit.mjs": commit, "package.json": JSON.stringify({ scripts: { test: "node commit.mjs" } }) }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["npm test"]) });
+	assert.equal(result.isError, true);
+	assert.equal(calls().length, 1, "the failing check would normally start a correction round");
+	assert.equal(result.details.correctionRounds, 0);
+	assert.equal(result.details.verification, "failed");
+	assert.equal(result.details.sessionPreserved, false);
+	assert.deepEqual(result.details.scopeViolations, [], "the worker itself did not move HEAD");
+	assert.ok(result.details.verificationSafetyViolations.some((item: string) => /^npm test: HEAD changed from /.test(item)), result.details.verificationSafetyViolations.join("; "));
+	assert.match(result.content[0].text, /GIT SAFETY VIOLATION by verification commands[^\n]*Automation stopped/);
+	assert.equal(host.ctx.auditState.workerSession, undefined);
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The change itself is fine and reviewed." }), /cannot be accepted/);
+});
+
+test("AUDIT-3: after a check switches the branch, later VERIFY commands do not run and are not reported as run", async () => {
+	const branch = `import fs from "node:fs";\nimport { execFileSync } from "node:child_process";\nif (fs.readFileSync("value.txt", "utf8") === "bad") execFileSync("git", ["checkout", "-q", "-b", "verify-branch"]);\n`;
+	const sentinel = `import fs from "node:fs";\nif (fs.readFileSync("value.txt", "utf8") === "bad") fs.writeFileSync("sentinel.txt", "ran");\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }, { write: { "value.txt": "ok" } }] });
+	const repo = makeRepo({ "value.txt": "ok", "branch.mjs": branch, "sentinel.mjs": sentinel, "package.json": JSON.stringify({ scripts: { test: "node branch.mjs", lint: "node sentinel.mjs" } }) });
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["npm test", "npm run lint"]) });
+	assert.equal(result.isError, true);
+	assert.equal(fs.existsSync(path.join(repo, "sentinel.txt")), false, "no later check runs on the changed Git state");
+	assert.equal(calls().length, 1, "no correction round either");
+	assert.deepEqual(result.details.verificationCommandsRun, ["npm test"]);
+	assert.ok(result.details.verificationSafetyViolations.some((item: string) => /^npm test: branch changed from \S+ to verify-branch$/.test(item)), result.details.verificationSafetyViolations.join("; "));
+	const text = result.content[0].text;
+	assert.match(text, /^- npm test: pass — GIT SAFETY VIOLATION: branch changed/m);
+	assert.doesNotMatch(text, /^- npm run lint:/m);
+	assert.match(text, /already run by the extension on the final code: npm test\. /);
+	assert.match(text, /Not run on the changed Git state: npm run lint\./);
+});
+
+test("AUDIT-3: a manual check that changes the Git index ends the worker session: no continuation on that state", async () => {
+	const stage = `import fs from "node:fs";\nimport { execFileSync } from "node:child_process";\nfs.writeFileSync("gen.txt", String(Math.random()));\nexecFileSync("git", ["add", "gen.txt"]);\n`;
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }, { write: { "a.txt": "again" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old", "stage.mjs": stage, "package.json": JSON.stringify({ scripts: { test: "node stage.mjs" } }) }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.details.sessionPreserved, true);
+	assert.ok(host.ctx.auditState.workerSession);
+	const check = await host.call("run_verification", { command: "npm test" });
+	assert.equal(check.isError, true);
+	assert.match(check.content[0].text, /GIT SAFETY VIOLATION: staged files or staged content changed/);
+	assert.equal(host.ctx.auditState.workerSession, undefined, "the cleared session is persisted");
+	assert.deepEqual([host.ctx.auditState.taskPacket.phase, host.ctx.auditState.taskPacket.verification], ["failed", "failed"]);
+	await assert.rejects(host.call("delegate_implementation", { task: "finish", continuePrevious: true, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) }), /Cannot continue/);
+	assert.equal(calls().length, 1, "no worker was resumed");
+});
+
+test("AUDIT-3: planning, commit and push are rejected while a delegation is running", async () => {
+	configure({ workerCommandArgs: [scriptedClaude("slow-claude-3", 'if (step.action === "slow") { await new Promise((resolve) => setTimeout(resolve, 1500)); }')] }, { "claude-sonnet-5": [{ action: "slow", write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const running = host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	await assert.rejects(host.call("plan_task", { task: "another task", profile: "small", rationale: "test" }), /running delegation/);
+	await assert.rejects(host.call("request_git_commit", { message: "wip", paths: ["a.txt"] }), /running delegation/);
+	await assert.rejects(host.call("request_git_push", {}), /running delegation/);
+	const result = await running;
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(host.ctx.auditState.taskPacket.phase, "implemented");
+});
+
 test("the worker chain is reported in chain order, skipped candidates included", async () => {
 	// First delegation: GPT runs out of credits and Sonnet takes over. Its account is now blocked.
 	configure({}, { "gpt-5.5": [{ action: "credits" }], "claude-sonnet-5": [{ write: { "a.txt": "done" } }, { write: { "a.txt": "again" } }] });
@@ -659,4 +858,126 @@ test("the worker chain is reported in chain order, skipped candidates included",
 	const result = await host.call("delegate_implementation", { task: "second", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
 	const chain = /Worker chain: (.*)/.exec(result.content[0].text)?.[1] ?? "";
 	assert.ok(chain.indexOf("claude-sonnet-5") >= 0 && chain.indexOf("claude-sonnet-5") < chain.indexOf("gpt-5.5"), chain);
+});
+
+const RED_CHECK = `import test from "node:test";\nimport assert from "node:assert";\nimport fs from "node:fs";\ntest("broken", () => assert.equal(fs.readFileSync("a.txt", "utf8"), "ok"));\n`;
+
+test("CONTEXT: passing tests added by the worker keep a pre-existing failure unchanged; later delegations only name it", async () => {
+	const withNewTest = RED_CHECK.replace('test("broken"', 'test("added by the worker", () => assert.ok(true));\ntest("broken"');
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "red.test.mjs": withNewTest } }, { write: { "b.txt": "two" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "bad", "b.txt": "one", "red.test.mjs": RED_CHECK }));
+	await host.on();
+	const verify = ["node --test --test-reporter=tap red.test.mjs"];
+	const first = await host.call("delegate_implementation", { task: "add a test", profile: "medium", allowedPaths: ["red.test.mjs", "b.txt"], implementationGuide: guide(["red.test.mjs", "b.txt"], verify) });
+	assert.equal(first.details.verification, "unchanged_failures", first.content[0].text);
+	assert.match(first.content[0].text, /\$ node --test/, "the first delegation shows what the pre-existing failure is");
+	const second = await host.call("delegate_implementation", { task: "next step", profile: "medium", continuePrevious: true, allowedPaths: ["red.test.mjs", "b.txt"], implementationGuide: guide(["red.test.mjs", "b.txt"], verify) });
+	assert.equal(second.details.verification, "unchanged_failures", second.content[0].text);
+	assert.match(second.content[0].text, /already failing before this task, in the same way/);
+	assert.doesNotMatch(second.content[0].text, /\$ node --test/, "a later delegation does not repeat its output");
+});
+
+test("CONTEXT: run_verification returns a short tail for a passing check and a longer one for a failing check", async () => {
+	configure({}, {});
+	const noisy = (ok: boolean) => `import test from "node:test";\nimport assert from "node:assert";\ntest("noisy", () => { console.log("x".repeat(30000)); assert.ok(${ok}); });\n`;
+	const repo = makeRepo({ "pass.test.mjs": noisy(true), "fail.test.mjs": noisy(false) });
+	const host = makeHost(repo);
+	await host.on();
+	const pass = (await host.call("run_verification", { command: "node --test pass.test.mjs" })).content[0].text;
+	assert.match(pass, /exit code 0/);
+	assert.ok(Buffer.byteLength(pass) < 2400, `passing output is ${Buffer.byteLength(pass)} bytes`);
+	const fail = (await host.call("run_verification", { command: "node --test fail.test.mjs" })).content[0].text;
+	assert.match(fail, /exit code 1/);
+	assert.ok(Buffer.byteLength(fail) > 10_000 && Buffer.byteLength(fail) < 12_400, `failing output is ${Buffer.byteLength(fail)} bytes`);
+});
+
+test("CONTEXT: a long worker report is shortened in the middle and never pushes the review or the diff out", async () => {
+	const report = `Summary start.\n${"detail line\n".repeat(5000)}RESIDUAL RISKS: end-marker`;
+	configure({ independentReviewProfiles: ["medium"], reviewApi: baseConfig.reviewApi }, { "claude-sonnet-5": [{ write: { "a.txt": "done\n" }, text: report }] });
+	const host = makeHost(makeRepo({ "a.txt": "old\n" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	const text = result.content[0].text;
+	assert.match(text, /Summary start\./);
+	assert.match(text, /end-marker/);
+	assert.match(text, /middle omitted/);
+	assert.match(text, /verdict PASS/);
+	assert.match(text, /DIFF \(this delegation only\)/);
+	assert.ok(Buffer.byteLength(text) < 16_000, `result is ${Buffer.byteLength(text)} bytes`);
+});
+
+test("CONTEXT: outputLimits are validated", async () => {
+	configure({ outputLimits: { consultBytes: 10 } }, {});
+	assert.throws(() => makeHost(makeRepo({ "a.txt": "old" })), /outputLimits\.consultBytes/);
+});
+
+test("REUSE: the next delegation of the same prompt reuses the checks that closed the previous one, on the same code only", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }, { write: { "b.txt": "1" } }, { write: { "b.txt": "2" } }, { write: { "b.txt": "3" } }] });
+	const repo = makeRepo({ "value.txt": "bad", "b.txt": "0", "check.test.mjs": PASSING_CHECK });
+	const host = makeHost(repo);
+	await host.on();
+	const verify = ["node --test check.test.mjs"];
+	const delegate = (task: string) => host.call("delegate_implementation", { task, profile: "medium", allowedPaths: ["value.txt", "b.txt"], implementationGuide: guide(["value.txt", "b.txt"], verify) });
+	const first = await delegate("fix");
+	assert.equal(first.details.verification, "passed", first.content[0].text);
+	assert.deepEqual(first.details.checksReusedAtStart, []);
+	const second = await delegate("next step");
+	assert.deepEqual(second.details.checksReusedAtStart, verify, "same code as the checks that closed the first delegation");
+	assert.equal(second.details.verification, "passed");
+	fs.writeFileSync(path.join(repo, "value.txt"), "bad");
+	fs.writeFileSync(path.join(repo, "value.txt"), "ok");
+	fs.writeFileSync(path.join(repo, "untracked.txt"), "new");
+	const third = await delegate("third step");
+	assert.deepEqual(third.details.checksReusedAtStart, [], "an untracked file changed the repository state");
+	await host.handlers.get("before_agent_start")({ prompt: "Go on" }, host.ctx);
+	const fourth = await delegate("fourth step");
+	assert.deepEqual(fourth.details.checksReusedAtStart, [], "a new user prompt never reuses results");
+	await host.command("status");
+	assert.match(host.notifications.at(-1)!, /reused 1\b/);
+});
+
+test("REUSE: a reused red check keeps its failure signature, so a changed failure is still a regression", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "b.txt": "bad" } }, { write: { "other.txt": "x\n" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "bad", "b.txt": "ok", "two.test.mjs": TWO_CHECKS }));
+	await host.on();
+	const verify = ["node --test two.test.mjs"];
+	const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"], verify) });
+	assert.equal(first.details.verification, "failed");
+	const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["other.txt"], implementationGuide: guide(["other.txt"], verify) });
+	assert.deepEqual(second.details.checksReusedAtStart, verify);
+	assert.equal(second.details.verification, "failed");
+	assert.match(second.content[0].text, /the failure changed/);
+});
+
+test("REUSE: reuseChecks false, or a supervisor with a shell, always runs the checks again", async () => {
+	for (const overrides of [{ reuseChecks: false }, { supervisorTools: [...baseConfig.supervisorTools, "bash"] }]) {
+		configure(overrides, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }, { write: { "b.txt": "1" } }] });
+		const host = makeHost(makeRepo({ "value.txt": "bad", "b.txt": "0", "check.test.mjs": PASSING_CHECK }));
+		await host.on();
+		const verify = ["node --test check.test.mjs"];
+		await host.call("delegate_implementation", { task: "fix", profile: "medium", allowedPaths: ["value.txt", "b.txt"], implementationGuide: guide(["value.txt", "b.txt"], verify) });
+		const second = await host.call("delegate_implementation", { task: "next", profile: "medium", allowedPaths: ["value.txt", "b.txt"], implementationGuide: guide(["value.txt", "b.txt"], verify) });
+		assert.deepEqual(second.details.checksReusedAtStart, [], JSON.stringify(overrides));
+	}
+});
+
+test("OUTLINE: code_outline lists declarations with line ranges, expands directories without ignored files, stays in the workspace", async () => {
+	configure({}, {});
+	const repo = makeRepo({
+		".gitignore": "src/gen/\n",
+		"src/store.ts": "export class Store {\n\tadd(item: string): void {\n\t\tconsole.log(item);\n\t}\n}\n",
+		"src/gen/out.ts": "export function generated() {}\n",
+		"src/data.json": "{}\n",
+		"README.md": "# Title\n\n## Use\n",
+	});
+	const host = makeHost(repo);
+	await host.on();
+	const text = (await host.call("code_outline", { paths: ["src", "README.md", "missing.ts"] })).content[0].text;
+	assert.match(text, /^src\/store\.ts \(5 lines\)$/m);
+	assert.match(text, /1-5 +export class Store/);
+	assert.match(text, /2-4 +add\(item: string\): void/);
+	assert.match(text, /## Use/);
+	assert.match(text, /missing\.ts: not found/);
+	assert.doesNotMatch(text, /generated|data\.json/);
+	await assert.rejects(host.call("code_outline", { paths: ["../outside"] }), /'\.\.'/);
 });

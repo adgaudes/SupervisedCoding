@@ -33,6 +33,7 @@ import {
 	addLesson,
 	effectiveEffort,
 	extractVerifyCommands,
+	failureSignature,
 	lessonsFor,
 	loadLearning,
 	parseVerdict,
@@ -49,6 +50,7 @@ import {
 } from "./learning.ts";
 import { assessTask, routeWithEvidence, taskEffort, TASK_KINDS, type TaskAssessment } from "./routing.ts";
 import { checkpoint, changesSince, type Checkpoint } from "./changes.ts";
+import { formatOutline, outlineSupported } from "./outline.ts";
 
 const execFile = promisify(execFileCallback);
 const extensionDir = path.dirname(fileURLToPath(import.meta.url));
@@ -81,7 +83,7 @@ const STATE_TYPE = "supervised-coding";
 const POLICY_TYPE = "supervised-coding-policy";
 /** Entry types written by the extension before it was renamed; still read so existing sessions keep their state. */
 const LEGACY_STATE_TYPES = ["codex-claude-supervisor"];
-const CUSTOM_TOOLS = new Set(["plan_task", "complete_task", "consult_readonly", "delegate_implementation", "run_verification", "record_lesson", "supervisor_git", "request_git_commit", "request_git_push"]);
+const CUSTOM_TOOLS = new Set(["plan_task", "complete_task", "consult_readonly", "delegate_implementation", "run_verification", "code_outline", "record_lesson", "supervisor_git", "request_git_commit", "request_git_push"]);
 const PROFILE_NAMES = ["small", "medium", "large", "critical"] as const;
 const WORKER_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const MAX_STORED_REPORT_CHARS = 8000;
@@ -139,6 +141,11 @@ interface Config {
 	reviewApi: { provider: string; model: string; reasoning: ThinkingLevel } | null;
 	/** Run the guide's VERIFY commands before and after each delegation and let the worker fix regressions. */
 	autoVerify: boolean;
+	/**
+	 * Reuse a check's result, within one user prompt, when it already ran on exactly the same repository state
+	 * (HEAD, index and every changed or untracked file). Off when the supervisor has a shell.
+	 */
+	reuseChecks: boolean;
 	maxCorrectionRounds: number;
 	/** Repository instruction files given to every worker (they run in --safe-mode and would not load them). */
 	repoRulesFiles: string[];
@@ -190,8 +197,25 @@ interface Config {
 	allowedSupervisorProviders: string[];
 	supervisorTools: string[];
 	maxOutputBytes: number;
+	/** Per-tool caps below maxOutputBytes: every byte returned to the supervisor is resent on each later turn. */
+	outputLimits: OutputLimits;
 	minImplementationGuideChars: Record<ExecutionProfileName, number>;
 }
+
+interface OutputLimits {
+	/** End of a passing run_verification command: the verdict and summary are all the supervisor needs. */
+	verificationPassBytes: number;
+	/** End of a failing run_verification command, where test runners print failures and summaries. */
+	verificationFailBytes: number;
+	/** consult_readonly answers and reviews (start and end kept: the verdict comes last). */
+	consultBytes: number;
+	/** The worker's own report inside a delegation result, so the review and the diff are never cut. */
+	workerReportBytes: number;
+	/** code_outline output. */
+	outlineBytes: number;
+}
+
+const OUTPUT_LIMIT_DEFAULTS: OutputLimits = { verificationPassBytes: 2000, verificationFailBytes: 12_000, consultBytes: 24_000, workerReportBytes: 8000, outlineBytes: 24_000 };
 
 interface SupervisorMetrics {
 	delegations: number;
@@ -210,6 +234,8 @@ interface SupervisorMetrics {
 	flagshipRequests: number;
 	flagshipApprovals: number;
 	verifications: number;
+	/** Checks answered from an earlier run on the same repository state instead of running again. */
+	reusedChecks: number;
 	correctionRounds: number;
 	autoVerifiedDelegations: number;
 	apiReviews: number;
@@ -276,6 +302,16 @@ interface TaskPacket {
 	flagshipDecisions?: Record<string, boolean>;
 	/** Result of each VERIFY command when the task started: a check the task turned red is its regression. */
 	baseline?: Record<string, boolean>;
+	/**
+	 * failureSignature of each VERIFY command that failed when the task started. A red check is tolerated only
+	 * while it still fails the same way; tasks persisted before signatures existed get one at their next delegation.
+	 */
+	baselineSignatures?: Record<string, string>;
+	/**
+	 * Checks that regressed while verification was the task's only failure: once each passes again with
+	 * run_verification, the task is implemented again. Undefined when anything else failed (worker, scope, review).
+	 */
+	failedChecks?: string[];
 	delegationCount?: number;
 	/** Strongest profile of any delegation of the task: review requirements follow it. */
 	maxProfile?: ExecutionProfileName;
@@ -355,6 +391,7 @@ const EMPTY_METRICS: SupervisorMetrics = {
 	flagshipRequests: 0,
 	flagshipApprovals: 0,
 	verifications: 0,
+	reusedChecks: 0,
 	correctionRounds: 0,
 	autoVerifiedDelegations: 0,
 	apiReviews: 0,
@@ -441,6 +478,10 @@ function loadConfig(): Config {
 		const value = raw[field];
 		if (value !== undefined && (!Number.isInteger(value) || value < 128)) throw new Error(`${field} must be an integer >= 128.`);
 	}
+	const outputLimits: OutputLimits = { ...OUTPUT_LIMIT_DEFAULTS, ...raw.outputLimits };
+	for (const [field, value] of Object.entries(outputLimits)) {
+		if (!Number.isInteger(value) || value < 128) throw new Error(`outputLimits.${field} must be an integer >= 128.`);
+	}
 	if ((raw.transientRetryAttempts ?? 4) > 10 || !Number.isInteger(raw.transientRetryAttempts ?? 4) || (raw.maxCorrectionRounds ?? 2) > 10 || !Number.isInteger(raw.maxCorrectionRounds ?? 2)) throw new Error("Retry/correction counts must be integers between 0 and 10.");
 	for (const candidate of Object.values(workerChains).flat()) if (candidate.effort && !WORKER_EFFORTS.includes(candidate.effort)) throw new Error(`Invalid effort for ${candidate.model}.`);
 	if (raw.reviewApi && flagshipModels.includes(raw.reviewApi.model)) throw new Error("Flagship models cannot be used for API reviews.");
@@ -476,6 +517,7 @@ function loadConfig(): Config {
 		piReadOnlyTools: raw.piReadOnlyTools ?? ["read", "grep", "find", "ls"],
 		reviewApi: raw.reviewApi === null ? null : { provider: "openai-codex", model: "gpt-5.5", reasoning: "high", ...raw.reviewApi },
 		autoVerify: raw.autoVerify ?? true,
+		reuseChecks: raw.reuseChecks ?? true,
 		maxCorrectionRounds: raw.maxCorrectionRounds ?? 2,
 		repoRulesFiles: raw.repoRulesFiles ?? ["AGENTS.md", "CLAUDE.md"],
 		maxDiffBytes: raw.maxDiffBytes ?? 60_000,
@@ -525,6 +567,7 @@ function loadConfig(): Config {
 		allowedSupervisorProviders: raw.allowedSupervisorProviders ?? ["*"],
 		supervisorTools: [...new Set([...(raw.supervisorTools ?? ["read", "grep", "find", "ls", ...CUSTOM_TOOLS]), "complete_task"])],
 		maxOutputBytes: raw.maxOutputBytes ?? 51200,
+		outputLimits,
 		minImplementationGuideChars,
 	};
 }
@@ -546,16 +589,31 @@ function resolveClaudeCommand(configured: string): string {
 /** Keep the end of long command output: test runners print failures and summaries last. */
 function truncateUtf8Tail(value: string, maxBytes: number): string {
 	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-	let result = value.slice(-maxBytes);
-	while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(1);
-	return `[Output truncated; showing the last ${maxBytes} bytes.]\n${result}`;
+	return `[Output truncated; showing the last ${maxBytes} bytes.]\n${lastBytes(value, maxBytes)}`;
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
 	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	return `${firstBytes(value, maxBytes)}\n\n[Output truncated; inspect the working tree for full details.]`;
+}
+
+/** Keep the start and the end of a long report: its context comes first, its conclusions (verdict, risks) last. */
+function truncateUtf8Middle(value: string, maxBytes: number): string {
+	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	const head = firstBytes(value, Math.floor(maxBytes * 0.4));
+	return `${head}\n\n[… middle omitted …]\n\n${lastBytes(value, maxBytes - Buffer.byteLength(head, "utf8"))}`;
+}
+
+function firstBytes(value: string, maxBytes: number): string {
 	let result = value.slice(0, maxBytes);
 	while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(0, -1);
-	return `${result}\n\n[Output truncated; inspect the working tree for full details.]`;
+	return result;
+}
+
+function lastBytes(value: string, maxBytes: number): string {
+	let result = value.slice(-maxBytes);
+	while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(1);
+	return result;
 }
 
 async function runGit(cwd: string, args: string[]): Promise<string> {
@@ -661,6 +719,29 @@ async function getGitSnapshot(cwd: string): Promise<GitSnapshot> {
 }
 
 const CLEAN_FINGERPRINT = "(clean)";
+
+/**
+ * Exact identity of the repository state a check runs on: HEAD, branch, index, and the content of every changed or
+ * untracked file of the whole repository (a check run from a subdirectory may read files outside it). Files ignored
+ * by Git are not covered. Undefined when it cannot be exact: no Git, or an entry that is not a plain file (a nested
+ * repository, whose own changes Git does not list).
+ */
+async function workingTreeFingerprint(cwd: string): Promise<string | undefined> {
+	const top = (await gitStdout(cwd, ["rev-parse", "--show-toplevel"]))?.trim();
+	if (!top) return undefined;
+	const [head, branch, index, status] = await Promise.all([
+		gitStdout(top, ["rev-parse", "--verify", "--quiet", "HEAD"]), gitStdout(top, ["symbolic-ref", "--quiet", "HEAD"]),
+		gitStdout(top, ["diff", "--cached", "--raw", "--no-renames", "-z", "--"]), gitStdout(top, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"]),
+	]);
+	if (index === undefined || status === undefined) return undefined;
+	const hash = createHash("sha256").update(`${head ?? ""}\0${branch ?? ""}\0${index}`);
+	for (const entry of status.split("\0").filter(Boolean)) {
+		const content = fileFingerprint(top, entry.slice(3));
+		if (content === "(directory)" || content === "(special)") return undefined;
+		hash.update(`\0${entry}\0${content}`);
+	}
+	return hash.digest("hex");
+}
 
 /** Files whose content differs between two snapshots, including pre-existing dirty files. */
 function filesChangedBetween(before: GitSnapshot, after: GitSnapshot): string[] {
@@ -1267,6 +1348,51 @@ function collectFiles(cwd: string, paths: string[], maxBytes: number): string | 
 	return parts.join("\n\n");
 }
 
+const OUTLINE_MAX_FILES = 200;
+
+/**
+ * Files to outline, inside the workspace: named files as given, directories expanded to the supported files Git
+ * does not ignore (outside Git, a walk that skips generated folders).
+ */
+async function outlineFiles(cwd: string, paths: string[]): Promise<{ list: string[]; missing: string[]; capped: boolean }> {
+	const boundary = fs.realpathSync(cwd);
+	const list: string[] = [];
+	const missing: string[] = [];
+	const add = (file: string) => { if (!list.includes(file)) list.push(file); };
+	for (const item of paths) {
+		let real: string;
+		let stat: fs.Stats;
+		try {
+			real = fs.realpathSync(path.join(cwd, item));
+			stat = fs.statSync(real);
+		} catch {
+			missing.push(item);
+			continue;
+		}
+		if (real !== boundary && !real.startsWith(boundary + path.sep)) throw new Error(`Path outside the workspace: ${item}`);
+		if (!stat.isDirectory()) { add(item); continue; }
+		const listed = await gitStdout(cwd, ["--literal-pathspecs", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", item]);
+		const found = listed !== undefined ? nulSeparated(listed) : walkFiles(cwd, item);
+		for (const file of found.filter(outlineSupported).sort()) {
+			add(file);
+			if (list.length > OUTLINE_MAX_FILES) return { list: list.slice(0, OUTLINE_MAX_FILES), missing, capped: true };
+		}
+	}
+	return { list: list.slice(0, OUTLINE_MAX_FILES), missing, capped: list.length > OUTLINE_MAX_FILES };
+}
+
+function walkFiles(cwd: string, relative: string, depth = 0): string[] {
+	if (depth > 30) return [];
+	const files: string[] = [];
+	for (const entry of fs.readdirSync(path.join(cwd, relative), { withFileTypes: true })) {
+		if (SKIPPED_DIRS.has(entry.name)) continue;
+		const child = relative === "." ? entry.name : `${relative}/${entry.name}`;
+		if (entry.isDirectory()) files.push(...walkFiles(cwd, child, depth + 1));
+		else if (entry.isFile()) files.push(child);
+	}
+	return files;
+}
+
 /** Read-only review through a Pi provider: only the diff and files are sent, without a CLI's fixed prompt overhead. */
 async function runApiReview(ctx: ExtensionContext, candidate: WorkerCandidate, reasoning: ThinkingLevel, prompt: string, material: string, signal: AbortSignal | undefined, timeoutMs: number, maxTokens = 8192): Promise<RunResult> {
 	const base = { worker: "api" as const, provider: candidate.provider, model: candidate.model, stderr: "", turns: 1, timedOut: false };
@@ -1634,37 +1760,94 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		timedOut: boolean;
 		output: string;
 		changed: string[];
+		/** failureSignature of a failed run, including its exit status. */
+		signature?: string;
+		/** Branch, HEAD or index changes made by the check: never harmless, unlike files it writes. */
+		safetyViolations: string[];
+		/** Answered from an earlier run on the same repository state (see runCheck). */
+		reused?: boolean;
 	}
 
-	/** One allowlisted check, non-interactive (CI=1 keeps test runners out of watch mode). */
-	async function runCheck(ctx: ExtensionContext, command: string, signal: AbortSignal | undefined): Promise<CheckResult> {
+	/**
+	 * Last result of each command, with the repository state it ran on. Within one user prompt only workers change
+	 * files (the supervisor has no shell, consultants and reviewers are read-only), so the same state gives the same
+	 * result: the next delegation's start need not run again the checks that closed the previous one. Results are
+	 * dropped whenever a worker starts, since a worker may also write files ignored by Git, which the fingerprint
+	 * does not cover. Only runs that left the state as they found it are kept.
+	 */
+	const checkResults = new Map<string, { cwd: string; promptSeq: number; fingerprint: string; result: CheckResult }>();
+
+	function checkReuseEnabled(): boolean {
+		return config.reuseChecks && !config.supervisorTools.includes("bash");
+	}
+
+	/** pass; unchanged = red since the task started and failing the same way; changed/regression block the task. */
+	type CheckState = "pass" | "unchanged" | "changed" | "regression";
+
+	/**
+	 * How a check compares with the task's start. A check red since then is tolerated only while its failure
+	 * signature matches the one recorded then: a new failure inside an already-red command (another test, a
+	 * different error, other counts) is a regression. Without a recorded signature nothing proves the failure
+	 * unchanged, so it counts as changed.
+	 */
+	function classifyCheck(check: CheckResult, redAtStart: boolean, startSignature: string | undefined): CheckState {
+		if (check.ok) return "pass";
+		if (!redAtStart) return "regression";
+		return startSignature !== undefined && check.signature === startSignature ? "unchanged" : "changed";
+	}
+
+	/**
+	 * One allowlisted check, non-interactive (CI=1 keeps test runners out of watch mode). With reuse, a result from
+	 * this prompt on exactly the same repository state is returned instead of running the command again.
+	 */
+	async function runCheck(ctx: ExtensionContext, command: string, signal: AbortSignal | undefined, reuse = false): Promise<CheckResult> {
+		const fingerprint = checkReuseEnabled() ? await workingTreeFingerprint(ctx.cwd) : undefined;
+		const known = checkResults.get(command);
+		if (reuse && fingerprint && known && known.fingerprint === fingerprint && known.cwd === ctx.cwd && known.promptSeq === promptSeq) {
+			metrics.reusedChecks++;
+			return { ...known.result, changed: [], safetyViolations: [], reused: true };
+		}
 		const before = await getGitSnapshot(ctx.cwd);
 		const outcome = await runProcess(command, [], "", ctx.cwd, signal, minutes(config.verificationTimeoutMinutes), undefined, { shell: true, maxBytes: config.maxProcessOutputBytes, env: { CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" } });
 		if (outcome.aborted) throw new Error("Verification aborted.");
-		const after = await getGitSnapshot(ctx.cwd);
+		const afterRun = await getGitSnapshot(ctx.cwd);
 		metrics.verifications++;
-		return {
+		const ok = outcome.exitCode === 0 && !outcome.timedOut;
+		const output = `${outcome.stdout}${outcome.stderr ? `\n[stderr]\n${outcome.stderr}` : ""}`.trim() || "(no output)";
+		const result: CheckResult = {
 			command,
-			ok: outcome.exitCode === 0 && !outcome.timedOut,
+			ok,
 			exitCode: outcome.exitCode,
 			timedOut: outcome.timedOut,
-			output: `${outcome.stdout}${outcome.stderr ? `\n[stderr]\n${outcome.stderr}` : ""}`.trim() || "(no output)",
-			changed: filesChangedBetween(before, after),
+			output,
+			changed: filesChangedBetween(before, afterRun),
+			// Every path is in scope here ("."), so only branch, HEAD and staged-content changes are reported.
+			safetyViolations: compareGitSnapshots(before, afterRun, ["."]),
+			signature: ok ? undefined : failureSignature(`${outcome.timedOut ? "timed out" : `exit code ${outcome.exitCode}`}\n${output}`),
 		};
+		// A timeout says nothing stable about the code; a run that changed the state is valid for no state left.
+		const after = fingerprint && !outcome.timedOut && !result.changed.length && !result.safetyViolations.length ? await workingTreeFingerprint(ctx.cwd) : undefined;
+		if (after && after === fingerprint) checkResults.set(command, { cwd: ctx.cwd, promptSeq, fingerprint, result });
+		else checkResults.delete(command);
+		return result;
 	}
 
-	async function runChecks(ctx: ExtensionContext, commands: string[], signal: AbortSignal | undefined): Promise<CheckResult[]> {
-		const results: CheckResult[] = [];
-		for (const command of commands) results.push(await runCheck(ctx, command, signal));
-		return results;
-	}
+	const CHECK_STATE_TEXT: Record<CheckState, string> = {
+		pass: "pass",
+		unchanged: "FAIL (was already failing before this task, in the same way)",
+		changed: "FAIL (regression: already failing before this task, but the failure changed)",
+		regression: "FAIL (regression)",
+	};
 
-	function formatChecks(checks: CheckResult[], baseline: Map<string, boolean>, rounds: number, verification: VerificationResult, notes: string[]): string {
-		const lines = checks.map((check) => {
-			const state = check.ok ? "pass" : baseline.get(check.command) === false ? "FAIL (was already failing before this task)" : "FAIL (regression)";
-			return `- ${check.command}: ${state}`;
-		});
-		const failing = checks.filter((check) => !check.ok).map((check) => `$ ${check.command}\n${check.timedOut ? "timed out" : `exit code ${check.exitCode}`}\n${truncateUtf8Tail(check.output, 4000)}`);
+	/**
+	 * Output is shown for regressions only. A failure unchanged since the task started is not the worker's doing:
+	 * a short excerpt on the task's first delegation says what it is, later delegations only name it.
+	 */
+	function formatChecks(checks: CheckResult[], classify: (check: CheckResult) => CheckState, rounds: number, verification: VerificationResult, notes: string[], firstDelegation: boolean): string {
+		const lines = checks.map((check) => `- ${check.command}: ${CHECK_STATE_TEXT[classify(check)]}${check.safetyViolations.length ? ` — GIT SAFETY VIOLATION: ${check.safetyViolations.join("; ")}` : ""}`);
+		const failing = checks
+			.filter((check) => !check.ok && (firstDelegation || classify(check) !== "unchanged"))
+			.map((check) => `$ ${check.command}\n${check.timedOut ? "timed out" : `exit code ${check.exitCode}`}\n${truncateUtf8Tail(check.output, classify(check) === "unchanged" ? 800 : 4000)}`);
 		return [
 			`AUTOMATIC VERIFICATION: ${verification.toUpperCase()}${rounds ? ` (${rounds} correction round${rounds > 1 ? "s" : ""})` : ""}`,
 			...lines,
@@ -1821,7 +2004,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const verdicts = Object.entries(metrics.reviewVerdicts).map(([verdict, count]) => `${verdict.toUpperCase()} ${count}`).join(", ");
 		const completed = metrics.delegations - metrics.failedDelegations;
 		lines.push(`Quality: ${metrics.delegations} delegations (${completed} completed, ${metrics.failedDelegations} failed) · ${metrics.autoVerifiedDelegations} auto-verified, ${metrics.firstPassDelegations} green at the first attempt, ${metrics.correctionRounds} correction rounds · reviews: ${verdicts || "none"}`);
-		lines.push(`Routing: failovers workers ${metrics.providerFailovers}, supervisor ${metrics.supervisorFailovers} · flagship asked ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved) · consultations ${metrics.readOnlyConsultations} · resumed sessions ${metrics.resumedDelegations} · checks run ${metrics.verifications}`);
+		lines.push(`Routing: failovers workers ${metrics.providerFailovers}, supervisor ${metrics.supervisorFailovers} · flagship asked ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved) · consultations ${metrics.readOnlyConsultations} · resumed sessions ${metrics.resumedDelegations} · checks run ${metrics.verifications}, reused ${metrics.reusedChecks}`);
 		if (completed > 0) lines.push(`Average per completed delegation: ${fmt(Math.round(grand / completed))} tokens · ${money((supervisorCost + workerCost) / completed)}`);
 		lines.push("Per-model costs are API-equivalent; for subscriptions the real cost is the plan usage above. ~ = estimated from Pi's price list.");
 		return lines;
@@ -2334,6 +2517,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			if (!enabled) throw new Error("SupervisedCoding is disabled. Run /SupervisedCoding on.");
+			if (delegationRunning) throw new Error("Wait for the running delegation before planning a task: it would replace the task that delegation is updating.");
 			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor model may plan tasks.");
 			const assessment = assessTask(params.profile, params.assessment);
 			params.profile = assessment.profile;
@@ -2442,9 +2626,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "consult_readonly",
 		label: "Read-only consultation",
-		description: "Independent read-only coding analysis by a Claude or GPT model without edit or shell tools. Ask for a family different from the one that wrote the code when independence matters. Unavailable/out-of-credit reviewers are skipped automatically. Use for architecture, risk, test strategy, hard debugging, or implementation review — not routine summaries.",
+		description: "Independent read-only coding analysis by a Claude or GPT model without edit or shell tools. Ask for a family different from the one that wrote the code when independence matters. Unavailable/out-of-credit reviewers are skipped automatically. Use for architecture, risk, test strategy, hard debugging, implementation review, or an audit or analysis spanning many files or large modules: the consultant reads them in its own context, not yours. Not for routine summaries.",
 		parameters: Type.Object({
-			purpose: StringEnum(["architecture", "risk-review", "test-strategy", "debugging", "implementation-review"] as const),
+			purpose: StringEnum(["architecture", "risk-review", "test-strategy", "debugging", "implementation-review", "audit"] as const),
 			question: Type.String({ description: "Narrow, decision-oriented question. Include known evidence; do not ask for a generic repository summary." }),
 			paths: Type.Array(Type.String({ description: "Repository-relative paths to inspect" }), { minItems: 1 }),
 			reviewer: Type.Optional(StringEnum(["auto", "claude", "gpt"] as const, { description: "Preferred reviewer family; the others follow if it is unavailable or out of credits. Default auto: the configured order." })),
@@ -2455,7 +2639,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (delegationRunning) throw new Error("Wait for the implementation before requesting an independent consultation.");
 			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor model may request consultations.");
 			const paths = normalizeAllowedPaths(params.paths, false);
-			const profileName = params.profile ?? (params.purpose === "architecture" || params.purpose === "risk-review" ? "large" : "medium");
+			const profileName = params.profile ?? (params.purpose === "architecture" || params.purpose === "risk-review" || params.purpose === "audit" ? "large" : "medium");
 			const outcome = await runConsultation(ctx, consultOrder(params.reviewer ?? "auto", profileName), `[READ-ONLY CODING CONSULTANT]\nPurpose: ${params.purpose}`, `Question: ${params.question}`, paths, signal);
 			metrics.readOnlyConsultations++;
 			persist();
@@ -2464,7 +2648,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const warning = outcome.gitAvailable ? "" : "\n\nGit unavailable: read-only mutation verification degraded.";
 			const violationText = outcome.violations.length ? `\n\nREAD-ONLY VIOLATION: ${outcome.violations.join("; ")}` : "";
 			return {
-				content: [{ type: "text", text: truncateUtf8(`${outcome.reviewer ?? "No reviewer"} ${outcome.failed ? "failed" : "completed"} (${profileName}).${chain}\n\n${outcome.text}${violationText}${warning}`, config.maxOutputBytes) }],
+				content: [{ type: "text", text: truncateUtf8(`${outcome.reviewer ?? "No reviewer"} ${outcome.failed ? "failed" : "completed"} (${profileName}).${chain}\n\n${truncateUtf8Middle(outcome.text, config.outputLimits.consultBytes)}${violationText}${warning}`, config.maxOutputBytes) }],
 				details: { purpose: params.purpose, paths, profile: profileName, attempts: outcome.attempts, violations: outcome.violations },
 				isError: outcome.failed,
 				usage: combineUsage(outcome.usage),
@@ -2516,7 +2700,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		}
 		if (review.verdict !== "none") metrics.reviewVerdicts[review.verdict] = (metrics.reviewVerdicts[review.verdict] ?? 0) + 1;
 		persist();
-		if (review.reviewer && !review.failed) return { text: `Review of the whole task (${review.reviewer}), verdict ${review.verdict.toUpperCase()}:\n${review.text}`, verdict: review.verdict };
+		if (review.reviewer && !review.failed) return { text: `Review of the whole task (${review.reviewer}), verdict ${review.verdict.toUpperCase()}:\n${truncateUtf8Middle(review.text, config.outputLimits.consultBytes)}`, verdict: review.verdict };
 		return { text: `REVIEW OF THE WHOLE TASK UNAVAILABLE: ${review.text}${review.violations.length ? `\nREAD-ONLY VIOLATION: ${review.violations.join("; ")}` : ""}`, verdict: "none" };
 	}
 
@@ -2582,7 +2766,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				acceptanceCriteria: criteria,
 				allowedPaths: [...allowedPaths],
 				phase: "implementing",
+				// The task-start reference travels with the task: re-recording it later would hide earlier regressions.
 				baseline: open?.baseline,
+				baselineSignatures: open?.baselineSignatures,
 				delegationCount: (open?.delegationCount ?? 0) + 1,
 				maxProfile: PROFILE_NAMES[Math.max(PROFILE_NAMES.indexOf(profileName), PROFILE_NAMES.indexOf(open?.maxProfile ?? profileName))],
 				implementer: open?.implementer,
@@ -2603,17 +2789,66 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				// Baseline first: checks that already failed are reported, never blamed on (or credited to) the worker.
 				// A check counts as pre-existing only if it fails now AND failed when the task started: whatever an
 				// earlier delegation of the same task broke is still a regression of the task, to be fixed here.
+				// Even then it is tolerated only while it fails the same way it failed at the start (see classifyCheck).
 				const taskBaseline: Record<string, boolean> = { ...taskPacket.baseline };
+				const taskSignatures: Record<string, string> = { ...taskPacket.baselineSignatures };
 				const baseline = new Map<string, boolean>();
+				const reusedAtStart: string[] = [];
+				// Files written by checks (build output, caches) are reported, never counted as worker scope violations.
+				const checkChanges = new Set<string>();
+				// Branch, HEAD or index changes by any check run of this delegation: they fail it, whoever's fault.
+				const checkSafety = new Set<string>();
+				const collect = (check: CheckResult) => {
+					check.changed.forEach((file) => checkChanges.add(file));
+					check.safetyViolations.forEach((item) => checkSafety.add(`${check.command}: ${item}`));
+				};
 				for (const command of verifyCommands) {
-					const ok = (await runCheck(ctx, command, signal)).ok;
-					taskBaseline[command] ??= ok;
-					baseline.set(command, ok || taskBaseline[command]);
+					const check = await runCheck(ctx, command, signal, true);
+					collect(check);
+					if (check.reused) reusedAtStart.push(command);
+					if (check.safetyViolations.length) break;
+					// A task persisted before signatures existed adopts this delegation's start as its reference: the
+					// best evidence left, and still stricter than the old boolean.
+					if (taskBaseline[command] === undefined || (taskBaseline[command] === false && taskSignatures[command] === undefined && check.signature)) {
+						taskBaseline[command] ??= check.ok;
+						if (check.signature) taskSignatures[command] = check.signature;
+					}
+					baseline.set(command, check.ok || taskBaseline[command]);
 				}
-				updateTaskPacket({ baseline: taskBaseline });
+				// A check that moved the branch, HEAD or index leaves Git in a state no worker may build on: stop before
+				// any worker starts, and record no baseline from it.
+				if (checkSafety.size) {
+					const changedNote = checkChanges.size ? `\nVerification commands also changed files: ${[...checkChanges].join(", ")}` : "";
+					const report = `DELEGATION BLOCKED before any worker started: verification commands changed Git state at the task start.\nGIT SAFETY VIOLATION: ${[...checkSafety].join("; ")}.\nReview manually (branch, HEAD, staged files); no automatic revert was attempted. Fix the VERIFY commands or the scripts they run before delegating again.${changedNote}`;
+					workerSession = undefined;
+					metrics.failedDelegations++;
+					updateTaskPacket({ phase: "failed", verification: "failed", failedChecks: undefined, lastReport: report });
+					updateStatus(ctx);
+					return {
+						content: [{ type: "text", text: truncateUtf8(report, config.maxOutputBytes) }],
+						details: { attempts: [], profile: profileName, taskPacketId: taskPacket?.id, verification: "failed", verificationSafetyViolations: [...checkSafety], verificationChanged: [...checkChanges], scopeViolations: [], correctionRounds: 0, reviewVerdict: "none", sessionPreserved: false, workerStarted: false },
+						isError: true,
+					};
+				}
+				updateTaskPacket({ baseline: taskBaseline, baselineSignatures: taskSignatures });
+				const classify = (check: CheckResult) => classifyCheck(check, baseline.get(check.command) === false, taskSignatures[check.command]);
+				const regressionsIn = (checks: CheckResult[]) => checks.filter((check) => ["regression", "changed"].includes(classify(check)));
+				// One command at a time: after a check changes the branch, HEAD or index, no later check runs on that state
+				// (and only the checks that ran are reported).
+				const runVerifyChecks = async () => {
+					const checks: CheckResult[] = [];
+					for (const command of verifyCommands) {
+						const check = await runCheck(ctx, command, signal);
+						collect(check);
+						checks.push(check);
+						if (check.safetyViolations.length) break;
+					}
+					return checks;
+				};
 				const beforeContent = await checkpoint(ctx.cwd, allowedPaths);
 				await extendTaskCheckpoint(ctx.cwd, taskPacket.id, allowedPaths, beforeContent);
 				const spec: ImplementationSpec = { task: params.recoveryNote ? `${params.task}\n\n${params.recoveryNote}` : params.task, guide: implementationGuide, criteria, allowedPaths, profileName, assessment: assessed.assessment, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, resumeWorker: workerSession?.worker ?? "claude", resumeModel: workerSession?.model, repoContext, checkpoint: beforeContent };
+				checkResults.clear();
 				const outcome = await executeImplementation(ctx, spec, signal, (text, label) => onUpdate?.({ content: [{ type: "text", text: truncateUtf8(text, 4000) }], details: { running: true, profile: profileName, worker: label } }));
 				if (outcome.resumed) metrics.resumedDelegations++;
 				let final = outcome.final as RunResult;
@@ -2631,12 +2866,21 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				let verification: VerificationResult = "unverified";
 				let verificationText = "";
 				let correctionRounds = 0;
+				// Scope/Git safety covers only worker runs (the implementation and each correction), each against its own
+				// snapshots: files written by the checks in between are not the worker's doing.
+				const scopeViolations = [...outcome.scopeViolations];
+				let regressions: CheckResult[] = [];
+				let correctionFailed = false;
+				/** Commands of the last check run: fewer than VERIFY lists when a Git safety violation stopped it. */
+				let ranCommands = verifyCommands;
 				if (!failed && verifyCommands.length) {
 					metrics.autoVerifiedDelegations++;
-					let checks = await runChecks(ctx, verifyCommands, signal);
-					let regressions = checks.filter((check) => !check.ok && baseline.get(check.command) !== false);
+					let checks = await runVerifyChecks();
+					regressions = regressionsIn(checks);
 					const notes: string[] = [];
-					while (regressions.length && correctionRounds < config.maxCorrectionRounds) {
+					// No correction round ever starts on Git state a check changed (branch, HEAD, index): the worker
+					// would build on it. This also ends the loop right after any later check run that changes it.
+					while (regressions.length && !checkSafety.size && correctionRounds < config.maxCorrectionRounds) {
 						const over = budgetExceeded();
 						if (over) {
 							limitReached = over;
@@ -2646,8 +2890,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 						correctionRounds++;
 						metrics.correctionRounds++;
 						onUpdate?.({ content: [{ type: "text", text: `Correction round ${correctionRounds}: ${regressions.map((check) => check.command).join(", ")} failing` }], details: { running: true, profile: profileName, worker: candidateLabel(implementer) } });
+						checkResults.clear();
 						const correction = await runCorrection(ctx, implementer, sessionId, spec, regressions, correctionRounds, signal);
 						usage.push(...correction.usage);
+						scopeViolations.push(...correction.scopeViolations);
 						if (correction.final) { final = correction.final; sessionId = final.sessionId; }
 						if (correction.finalCandidate) implementer = correction.finalCandidate;
 						if (correction.limitReached) {
@@ -2656,28 +2902,39 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 							break;
 						}
 						if (correction.failed) {
+							correctionFailed = true;
 							providerFailure = runFailed(final) && (FAILOVER_KINDS.has(failureKindOf(final)) || failureKindOf(final) === "transient");
 							notes.push(`Correction round ${correctionRounds} failed: ${correction.primaryOutput.slice(0, 200)}`);
 							break;
 						}
 						sessionId = final.sessionId ?? sessionId;
-						checks = await runChecks(ctx, verifyCommands, signal);
-						regressions = checks.filter((check) => !check.ok && baseline.get(check.command) !== false);
+						checks = await runVerifyChecks();
+						regressions = regressionsIn(checks);
 					}
 					verification = regressions.length ? "failed" : checks.some(check => !check.ok) ? "unchanged_failures" : correctionRounds ? "fixed" : "passed";
 					if (regressions.length) failed = true;
-					verificationText = formatChecks(checks, baseline, correctionRounds, verification, notes);
+					if (checkSafety.size) {
+						verification = "failed";
+						notes.push(`GIT SAFETY VIOLATION by verification commands: ${[...checkSafety].join("; ")}. Automation stopped: no correction round, worker session not kept. Review manually; no automatic revert was attempted.`);
+					}
+					if (checkChanges.size) notes.push(`Warning: verification commands changed files (not counted as scope violations of the worker): ${[...checkChanges].join(", ")}`);
+					ranCommands = checks.map((check) => check.command);
+					const skipped = verifyCommands.filter((command) => !ranCommands.includes(command));
+					if (skipped.length) notes.push(`Not run on the changed Git state: ${skipped.join(", ")}.`);
+					verificationText = formatChecks(checks, classify, correctionRounds, verification, notes, (taskPacket?.delegationCount ?? 1) === 1);
 				}
+				if (checkSafety.size) { verification = "failed"; failed = true; }
 
-				// Scope is checked again: correction rounds edit files too.
 				const afterAll = await getGitSnapshot(ctx.cwd);
-				const scopeViolations = compareGitSnapshots(outcome.before, afterAll, allowedPaths);
 				if (scopeViolations.length) failed = true;
-				workerSession = implementer.worker !== "api" && sessionId && !scopeViolations.length
+				// Never resumable on Git state a check changed: continuePrevious would resume the worker on it.
+				workerSession = implementer.worker !== "api" && sessionId && !scopeViolations.length && !checkSafety.size
 					? { worker: implementer.worker, sessionId, cwd: ctx.cwd, allowedPaths: [...allowedPaths], model: implementer.model, taskId: taskPacket?.id }
 					: undefined;
 				const report = `${outcome.primaryOutput}${verificationText ? `\n\n${verificationText}` : ""}`;
-				updateTaskPacket({ phase: failed ? "failed" : "implemented", primaryWorker: candidateLabel(implementer), implementer, lastReport: report, verification });
+				// Only a task failed by its checks alone can be restored by passing checks (run_verification).
+				const onlyChecksFailed = regressions.length > 0 && !outcome.failed && !correctionFailed && !limitReached && !scopeViolations.length && !checkSafety.size;
+				updateTaskPacket({ phase: failed ? "failed" : "implemented", primaryWorker: candidateLabel(implementer), implementer, lastReport: report, verification, failedChecks: onlyChecksFailed ? regressions.map((check) => check.command) : undefined });
 
 				let reviewText = "";
 				let reviewVerdict: ReviewVerdict = "none";
@@ -2710,25 +2967,32 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				persist();
 				updateStatus(ctx);
 				const usageLine = combined ? `Combined tokens: ${combined.input} in + ${combined.output} out + ${combined.cacheRead} cache-read; reported cost $${combined.cost.total.toFixed(2)}` : "Usage unavailable";
-				const safetyLine = scopeViolations.length ? `SAFETY VIOLATIONS: ${scopeViolations.join("; ")}\n` : "";
+				const safetyItems = [...scopeViolations, ...[...checkSafety].map((item) => `verification ${item}`)];
+				const safetyLine = safetyItems.length ? `SAFETY VIOLATIONS: ${safetyItems.join("; ")}\n` : "";
 				const changedLine = afterAll.available ? `Changed files in this delegation: ${filesChangedBetween(outcome.before, afterAll).join(", ") || "none"}\n` : "Git unavailable: scope enforcement degraded outside Git repositories.\n";
 				// The supervisor reviews the change right here instead of spending extra turns on supervisor_git.
 				const delta = afterAll.available ? await changesSince(ctx.cwd, allowedPaths, beforeContent, 12_000) : undefined;
 				const diffSection = delta?.complete ? `DIFF (this delegation only)\n\`\`\`diff\n${delta.diff}\n\`\`\`` : delta ? `DIFF: incomplete; inspect with supervisor_git. Changed paths: ${delta.files.join(", ")}.` : "";
 				const verificationLine = verifyCommands.length
-					? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""} — already run by the extension on the final code: ${verifyCommands.join(", ")}. Do not re-run these; use run_verification only for other checks.\n`
+					? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""} — already run by the extension on the final code: ${ranCommands.join(", ")}. Do not re-run these; use run_verification only for other checks.\n`
 					: "Automatic verification: none (no allowlisted command in VERIFY); run_verification before accepting.\n";
-				const text = truncateUtf8([
+				// Each part has its own cap, so a long worker report can never push the review or the diff out of the result.
+				const sections = [
 					`${candidateLabel(implementer)} (${profileName}) ${limitReached ? "stopped" : failed ? "failed" : "completed"}.\n${limitReached ? `STOPPED: ${limitReached} reached. Partial work${workerSession ? " and the worker session are" : " is"} preserved; delegate the rest with continuePrevious=true.\n` : ""}${safetyLine}${changedLine}${verificationLine}${usageLine}`,
-					outcome.primaryOutput,
+					truncateUtf8Middle(outcome.primaryOutput, config.outputLimits.workerReportBytes),
 					verificationText,
-					reviewText,
-					diffSection,
+					truncateUtf8Middle(reviewText, config.outputLimits.consultBytes),
 					learningNotes.length ? `Learning: ${learningNotes.join("; ")}` : "",
-				].filter(Boolean).join("\n\n"), config.maxOutputBytes);
+				];
+				const withoutDiff = Buffer.byteLength(sections.join("\n\n"), "utf8");
+				// A diff is useful only whole: when it does not fit, point to it instead of cutting it.
+				sections.splice(4, 0, diffSection && withoutDiff + Buffer.byteLength(diffSection, "utf8") + 2 > config.maxOutputBytes && delta
+					? `DIFF: omitted to keep this result within maxOutputBytes; inspect with supervisor_git. Changed paths: ${delta.files.join(", ")}.`
+					: diffSection);
+				const text = truncateUtf8(sections.filter(Boolean).join("\n\n"), config.maxOutputBytes);
 				return {
 					content: [{ type: "text", text }],
-					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: afterAll, scopeViolations, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict, limitReached, sessionPreserved: Boolean(workerSession && workerSession.taskId === taskPacket?.id) },
+					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: afterAll, scopeViolations, verificationChanged: [...checkChanges], verificationSafetyViolations: [...checkSafety], verificationCommandsRun: verification === "unverified" ? [] : ranCommands, checksReusedAtStart: reusedAtStart, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict, limitReached, sessionPreserved: Boolean(workerSession && workerSession.taskId === taskPacket?.id) },
 					isError: failed,
 					usage: combined,
 				};
@@ -2776,16 +3040,79 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				throw new Error(`Command not allowlisted. Allowed prefixes: ${config.verificationCommands.join(", ")} (verificationCommands in config.json).`);
 			}
 			const check = await runCheck(ctx, command, signal);
-			// A failure blocks acceptance of the open task, unless the same check was already red when the task started.
-			// A completed task is never reopened by a later check.
+			// A failure blocks acceptance of the open task, unless the check was already red when the task started and
+			// still fails the same way. A completed task is never reopened by a later check.
 			const open = openTask();
-			if (!check.ok && open && open.baseline?.[command] !== false) updateTaskPacket({ verification: "failed", phase: "failed" });
+			const state = open ? classifyCheck(check, open.baseline?.[command] === false, open.baselineSignatures?.[command]) : undefined;
+			if (check.safetyViolations.length) {
+				// No worker may be resumed (continuePrevious) on Git state a check changed, whatever task it belongs to.
+				workerSession = undefined;
+				persist();
+			}
+			if (open && check.safetyViolations.length) {
+				// Branch, HEAD or index changes are never cleared by a later passing check.
+				updateTaskPacket({ verification: "failed", phase: "failed", failedChecks: undefined });
+			} else if (open && (state === "regression" || state === "changed")) {
+				// Checks stay the only failure of a task that was implemented, or already failed by checks alone.
+				const onlyChecks = open.phase === "implemented" || (open.phase === "failed" && open.failedChecks !== undefined);
+				updateTaskPacket({ verification: "failed", phase: "failed", failedChecks: onlyChecks ? [...new Set([...(open.failedChecks ?? []), command])] : undefined });
+			} else if (open && (state === "pass" || state === "unchanged") && open.phase === "failed" && open.verification === "failed" && open.failedChecks?.includes(command)) {
+				// A check that failed the task is cleared once it passes, or fails again only the way it did at the task
+				// start (the added failure was fixed). The task returns to implemented when none is left; other failures never clear.
+				const remaining = open.failedChecks.filter((item) => item !== command);
+				updateTaskPacket(remaining.length ? { failedChecks: remaining } : { verification: state === "unchanged" ? "unchanged_failures" : "passed", phase: "implemented", failedChecks: undefined });
+			} else if (open && state === "pass" && open.phase === "implemented" && open.verification === "unverified") {
+				updateTaskPacket({ verification: "passed" });
+			}
 			const status = check.timedOut ? `timed out after ${config.verificationTimeoutMinutes} min` : `exit code ${check.exitCode}`;
+			const stateLine = state && state !== "pass" ? `\n${CHECK_STATE_TEXT[state]}` : "";
+			const safety = check.safetyViolations.length ? `\nGIT SAFETY VIOLATION: ${check.safetyViolations.join("; ")}. Review manually; no automatic revert was attempted.` : "";
 			const warning = check.changed.length ? `\n\nNote: the command changed files: ${check.changed.join(", ")}` : "";
 			return {
-				content: [{ type: "text", text: `$ ${command}\n${status}${warning}\n\n${truncateUtf8Tail(check.output, config.maxOutputBytes)}` }],
-				details: { command, exitCode: check.exitCode, timedOut: check.timedOut, changed: check.changed },
-				isError: !check.ok,
+				// A passing check needs only its summary; a failing one its failures, which runners print last.
+				content: [{ type: "text", text: `$ ${command}\n${status}${stateLine}${safety}${warning}\n\n${truncateUtf8Tail(check.output, Math.min(check.ok ? config.outputLimits.verificationPassBytes : config.outputLimits.verificationFailBytes, config.maxOutputBytes))}` }],
+				details: { command, exitCode: check.exitCode, timedOut: check.timedOut, changed: check.changed, safetyViolations: check.safetyViolations, state, taskPhase: open ? taskPacket?.phase : undefined, verification: open ? taskPacket?.verification : undefined },
+				isError: !check.ok || check.safetyViolations.length > 0,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "code_outline",
+		label: "Code outline",
+		description: "Outline of source files without reading them: functions, classes, methods, types and tests (Markdown: headings) with their line ranges. Use it before reading a large or unfamiliar file, then read only the ranges you need (read with offset/limit). Directories list the supported files Git does not ignore. Deterministic, no model call; ranges are approximate for unconventionally formatted code.",
+		parameters: Type.Object({
+			paths: Type.Array(Type.String({ description: "Repository-relative file or directory" }), { minItems: 1, maxItems: 50 }),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			if (!enabled) throw new Error("SupervisedCoding is disabled. Run /SupervisedCoding on.");
+			const files = await outlineFiles(ctx.cwd, normalizeAllowedPaths(params.paths, true));
+			const parts: string[] = [];
+			let bytes = 0;
+			let omitted = 0;
+			for (const file of files.list) {
+				let source: string;
+				try {
+					const buffer = fs.readFileSync(path.join(ctx.cwd, file));
+					if (buffer.includes(0)) continue;
+					source = buffer.toString("utf8");
+				} catch {
+					continue; // Deleted in the working tree.
+				}
+				const part = formatOutline(file, source);
+				bytes += Buffer.byteLength(part, "utf8") + 2;
+				if (bytes > config.outputLimits.outlineBytes && parts.length) { omitted++; continue; }
+				parts.push(part);
+			}
+			const notes = [
+				...files.missing.map((item) => `${item}: not found`),
+				...(files.capped ? [`More than ${OUTLINE_MAX_FILES} files: outline a narrower directory.`] : []),
+				...(omitted ? [`${omitted} more file(s) omitted to stay within outputLimits.outlineBytes: outline them separately.`] : []),
+			];
+			const text = [...parts, ...(notes.length ? [notes.join("\n")] : [])].join("\n\n") || "No supported source files in these paths.";
+			return {
+				content: [{ type: "text", text: truncateUtf8(text, config.outputLimits.outlineBytes + 1024) }],
+				details: { files: parts.length, omitted, missing: files.missing, capped: files.capped },
 			};
 		},
 	});
@@ -2854,6 +3181,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		description: "Stage literal paths and create a commit only after explicit human confirmation in the UI.",
 		parameters: Type.Object({ message: Type.String(), paths: Type.Array(Type.String(), { minItems: 1 }) }),
 		async execute(_id, params, _signal, _update, ctx) {
+			if (delegationRunning) throw new Error("Commit blocked: wait for the running delegation; its worker may still be changing files.");
 			if (!ctx.hasUI) throw new Error("Commit blocked: interactive human authorization is unavailable.");
 			const commitPaths = normalizeAllowedPaths(params.paths, false);
 			if (taskPacket?.allowedPaths?.length && !taskPacket.allowedPaths.includes(".")) {
@@ -2877,6 +3205,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		description: "Run a normal git push, never force-push, only after explicit human confirmation in the UI.",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _update, ctx) {
+			if (delegationRunning) throw new Error("Push blocked: wait for the running delegation to finish.");
 			if (!ctx.hasUI) throw new Error("Push blocked: interactive human authorization is unavailable.");
 			const branch = await runGit(ctx.cwd, ["branch", "--show-current"]);
 			if (!branch || branch === "(no output)") throw new Error("Push blocked: detached HEAD; cannot determine current branch to push.");
@@ -2971,7 +3300,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Every extra turn resends the whole context.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
 				display: false,
 			},
 		};
