@@ -3,3 +3,9 @@ data/
 node_modules/
 .npm-cache/
 .typecheck-*.json
+# Editors, OS files and logs
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
