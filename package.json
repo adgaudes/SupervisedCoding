@@ -13,6 +13,7 @@
     "multi-model",
     "code-review"
   ],
+  "license": "MIT",
   "homepage": "https://github.com/adgaudes/SupervisedCoding#readme",
   "repository": {
     "type": "git",

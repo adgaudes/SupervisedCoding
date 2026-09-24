@@ -2,7 +2,7 @@
 
 **Supervised multi-model coding for the [Pi](https://pi.dev) coding agent.** One model plans, delegates and accepts. Claude and GPT workers implement. Checks, independent reviews, credit failover and learning run on their own.
 
-![Pi extension](https://img.shields.io/badge/Pi-extension-6f42c1) ![Node.js ≥ 22.16](https://img.shields.io/badge/node-%E2%89%A5%2022.16-339933) ![Models: Claude · GPT](https://img.shields.io/badge/models-Claude%20%C2%B7%20GPT-555)
+![Pi extension](https://img.shields.io/badge/Pi-extension-6f42c1) ![Node.js ≥ 22.16](https://img.shields.io/badge/node-%E2%89%A5%2022.16-339933) ![Models: Claude · GPT](https://img.shields.io/badge/models-Claude%20%C2%B7%20GPT-555) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **English** · [Italiano](#italiano)
 
@@ -249,6 +249,10 @@ The tests never call a real model: they run the real extension against fake Clau
 | `changes.ts` | checkpoints and per-delegation diffs |
 | `config.json` | default configuration |
 | `CHANGELOG.md` | release notes |
+
+## License
+
+[MIT](LICENSE) © adgaudes
 
 ---
 
@@ -501,3 +505,7 @@ I test non chiamano mai un modello reale: eseguono la vera estensione contro CLI
 | `changes.ts` | checkpoint e diff per singola delega |
 | `config.json` | configurazione di default |
 | `CHANGELOG.md` | note di rilascio |
+
+## Licenza
+
+[MIT](LICENSE) © adgaudes
