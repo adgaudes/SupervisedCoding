@@ -1,0 +1,18 @@
+{
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2"
+  },
+  "name": "pi-supervised-coding",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "test:unit": "node --test tests/lib.test.ts tests/learning.test.ts tests/routing.test.ts tests/changes.test.ts",
+    "test:integration": "node --import ./tests/resolve-pi.mjs --test tests/integration.test.ts tests/regressions.test.ts",
+    "typecheck": "node tests/typecheck.mjs",
+    "test": "npm run test:unit && npm run test:integration && npm run typecheck"
+  }
+}

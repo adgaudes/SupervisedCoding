@@ -131,7 +131,9 @@
   "maxDiffBytes": 60000,
   "learning": {
     "enabled": true,
-    "autoTuneEffort": true
+    "autoTuneEffort": true,
+    "autoRouteModels": true,
+    "minModelSamples": 20
   },
   "minImplementationGuideChars": {
     "small": 150,
@@ -243,6 +245,7 @@
     "find",
     "ls",
     "plan_task",
+    "complete_task",
     "consult_readonly",
     "delegate_implementation",
     "run_verification",
@@ -251,5 +254,29 @@
     "request_git_commit",
     "request_git_push"
   ],
-  "maxOutputBytes": 51200
+  "maxOutputBytes": 51200,
+  "supervisorProfiles": {
+    "small": [
+      {
+        "provider": "openai-codex",
+        "model": "gpt-6-sol"
+      },
+      {
+        "provider": "openai-codex",
+        "model": "gpt-5.5"
+      }
+    ]
+  },
+  "probeTtlMinutes": 15,
+  "probeMaxTokens": 128,
+  "reviewMaxTokens": 8192,
+  "workerMaxTurns": {
+    "small": 30,
+    "medium": 60,
+    "large": 100,
+    "critical": 120
+  },
+  "delegationTimeoutMinutes": 120,
+  "delegationBudgetUsd": 0,
+  "maxProcessOutputBytes": 2000000
 }

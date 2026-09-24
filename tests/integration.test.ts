@@ -181,7 +181,7 @@ test("a regression is fixed by the same worker session in a correction round", a
 			{ write: { "value.txt": "ok" }, text: "Restored value.txt." },
 		],
 	});
-	const host = makeHost(makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK }));
+	const host = makeHost(repo);
 	await host.on();
 	const result = await host.call("delegate_implementation", { task: "Add feature.txt", profile: "medium", implementationGuide: guide(["feature.txt", "value.txt"], ["node --test"]), allowedPaths: ["feature.txt", "value.txt"] });
 	assert.equal(result.isError, false, result.content[0].text);
@@ -201,7 +201,7 @@ test("a check that was already failing is reported but not blamed on the worker"
 	await host.on();
 	const result = await host.call("delegate_implementation", { task: "Add feature.txt", profile: "medium", implementationGuide: guide(["feature.txt"], ["node --test broken.test.mjs"]), allowedPaths: ["feature.txt"] });
 	assert.equal(result.isError, false);
-	assert.equal(result.details.verification, "passed");
+	assert.equal(result.details.verification, "unchanged_failures");
 	assert.equal(result.details.correctionRounds, 0);
 	assert.match(result.content[0].text, /was already failing before the change/);
 	assert.equal(calls().length, 1, "no correction round for a pre-existing failure");
@@ -257,8 +257,9 @@ test("repository rules and recorded lessons reach every fresh worker", async () 
 
 test("repeated poor outcomes raise the worker effort for that profile and model", async () => {
 	fs.mkdirSync(path.dirname(dataFile), { recursive: true });
-	const poor = { at: Date.now(), repo: "seed", taskId: "seed", profile: "medium", worker: "claude", model: "claude-sonnet-5", effort: "high", verification: "failed", correctionRounds: 2, review: "none", failed: true, tokens: 0, costUsd: 0 };
-	fs.writeFileSync(dataFile, JSON.stringify({ version: 1, outcomes: [poor, poor, poor], lessons: [], effortAdjustments: {} }));
+	const repo = makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK });
+	const poor = { evidenceVersion: 2, taskKind: "general", at: Date.now(), repo: repo.replace(/\\/g, "/").toLowerCase(), taskId: "seed", profile: "medium", worker: "claude", model: "claude-sonnet-5", effort: "high", verification: "failed", correctionRounds: 2, review: "none", failed: true, tokens: 0, costUsd: 0 };
+	fs.writeFileSync(dataFile, JSON.stringify({ version: 1, outcomes: [0,1,2].map(i => ({...poor, taskId: "seed-" + i})), lessons: [], effortAdjustments: {} }));
 	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "value.txt": "broken" } }, { write: { "other.txt": "x\n" } }] });
 	const host = makeHost(makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK }));
 	await host.on();
@@ -295,7 +296,7 @@ test("a follow-up step of the same task resumes the worker session on new paths"
 	const [first, second] = calls();
 	assert.ok(first.resume === undefined && second.resume, "same task: session resumed despite the new path");
 	await host.call("plan_task", { task: "Another task", profile: "medium", rationale: "test" });
-	await assert.rejects(host.call("delegate_implementation", { task: "Other", continuePrevious: true, implementationGuide: guide(["step3.txt"]), allowedPaths: ["step3.txt"] }), /no compatible previous Claude session|different task/);
+	await assert.rejects(host.call("delegate_implementation", { task: "Other", continuePrevious: true, implementationGuide: guide(["step3.txt"]), allowedPaths: ["step3.txt"] }), /no compatible previous worker session|different task/);
 });
 
 test("flagship workers run only after SI; No falls back to the strongest non-flagship model", async () => {
@@ -346,5 +347,5 @@ test("a guide without SYMBOLS/PRESERVE is completed with safe defaults instead o
 	const result = await host.call("delegate_implementation", { task: "Rewrite x.txt", profile: "medium", implementationGuide: lean, allowedPaths: ["x.txt"] });
 	assert.equal(result.isError, false);
 	assert.match(calls()[0].prompt, /PRESERVE:\n- Existing public API/);
-	assert.match(result.content[0].text, /DIFF \(allowed paths vs HEAD\)[\s\S]*-old[\s\S]*\+x/, "the supervisor sees the diff without extra turns");
+	assert.match(result.content[0].text, /DIFF \(this delegation only\)[\s\S]*-old[\s\S]*\+x/, "the supervisor sees the diff without extra turns");
 });

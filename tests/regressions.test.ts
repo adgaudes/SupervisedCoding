@@ -1,0 +1,252 @@
+﻿// End-to-end tests of the real extension against fake Claude/Gemini CLIs, a fake Pi host and real Git repositories.
+// Regression tests derived from the audit: assert the repaired guarantees.
+// Run: node --import ./tests/resolve-pi.mjs --test tests/regressions.test.ts
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { after, beforeEach, test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const here = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tests");
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-it-"));
+const configFile = path.join(root, "config.json");
+const dataFile = path.join(root, "data", "learning.json");
+const planFile = path.join(root, "plan.json");
+const logFile = path.join(root, "calls.jsonl");
+process.env.SUPERVISED_CODING_CONFIG = configFile;
+process.env.SUPERVISED_CODING_DATA = dataFile;
+process.env.FAKE_PLAN = planFile;
+process.env.FAKE_LOG = logFile;
+// The checks run `node --test` themselves; nested under this test runner they would report to it and exit 0.
+delete process.env.NODE_TEST_CONTEXT;
+const { default: extension } = await import("../index.ts");
+const baseConfig = JSON.parse(fs.readFileSync(path.join(here, "..", "config.json"), "utf8"));
+
+after(() => fs.rmSync(root, { recursive: true, force: true }));
+beforeEach(() => {
+	fs.rmSync(dataFile, { force: true });
+	fs.writeFileSync(logFile, "");
+});
+
+type Step = { action?: string; write?: Record<string, string>; text?: string };
+
+function configure(overrides: Record<string, unknown>, plan: Record<string, Step[]>): void {
+	const config = {
+		...baseConfig,
+		workerCommand: process.execPath,
+		workerCommandArgs: [path.join(here, "fakes", "fake-claude.mjs")],
+		geminiCommand: process.execPath,
+		geminiCommandArgs: [path.join(here, "fakes", "fake-gemini.mjs")],
+		supervisorChain: [],
+		probeOnActivate: false,
+		flagshipModels: [],
+		reviewApi: null,
+		independentReviewProfiles: [],
+		transientRetryDelayMs: 1,
+		...overrides,
+	};
+	fs.writeFileSync(configFile, JSON.stringify(config));
+	fs.writeFileSync(planFile, JSON.stringify(plan));
+}
+
+function calls(): Array<{ cli: string; model: string; effort?: string; resume?: string; mode?: string; tools?: string; prompt: string }> {
+	return fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function makeRepo(files: Record<string, string>): string {
+	const repo = fs.mkdtempSync(path.join(root, "repo-"));
+	for (const [file, content] of Object.entries(files)) {
+		fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+		fs.writeFileSync(path.join(repo, file), content);
+	}
+	const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "pipe" });
+	git("init", "-q");
+	git("add", "-A");
+	git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "core.autocrlf=false", "commit", "-q", "-m", "init", "--allow-empty");
+	return repo;
+}
+
+function makeHost(repo: string) {
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	const notifications: string[] = [];
+	const questions: string[] = [];
+	const handlers = new Map<string, any>();
+	let answer = "No";
+	const apiCalls: Array<{ model: string; content: string }> = [];
+	let apiReply = "No material defect.\nVERDICT: PASS";
+	let thinking = "medium";
+	let activeTools = ["read", "bash", "edit", "write"];
+	const models: Record<string, any> = {
+		"google/gemini-3.1-pro-preview": { provider: "google", id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro" },
+		"openai-codex/gpt-5.5": { provider: "openai-codex", id: "gpt-5.5", name: "GPT-5.5" },
+		"google/gemini-3.8-flash": { provider: "google", id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+	};
+	const ctx: any = {
+		cwd: repo,
+		hasUI: true,
+		model: { provider: "test", id: "supervisor" },
+		modelRegistry: {
+			find: (provider: string, id: string) => models[`${provider}/${id}`],
+			hasConfiguredAuth: () => true,
+			isUsingOAuth: (model: any) => model.provider === "openai-codex",
+			streamSimple: (model: any, context: any) => ({
+				result: async () => {
+					apiCalls.push({ model: model.id, content: context.messages[0].content });
+					return { role: "assistant", content: [{ type: "text", text: apiReply }], stopReason: "stop", usage: { input: 500, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 550, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.002 } } };
+				},
+			}),
+		},
+		ui: {
+			notify: (text: string) => notifications.push(text),
+			confirm: async () => true,
+			select: async (title: string) => {
+				questions.push(title);
+				return answer;
+			},
+			setStatus: () => undefined,
+			theme: { fg: (_: string, text: string) => text },
+		},
+		getContextUsage: () => undefined,
+		sessionManager: { getBranch: () => [] },
+	};
+	const pi: any = {
+		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerCommand: (name: string, command: any) => commands.set(name, command),
+		on: (event: string, handler: any) => handlers.set(event, handler),
+		appendEntry: (_type: string, data: any) => { ctx.auditState = structuredClone(data); },
+		getActiveTools: () => activeTools,
+		setActiveTools: (names: string[]) => { activeTools = names; },
+		setModel: async (model: any) => {
+			ctx.model = model;
+			return true;
+		},
+		getThinkingLevel: () => thinking,
+		setThinkingLevel: (level: string) => { thinking = level; },
+		sendMessage: () => undefined,
+	};
+	extension(pi);
+	return {
+		ctx,
+		command: (args: string) => commands.get("SupervisedCoding").handler(args, ctx), notifications,
+		apiCalls,
+		setApiReply: (text: string) => { apiReply = text; },
+		setAnswer: (value: string) => { answer = value; },
+		questions,
+		handlers,
+		on: () => commands.get("SupervisedCoding").handler("on", ctx),
+		call: (name: string, params: any) => tools.get(name).execute("t", params, undefined, undefined, ctx),
+	};
+}
+
+function guide(files: string[], verify: string[] = []): string {
+	return [
+		`FILE: ${files.join(", ")}`,
+		"SYMBOLS: none (plain files used by the integration test)",
+		"CHANGES:",
+		"- Apply the scripted change; the fake worker writes the files itself.",
+		"PRESERVE:",
+		"- Everything outside the listed files; this guide is padded to exceed the minimum guide length required by the medium and larger profiles, which ask for four hundred characters of structured guidance before any worker may start.",
+		"VERIFY:",
+		...(verify.length ? verify.map((command) => `- \`${command}\``) : ["- Read the files back."]),
+	].join("\n");
+}
+
+const PASSING_CHECK = `import test from "node:test";\nimport assert from "node:assert";\nimport fs from "node:fs";\ntest("value", () => assert.equal(fs.readFileSync("value.txt", "utf8"), "ok"));\n`;
+
+import { emptyLearning, recordOutcome, tuneEfforts, effectiveEffort } from "../learning.ts";
+
+test("AUDIT: effort changes require new evidence, including return to an earlier level", () => {
+  const state = emptyLearning();
+  const target = { profile: "medium", model: "m", configured: "high" as const };
+  for (let i=0;i<4;i++) recordOutcome(state, {at:1,repo:"r",taskId:"t",profile:"medium",worker:"claude",model:"m",effort:"high",verification:"failed",correctionRounds:0,review:"none",failed:true,tokens:0,costUsd:0});
+  tuneEfforts(state,[target],undefined,2);
+  for (let i=0;i<20;i++) recordOutcome(state, {at:3,repo:"r",taskId:"t",profile:"medium",worker:"claude",model:"m",effort:"xhigh",verification:"passed",correctionRounds:0,review:"none",failed:false,tokens:0,costUsd:0});
+  tuneEfforts(state,[target],undefined,4);
+  assert.equal(effectiveEffort(state,"medium","m","high"),"high");
+  assert.equal(tuneEfforts(state,[target],undefined,5).length,0);
+  assert.equal(effectiveEffort(state,"medium","m","high"),"high");
+  assert.equal(tuneEfforts(state,[target],undefined,6).length,0);
+  assert.equal(effectiveEffort(state,"medium","m","high"),"high");
+});
+
+test("AUDIT: a still failing baseline never counts as first-pass test success", async () => {
+  configure({}, {"claude-sonnet-5":[{write:{"value.txt":"bad"}}]});
+  const host=makeHost(makeRepo({"value.txt":"bad","check.test.mjs":PASSING_CHECK})); await host.on();
+  const result=await host.call("delegate_implementation", {task:"change",profile:"medium",allowedPaths:["value.txt"],implementationGuide:guide(["value.txt"],["node --test check.test.mjs"])});
+  const learned=JSON.parse(fs.readFileSync(dataFile,"utf8"));
+  assert.equal(result.details.verification,"unchanged_failures"); assert.equal(learned.outcomes.at(-1).verification,"unchanged_failures");
+  assert.match(result.content[0].text,/already failing/);
+});
+
+test("AUDIT: explicit acceptance closes a critical task and resets effort", async () => {
+  configure({}, {"claude-fable-5-1":[{write:{"a.txt":"done"}}]});
+  const host=makeHost(makeRepo({"a.txt":"old"})); await host.on();
+  await host.call("delegate_implementation",{task:"change",profile:"critical",allowedPaths:["a.txt"],implementationGuide:guide(["a.txt"])});
+  await host.call("complete_task",{decision:"accept",summary:"Reviewed the final change and its requirements."});
+  await host.handlers.get("agent_settled")({},host.ctx);
+  await host.handlers.get("before_agent_start")({prompt:"A new request"},host.ctx);
+  await host.command("status");
+  assert.equal(host.ctx.auditState.taskPacket.phase,"completed");
+  assert.match(host.notifications.at(-1)!, /effort medium/);
+});
+
+test("AUDIT: activation never probes an unapproved flagship", async () => {
+  configure({supervisorChain:[{provider:"openai-codex",model:"gpt-5.5"}],flagshipModels:["gpt-5.5"],probeOnActivate:true}, {});
+  const host=makeHost(makeRepo({"a.txt":"old"})); let probes=0;
+  host.ctx.modelRegistry.complete=async()=>{probes++; return {stopReason:"stop",usage:{totalTokens:999}};};
+  await host.on();
+  assert.equal(probes,0); assert.equal(host.questions.length,0);
+  assert.equal(Object.keys(host.ctx.auditState.metrics.byModel).some(k=>k.includes("gpt-5.5")),false);
+});
+
+test("AUDIT: account exhaustion skips subsequent models on the same account", async () => {
+  const fake=path.join(root,"account-claude.mjs");
+  fs.writeFileSync(fake,fs.readFileSync(path.join(here,"fakes","fake-claude.mjs"),"utf8").replace('errorCode: "credits_required"','rateLimitType: "five_hour"'));
+  configure({workerCommandArgs:[fake],workerChains:{...baseConfig.workerChains,medium:[{worker:"claude",model:"m1",effort:"high"},{worker:"claude",model:"m2",effort:"high"},{worker:"gemini",model:"g1"}]}},{m1:[{action:"credits"}],m2:[{action:"credits"}],g1:[{write:{"a.txt":"done"}}]});
+  const host=makeHost(makeRepo({"a.txt":"old"})); await host.on();
+  await host.call("delegate_implementation",{task:"change",profile:"medium",allowedPaths:["a.txt"],implementationGuide:guide(["a.txt"])});
+  assert.deepEqual(calls().map(c=>c.model),["m1","g1"]);
+});
+
+test("AUDIT: transient retries resume the partially completed session", async () => {
+  const fake=path.join(root,"transient-claude.mjs");
+  const original=fs.readFileSync(path.join(here,"fakes","fake-claude.mjs"),"utf8");
+  fs.writeFileSync(fake,original.replace('if (step.action === "credits") {',`if (step.action === "transient") { emit({type:"result",is_error:true,result:"503 service unavailable",session_id:sessionId,usage}); process.exit(1); }\nif (step.action === "credits") {`));
+  configure({workerCommandArgs:[fake]},{"claude-sonnet-5":[{action:"transient",write:{"a.txt":"partial"}},{write:{"a.txt":"done"}}]});
+  const host=makeHost(makeRepo({"a.txt":"old"})); await host.on();
+  await host.call("delegate_implementation",{task:"change",profile:"medium",allowedPaths:["a.txt"],implementationGuide:guide(["a.txt"])});
+  assert.equal(calls().length,2); assert.ok(calls()[1].resume); assert.match(calls()[1].prompt,/RETRY AFTER TRANSIENT/);
+});
+
+test("AUDIT: credit exhaustion in correction fails over and verifies the repair", async () => {
+  configure({}, {"claude-sonnet-5":[{write:{"value.txt":"bad"}},{action:"credits"}],"claude-opus-5-5":[{write:{"value.txt":"ok"}}]});
+  const host=makeHost(makeRepo({"value.txt":"ok","check.test.mjs":PASSING_CHECK})); await host.on();
+  const result=await host.call("delegate_implementation",{task:"change",profile:"medium",allowedPaths:["value.txt"],implementationGuide:guide(["value.txt"],["node --test check.test.mjs"])});
+  assert.equal(result.isError,false); assert.deepEqual(calls().map(c=>c.model),["claude-sonnet-5","claude-sonnet-5","claude-opus-5-5"]);
+  const learned=JSON.parse(fs.readFileSync(dataFile,"utf8")); assert.equal(learned.outcomes.at(-1).failed,false); assert.equal(learned.outcomes.at(-1).verification,"fixed");
+});
+
+test("AUDIT: API review receives deeply nested changed files", async () => {
+  configure({independentReviewProfiles:["critical"],reviewApi:baseConfig.reviewApi},{"claude-fable-5-1":[{write:{"src/a/b/c/deep.ts":"export const n=2;\n"}}]});
+  const host=makeHost(makeRepo({"src/a/b/c/deep.ts":"export const n=1;\n"})); await host.on();
+  await host.call("delegate_implementation",{task:"change",profile:"critical",allowedPaths:["src"],implementationGuide:guide(["src"])});
+  assert.equal(host.apiCalls.length,1);
+  const material=host.apiCalls[0].content.split("FILES (current content)\n")[1];
+  assert.match(material,/=== src\/a\/b\/c\/deep.ts ===/);
+});
+
+test("AUDIT: unrelated prompts cannot inherit a flagship grant", async () => {
+  configure({supervisorChain:[{provider:"openai-codex",model:"gpt-5.5"},{provider:"google",model:"gemini-3.8-flash"}],flagshipModels:["gpt-5.5"]}, {"claude-fable-5-1":[{write:{"a.txt":"done"}}]});
+  const host=makeHost(makeRepo({"a.txt":"old"})); host.setAnswer("SI"); await host.on();
+  await host.handlers.get("before_agent_start")({prompt:"critical task"},host.ctx);
+  await host.call("plan_task",{task:"critical task",profile:"critical",rationale:"test"});
+  await host.call("delegate_implementation",{task:"critical task",allowedPaths:["a.txt"],implementationGuide:guide(["a.txt"])});
+  await host.handlers.get("agent_settled")({outcome:"completed"},host.ctx);
+  await host.handlers.get("before_agent_start")({prompt:"An unrelated small question"},host.ctx);
+  assert.equal(host.ctx.model.id,"gemini-3.8-flash"); assert.equal(host.questions.length,1);
+  assert.equal(host.ctx.auditState.taskPacket.phase,"implemented");
+});
+

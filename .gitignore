@@ -1,3 +1,5 @@
 # Dati di apprendimento locali (esiti, lezioni per repository): non versionati
 data/
 node_modules/
+.npm-cache/
+.typecheck-*.json

@@ -4,14 +4,21 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORT_LEVELS)[number];
 
-export type VerificationResult = "passed" | "fixed" | "failed" | "unverified";
+export type VerificationResult = "passed" | "fixed" | "failed" | "unverified" | "unchanged_failures";
 export type ReviewVerdict = "pass" | "minor" | "major" | "none";
 
 export interface OutcomeRecord {
+	id?: string;
+	sequence?: number;
+	evidenceVersion?: 2;
+	taskKind?: string;
+	accepted?: boolean;
+	failureDomain?: "provider" | "quality";
 	at: number;
 	repo: string;
 	taskId: string;
@@ -44,10 +51,12 @@ export interface EffortAdjustment {
 	configured: Effort;
 	reason: string;
 	since: number;
+	cursor?: number;
 }
 
 export interface LearningState {
 	version: 1;
+	sequence?: number;
 	outcomes: OutcomeRecord[];
 	lessons: Lesson[];
 	/** Keyed by `${profile}|${model}`. */
@@ -66,7 +75,9 @@ export function loadLearning(file: string): LearningState {
 	try {
 		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<LearningState>;
 		if (parsed.version !== 1) return emptyLearning();
-		return { version: 1, outcomes: parsed.outcomes ?? [], lessons: parsed.lessons ?? [], effortAdjustments: parsed.effortAdjustments ?? {} };
+		if (!Array.isArray(parsed.outcomes) || !Array.isArray(parsed.lessons) || !parsed.effortAdjustments || typeof parsed.effortAdjustments !== "object") return emptyLearning();
+		const outcomes = parsed.outcomes.filter(item => item && typeof item.repo === "string" && typeof item.model === "string" && Number.isFinite(item.at)).slice(-MAX_OUTCOMES);
+		return { version: 1, sequence: Math.max(parsed.sequence ?? 0, ...outcomes.map(item => item.sequence ?? 0)), outcomes, lessons: parsed.lessons.filter(item => item && typeof item.text === "string" && typeof item.repo === "string"), effortAdjustments: parsed.effortAdjustments };
 	} catch {
 		return emptyLearning();
 	}
@@ -75,9 +86,30 @@ export function loadLearning(file: string): LearningState {
 /** Atomic write: a crash mid-write must never leave a truncated learning file. */
 export function saveLearning(file: string, state: LearningState): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	const temp = `${file}.${process.pid}.tmp`;
-	fs.writeFileSync(temp, JSON.stringify(state, null, 1));
-	fs.renameSync(temp, file);
+	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+	try { fs.writeFileSync(temp, JSON.stringify(state, null, 1)); fs.renameSync(temp, file); }
+	finally { fs.rmSync(temp, { force: true }); }
+}
+
+/** Serialize read-modify-write across Pi processes. A crashed owner is recoverable; live owners are not stolen. */
+export async function updateLearning(file: string, mutate: (state: LearningState) => void): Promise<LearningState> {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const lock = `${file}.lock`;
+	let handle: number | undefined;
+	for (let attempt = 0; attempt < 100; attempt++) {
+		try { handle = fs.openSync(lock, "wx"); fs.writeFileSync(handle, String(process.pid)); break; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				const owner = Number(fs.readFileSync(lock, "utf8"));
+				if (owner > 0) { try { process.kill(owner, 0); } catch (probe) { if ((probe as NodeJS.ErrnoException).code === "ESRCH") fs.rmSync(lock, { force: true }); } }
+			} catch { /* Another writer may have just released the lock. */ }
+			await new Promise(resolve => setTimeout(resolve, 25));
+		}
+	}
+	if (handle === undefined) throw new Error("Learning store is busy; update was not written.");
+	try { const state = loadLearning(file); mutate(state); saveLearning(file, state); return state; }
+	finally { fs.closeSync(handle); fs.rmSync(lock, { force: true }); }
 }
 
 /**
@@ -85,8 +117,9 @@ export function saveLearning(file: string, state: LearningState): void {
  * (no checks and no review): such outcomes must not move the calibration either way.
  */
 export function outcomeQuality(outcome: OutcomeRecord): number | undefined {
+	if (outcome.failureDomain === "provider") return undefined;
 	if (outcome.failed || outcome.verification === "failed" || outcome.review === "major") return 0;
-	if (outcome.verification === "unverified" && outcome.review === "none") return undefined;
+	if ((outcome.verification === "unverified" || outcome.verification === "unchanged_failures") && outcome.review === "none") return undefined;
 	let quality = 1;
 	if (outcome.verification === "fixed") quality = Math.min(quality, 0.5);
 	if (outcome.review === "minor") quality = Math.min(quality, 0.75);
@@ -94,7 +127,8 @@ export function outcomeQuality(outcome: OutcomeRecord): number | undefined {
 }
 
 export function recordOutcome(state: LearningState, outcome: OutcomeRecord): void {
-	state.outcomes.push(outcome);
+	state.sequence = (state.sequence ?? 0) + 1;
+	state.outcomes.push({ ...outcome, id: outcome.id ?? randomUUID(), sequence: state.sequence });
 	if (state.outcomes.length > MAX_OUTCOMES) state.outcomes.splice(0, state.outcomes.length - MAX_OUTCOMES);
 }
 
@@ -120,6 +154,12 @@ export interface TuningTarget {
 	profile: string;
 	model: string;
 	configured: Effort;
+	repo?: string;
+	kind?: string;
+}
+
+export function tuningKey(target: { profile: string; model: string; repo?: string; kind?: string }): string {
+	return target.repo ? JSON.stringify([target.repo, target.kind ?? "general", target.profile, target.model]) : `${target.profile}|${target.model}`;
 }
 
 /**
@@ -130,13 +170,22 @@ export interface TuningTarget {
 export function tuneEfforts(state: LearningState, targets: TuningTarget[], rules: TuningRules = DEFAULT_TUNING, now = Date.now()): string[] {
 	const changes: string[] = [];
 	for (const target of targets) {
-		const key = `${target.profile}|${target.model}`;
+		const key = tuningKey(target);
 		const existing = state.effortAdjustments[key];
 		// A config change resets learning for that key: the user's explicit choice is the new baseline.
-		if (existing && existing.configured !== target.configured) delete state.effortAdjustments[key];
+		if (existing && existing.configured !== target.configured) {
+			state.effortAdjustments[key] = { effort: target.configured, configured: target.configured, reason: "configuration changed; new evidence required", since: now, cursor: state.sequence ?? 0 };
+			continue;
+		}
 		const current = state.effortAdjustments[key]?.effort ?? target.configured;
-		const samples = state.outcomes
-			.filter((item) => item.profile === target.profile && item.model === target.model && (item.effort ?? target.configured) === current)
+		const adjustment = state.effortAdjustments[key];
+		const evidence = state.outcomes.filter(item => item.profile === target.profile && item.model === target.model && (item.effort ?? target.configured) === current
+			&& (!target.repo || (item.repo === target.repo && (item.taskKind ?? "general") === (target.kind ?? "general") && item.evidenceVersion === 2))
+			&& (!adjustment || (item.sequence !== undefined && adjustment.cursor !== undefined ? item.sequence > adjustment.cursor : item.at > adjustment.since))
+			&& now - item.at <= 90 * 86400_000);
+		// Multiple delegations of one task are correlated; one task supplies at most one sample.
+		const distinct = target.repo ? [...new Map(evidence.map(item => [item.taskId, item])).values()] : evidence;
+		const samples = distinct
 			.map((item) => ({ item, quality: outcomeQuality(item) }))
 			.filter((entry): entry is { item: OutcomeRecord; quality: number } => entry.quality !== undefined)
 			.slice(-rules.window);
@@ -144,27 +193,25 @@ export function tuneEfforts(state: LearningState, targets: TuningTarget[], rules
 			const mean = samples.reduce((sum, entry) => sum + entry.quality, 0) / samples.length;
 			if (mean < rules.raiseBelowQuality && current !== "max") {
 				const next = step(current, 1);
-				state.effortAdjustments[key] = { effort: next, configured: target.configured, reason: `mean quality ${mean.toFixed(2)} over ${samples.length} delegations at ${current}`, since: now };
+				state.effortAdjustments[key] = { effort: next, configured: target.configured, reason: `mean quality ${mean.toFixed(2)} over ${samples.length} tasks at ${current}`, since: now, cursor: state.sequence ?? 0 };
 				changes.push(`${target.profile}/${target.model}: effort ${current} → ${next} (quality ${mean.toFixed(2)} over ${samples.length})`);
 				continue;
 			}
 		}
-		const streak = state.outcomes
-			.filter((item) => item.profile === target.profile && item.model === target.model && (item.effort ?? target.configured) === current)
-			.slice(-rules.lowerMinSamples);
+		const streak = distinct.slice(-rules.lowerMinSamples);
 		const canLower = rules.lowerProfiles.includes(target.profile) && current !== "low" && EFFORT_LEVELS.indexOf(current) > EFFORT_LEVELS.indexOf(target.configured) - 1;
-		if (canLower && streak.length >= rules.lowerMinSamples && streak.every((item) => item.verification === "passed" && outcomeQuality(item) === 1)) {
+		if (canLower && streak.length >= rules.lowerMinSamples && streak.every((item) => item.verification === "passed" && outcomeQuality(item) === 1 && (!target.repo || item.accepted === true))) {
 			const next = step(current, -1);
-			state.effortAdjustments[key] = { effort: next, configured: target.configured, reason: `${streak.length} consecutive first-pass, test-verified successes at ${current}`, since: now };
+			state.effortAdjustments[key] = { effort: next, configured: target.configured, reason: `${streak.length} consecutive accepted first-pass successes at ${current}`, since: now, cursor: state.sequence ?? 0 };
 			changes.push(`${target.profile}/${target.model}: effort ${current} → ${next} (${streak.length} verified first-pass successes)`);
 		}
 	}
 	return changes;
 }
 
-export function effectiveEffort(state: LearningState, profile: string, model: string, configured: Effort | undefined): Effort | undefined {
+export function effectiveEffort(state: LearningState, profile: string, model: string, configured: Effort | undefined, repo?: string, kind?: string): Effort | undefined {
 	if (!configured) return configured;
-	const adjustment = state.effortAdjustments[`${profile}|${model}`];
+	const adjustment = state.effortAdjustments[tuningKey({ profile, model, repo, kind })];
 	return adjustment && adjustment.configured === configured ? adjustment.effort : configured;
 }
 
@@ -251,7 +298,7 @@ export function removeLesson(state: LearningState, id: string): boolean {
 
 /** Reviewers end with "VERDICT: PASS|MINOR|MAJOR"; anything else counts as no usable verdict. */
 export function parseVerdict(text: string): ReviewVerdict {
-	const match = /VERDICT\s*[:=]\s*\**\s*(PASS|MINOR|MAJOR)\b/i.exec(text);
+	const match = /^\s*\**VERDICT\s*[:=]\s*\**\s*(PASS|MINOR|MAJOR)\b[^\n]*$/i.exec(text.trim().split(/\r?\n/).at(-1) ?? "");
 	return match ? (match[1].toLowerCase() as ReviewVerdict) : "none";
 }
 
