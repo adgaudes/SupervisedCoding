@@ -1,6 +1,6 @@
 {
   "name": "pi-supervised-coding",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Supervised multi-model coding for the Pi coding agent: one model plans, delegates and accepts; Claude and GPT workers implement; checks, reviews, credit failover and learning are automatic.",
   "keywords": [
     "pi-package",
