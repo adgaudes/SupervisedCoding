@@ -374,6 +374,8 @@ export function extractVerifyCommands(guide: string, allowedPrefixes: string[], 
 	const result: string[] = [];
 	for (const candidate of candidates) {
 		let command = candidate.command.trim().replace(/\s+/g, " ");
+		// A sentence's full stop ("VERIFY: npm test.") is not part of the command; "npx tsc -p ." and "./..." keep theirs.
+		if (candidate.bare) command = command.replace(/(?<=[\w)\]'"])[.;,]$/, "");
 		if (!allowedPrefixes.some((item) => command === item || command.startsWith(`${item} `))) continue;
 		// Drop trailing prose after the command ("npm test — all green").
 		// ("--" is kept: npm uses it to forward arguments, e.g. "npm test -- --grep parser").

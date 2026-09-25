@@ -121,15 +121,16 @@ function trimBlank(lines: string[], end: number, start: number): number {
 }
 
 /** Text of one file's outline: `path (N lines)` and one indented line per declaration. */
-export function formatOutline(file: string, source: string, maxEntries = 400): string {
+export function formatOutline(file: string, source: string, maxEntries = 400, keep?: (entry: OutlineEntry, entries: OutlineEntry[]) => boolean): string {
 	const total = source.split(/\r?\n/).length - (/\n$/.test(source) ? 1 : 0);
-	const entries = outlineSource(file, source, maxEntries);
-	const header = `${file} (${total} lines)`;
+	const all = outlineSource(file, source, maxEntries);
+	const entries = keep ? all.filter((entry) => keep(entry, all)) : all;
+	const header = `${file} (${total} lines${keep ? `; ${entries.length} of ${all.length} declarations shown` : ""})`;
 	if (!outlineSupported(file)) return `${header}: no outline rules for this file type`;
 	if (!entries.length) return `${header}: no declarations found`;
 	const width = String(total).length;
 	const body = entries.map((entry) => `${"  ".repeat(entry.depth + 1)}${String(entry.line).padStart(width)}-${String(entry.end).padEnd(width)}  ${entry.text}`);
-	return [header, ...body, ...(entries.length >= maxEntries ? [`  … more than ${maxEntries} declarations; outline a narrower path`] : [])].join("\n");
+	return [header, ...body, ...(all.length >= maxEntries ? [`  … more than ${maxEntries} declarations; outline a narrower path`] : [])].join("\n");
 }
 
 export interface ReferenceMatch {
@@ -150,6 +151,13 @@ export function entryName(text: string): string {
 	if (keyword) return keyword[1];
 	const call = /([\w$]+)\s*(?:<[^>]*>)?\(/.exec(text);
 	return call ? call[1] : text.slice(0, 40);
+}
+
+/** Name of the declaration on one source line, by the file's language rules; undefined for anything else (and tests). */
+export function declarationName(file: string, line: string): string | undefined {
+	const rule = RULES[extensionOf(file)];
+	if (!rule || rule.closing === "heading" || TEST_CALL.test(line) || !rule.patterns.some((pattern) => pattern.test(line))) return undefined;
+	return entryName(line.trim().replace(/\s*\{\s*$/, ""));
 }
 
 /**

@@ -133,6 +133,8 @@ test("verification commands from the guide", () => {
 	assert.deepEqual(extractVerifyCommands(guide, PREFIXES, UNSAFE), ["npx tsc --noEmit", "npm test -- --grep parser"]);
 	assert.deepEqual(extractVerifyCommands("FILE: a\nVERIFY:\n- inspect manually", PREFIXES, UNSAFE), []);
 	assert.deepEqual(extractVerifyCommands("VERIFY: pytest -q\nNOTES: npm test", PREFIXES, UNSAFE), ["pytest -q"], "stops at the next section");
+	assert.deepEqual(extractVerifyCommands("VERIFY: npm test.", PREFIXES, UNSAFE), ["npm test"], "a sentence's full stop is not part of the command");
+	assert.deepEqual(extractVerifyCommands("VERIFY:\n- npx tsc -p .\n- go test ./...", [...PREFIXES, "go test"], UNSAFE), ["npx tsc -p .", "go test ./..."], "meaningful dots stay");
 });
 
 test("verification commands: labels inside VERIFY, prose after bare commands", () => {

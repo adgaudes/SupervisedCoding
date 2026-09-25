@@ -278,6 +278,7 @@
     "plan_task",
     "complete_task",
     "consult_readonly",
+    "review_changes",
     "delegate_implementation",
     "run_verification",
     "code_outline",
@@ -294,6 +295,18 @@
     "workerReportBytes": 8000,
     "outlineBytes": 24000
   },
+  "contextPruning": {
+    "enabled": true,
+    "minResultBytes": 1500,
+    "minTotalBytes": 20000
+  },
+  "reviewConcurrency": 3,
+  "reviewMaxShards": 8,
+  "auditShardBytes": 300000,
+  "auditMaxShards": 6,
+  "reviewWholeFilesBytes": 100000,
+  "reviewContextBytes": 24000,
+  "workerCodeMapBytes": 10000,
   "supervisorProfiles": {},
   "probeTtlMinutes": 15,
   "probeMaxTokens": 128,

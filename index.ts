@@ -50,7 +50,9 @@ import {
 } from "./learning.ts";
 import { assessTask, routeWithEvidence, taskEffort, TASK_KINDS, type TaskAssessment } from "./routing.ts";
 import { checkpoint, changesSince, type Checkpoint } from "./changes.ts";
-import { formatOutline, formatReferences, outlineSupported, type ReferenceMatch } from "./outline.ts";
+import { entryName, formatOutline, formatReferences, outlineSource, outlineSupported, type ReferenceMatch } from "./outline.ts";
+import { compressPaths, enclosingRanges, FINDINGS_FORMAT, formatFinding, hunkRanges, mapLimit, mergeFindings, packShards, parseFindings, parseVerification, renderRanges, splitDiff, touchedDeclarations, type Finding } from "./review.ts";
+import { planContextEdits } from "./pruning.ts";
 
 const execFile = promisify(execFileCallback);
 const extensionDir = path.dirname(fileURLToPath(import.meta.url));
@@ -83,7 +85,7 @@ const STATE_TYPE = "supervised-coding";
 const POLICY_TYPE = "supervised-coding-policy";
 /** Entry types written by the extension before it was renamed; still read so existing sessions keep their state. */
 const LEGACY_STATE_TYPES = ["codex-claude-supervisor"];
-const CUSTOM_TOOLS = new Set(["plan_task", "complete_task", "consult_readonly", "delegate_implementation", "run_verification", "code_outline", "record_lesson", "supervisor_git", "request_git_commit", "request_git_push"]);
+const CUSTOM_TOOLS = new Set(["plan_task", "complete_task", "consult_readonly", "review_changes", "delegate_implementation", "run_verification", "code_outline", "record_lesson", "supervisor_git", "request_git_commit", "request_git_push"]);
 const PROFILE_NAMES = ["small", "medium", "large", "critical"] as const;
 const WORKER_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const MAX_STORED_REPORT_CHARS = 8000;
@@ -200,6 +202,28 @@ interface Config {
 	/** Per-tool caps below maxOutputBytes: every byte returned to the supervisor is resent on each later turn. */
 	outputLimits: OutputLimits;
 	minImplementationGuideChars: Record<ExecutionProfileName, number>;
+	/**
+	 * Supervisor context pruning at the end of each run: reads made outdated by a later delegation and bulky results
+	 * of accepted tasks become one-line notes, when that saves at least minTotalBytes (each batch costs one prompt
+	 * cache miss).
+	 */
+	contextPruning: { enabled: boolean; minResultBytes: number; minTotalBytes: number };
+	/** Reviewers of one review_changes or audit working at the same time. */
+	reviewConcurrency: number;
+	/** review_changes splits a diff larger than maxDiffBytes into at most this many shards. */
+	reviewMaxShards: number;
+	/** An audit of more source than this is split among several consultants, at most auditMaxShards. */
+	auditShardBytes: number;
+	auditMaxShards: number;
+	/**
+	 * The API reviewer gets whole changed files up to this size; above it, and up to 250 KB, it gets the code around
+	 * each change, outlines of large files and the uses of changed declarations instead.
+	 */
+	reviewWholeFilesBytes: number;
+	/** Code around the changes and uses of changed declarations given to every reviewer. */
+	reviewContextBytes: number;
+	/** Outline and uses of the guide's symbols given to fresh workers for large files (0 disables it). */
+	workerCodeMapBytes: number;
 }
 
 interface OutputLimits {
@@ -236,6 +260,9 @@ interface SupervisorMetrics {
 	verifications: number;
 	/** Checks answered from an earlier run on the same repository state instead of running again. */
 	reusedChecks: number;
+	/** Bytes of supervisor context replaced by short notes (context pruning), and how many results. */
+	contextPrunedBytes: number;
+	contextPrunedResults: number;
 	correctionRounds: number;
 	autoVerifiedDelegations: number;
 	apiReviews: number;
@@ -392,6 +419,8 @@ const EMPTY_METRICS: SupervisorMetrics = {
 	flagshipApprovals: 0,
 	verifications: 0,
 	reusedChecks: 0,
+	contextPrunedBytes: 0,
+	contextPrunedResults: 0,
 	correctionRounds: 0,
 	autoVerifiedDelegations: 0,
 	apiReviews: 0,
@@ -474,10 +503,17 @@ function loadConfig(): Config {
 		const value = raw[field];
 		if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error(`${field} must be a finite non-negative number.`);
 	}
-	for (const field of ["maxDiffBytes", "maxOutputBytes", "maxProcessOutputBytes", "probeMaxTokens", "reviewMaxTokens"] as const) {
+	for (const field of ["maxDiffBytes", "maxOutputBytes", "maxProcessOutputBytes", "probeMaxTokens", "reviewMaxTokens", "auditShardBytes", "reviewWholeFilesBytes", "reviewContextBytes"] as const) {
 		const value = raw[field];
 		if (value !== undefined && (!Number.isInteger(value) || value < 128)) throw new Error(`${field} must be an integer >= 128.`);
 	}
+	for (const field of ["reviewConcurrency", "reviewMaxShards", "auditMaxShards"] as const) {
+		const value = raw[field];
+		if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 20)) throw new Error(`${field} must be an integer between 1 and 20.`);
+	}
+	if (raw.workerCodeMapBytes !== undefined && (!Number.isInteger(raw.workerCodeMapBytes) || raw.workerCodeMapBytes < 0)) throw new Error("workerCodeMapBytes must be a non-negative integer (0 disables the code map).");
+	const contextPruning = { enabled: true, minResultBytes: 1500, minTotalBytes: 20_000, ...raw.contextPruning };
+	if (!Number.isInteger(contextPruning.minResultBytes) || contextPruning.minResultBytes < 256 || !Number.isInteger(contextPruning.minTotalBytes) || contextPruning.minTotalBytes < 0) throw new Error("contextPruning.minResultBytes must be an integer >= 256 and contextPruning.minTotalBytes a non-negative integer.");
 	const outputLimits: OutputLimits = { ...OUTPUT_LIMIT_DEFAULTS, ...raw.outputLimits };
 	for (const [field, value] of Object.entries(outputLimits)) {
 		if (!Number.isInteger(value) || value < 128) throw new Error(`outputLimits.${field} must be an integer >= 128.`);
@@ -569,6 +605,14 @@ function loadConfig(): Config {
 		maxOutputBytes: raw.maxOutputBytes ?? 51200,
 		outputLimits,
 		minImplementationGuideChars,
+		contextPruning,
+		reviewConcurrency: raw.reviewConcurrency ?? 3,
+		reviewMaxShards: raw.reviewMaxShards ?? 8,
+		auditShardBytes: raw.auditShardBytes ?? 300_000,
+		auditMaxShards: raw.auditMaxShards ?? 6,
+		reviewWholeFilesBytes: raw.reviewWholeFilesBytes ?? 100_000,
+		reviewContextBytes: raw.reviewContextBytes ?? 24_000,
+		workerCodeMapBytes: raw.workerCodeMapBytes ?? 10_000,
 	};
 }
 
@@ -779,7 +823,7 @@ function buildRepoContext(rules: string, lessons: string[]): string {
 	return parts.join("\n\n");
 }
 
-function buildWorkerPrompt(task: string, implementationGuide: string, acceptanceCriteria: string[], allowedPaths: string[], isContinuation: boolean, repoContext = ""): string {
+function buildWorkerPrompt(task: string, implementationGuide: string, acceptanceCriteria: string[], allowedPaths: string[], isContinuation: boolean, repoContext = "", codeMap = ""): string {
 	return `[CODING WORKER — ${isContinuation ? "TARGETED CORRECTION" : "EXECUTE, DO NOT REPLAN"}]
 ${!isContinuation && repoContext ? `${repoContext}\n\n` : ""}Implement only the task and file guide below. ${isContinuation ? "Reuse the existing session context; inspect only what changed or what the correction explicitly references." : "Check Git status first; preserve existing changes."} Never weaken, skip or delete tests to make checks pass. Start from the named symbols and use narrow/ranged reads where possible, expanding only when dependencies or uncertainty require it. Edit surgically and avoid broad exploration or unrelated refactors. Never stage, commit, push, merge, switch branches, rewrite history, or invoke agents. Do not modify paths outside the allowlist. If instructions conflict with the code or admit multiple material approaches, stop and report the ambiguity. Run pertinent checks. On success return only changed files, concise change summary, tests and residual risks; on failure include the diagnostics needed to resolve it.
 
@@ -788,7 +832,10 @@ ${task}
 
 FILE GUIDE (primary source of truth)
 ${implementationGuide}
-
+${!isContinuation && codeMap ? `
+CODE MAP (generated from the current files; line ranges are approximate: read only the ranges you need)
+${codeMap}
+` : ""}
 ACCEPTANCE
 ${acceptanceCriteria.length ? acceptanceCriteria.map((item) => `- ${item}`).join("\n") : "- Task and repository requirements are satisfied."}
 
@@ -865,6 +912,13 @@ async function scopedDiff(cwd: string, paths: string[], maxBytes: number): Promi
 	const scope = paths.length ? paths : ["."];
 	const hasHead = Boolean((await gitStdout(cwd, ["rev-parse", "--verify", "--quiet", "HEAD"]))?.trim());
 	const tracked = (await gitStdout(cwd, ["-c", "core.quotepath=off", "diff", "--no-ext-diff", "--no-color", "--unified=5", ...(hasHead ? ["HEAD"] : []), "--", ...scope])) ?? "";
+	const diff = [tracked.trim(), ...(await untrackedDiffs(cwd, scope))].filter(Boolean).join("\n");
+	if (!diff) return "(no changes in the allowed paths)";
+	return Buffer.byteLength(diff, "utf8") > maxBytes ? `${truncateUtf8(diff, maxBytes)}\n[Diff truncated at ${maxBytes} bytes: read the listed files for the rest.]` : diff;
+}
+
+/** Untracked files as diffs of new files (git diff omits them). */
+async function untrackedDiffs(cwd: string, scope: string[]): Promise<string[]> {
 	const untracked = nulSeparated(await gitStdout(cwd, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope]));
 	const added: string[] = [];
 	for (const file of untracked) {
@@ -875,9 +929,58 @@ async function scopedDiff(cwd: string, paths: string[], maxBytes: number): Promi
 			added.push(`new file (untracked, unreadable): ${file}`);
 		}
 	}
-	const diff = [tracked.trim(), ...added].filter(Boolean).join("\n");
-	if (!diff) return "(no changes in the allowed paths)";
-	return Buffer.byteLength(diff, "utf8") > maxBytes ? `${truncateUtf8(diff, maxBytes)}\n[Diff truncated at ${maxBytes} bytes: read the listed files for the rest.]` : diff;
+	return added;
+}
+
+/** Refs review_changes may compare against (no options, no revision ranges). */
+const SAFE_REF = /^(?!-)[\w./@{}^~-]+$/;
+
+/**
+ * The base a branch is reviewed against: the requested ref, else the current branch's upstream, origin/HEAD, main
+ * or master; compared from its merge base with HEAD, so only the branch's own changes are reviewed.
+ */
+async function resolveReviewBase(cwd: string, requested: string | undefined): Promise<{ ref: string; mergeBase: string }> {
+	const candidates = requested ? [requested.trim()] : ["@{upstream}", "origin/HEAD", "origin/main", "origin/master", "main", "master"];
+	for (const ref of candidates) {
+		if (!SAFE_REF.test(ref) || ref.includes("..")) {
+			if (requested) throw new Error(`Not a plain Git ref: ${ref}`);
+			continue;
+		}
+		const commit = (await gitStdout(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]))?.trim();
+		const mergeBase = commit ? (await gitStdout(cwd, ["merge-base", commit, "HEAD"]))?.trim() : undefined;
+		if (mergeBase) return { ref, mergeBase };
+		if (requested) throw new Error(`Unknown Git ref, or no common history with HEAD: ${ref}`);
+	}
+	throw new Error("No base to compare with (no upstream, origin/HEAD, main or master): pass base, e.g. origin/main.");
+}
+
+/** Changes since a merge base: committed ones, plus uncommitted and untracked ones unless only commits are wanted. */
+async function branchDiff(cwd: string, mergeBase: string, paths: string[], uncommitted: boolean): Promise<string> {
+	const scope = paths.length ? paths : ["."];
+	// --relative: paths from the working directory, like every other path the tools take and return.
+	const tracked = await gitStdout(cwd, ["-c", "core.quotepath=off", "diff", "--relative", "--no-ext-diff", "--no-color", "--unified=5", mergeBase, ...(uncommitted ? [] : ["HEAD"]), "--", ...scope]);
+	if (tracked === undefined) throw new Error("git diff failed.");
+	return [tracked.trim(), ...(uncommitted ? await untrackedDiffs(cwd, scope) : [])].filter(Boolean).join("\n");
+}
+
+/** Text files under the paths, with sizes, in path order (what an audit covers). */
+async function sourceInventory(cwd: string, paths: string[]): Promise<Array<{ file: string; bytes: number }>> {
+	const listed = await gitStdout(cwd, ["--literal-pathspecs", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ...paths]);
+	const files = listed !== undefined ? nulSeparated(listed) : paths.flatMap((item) => {
+		try { return fs.statSync(path.join(cwd, item)).isDirectory() ? walkFiles(cwd, item) : [item]; } catch { return []; }
+	});
+	const inventory: Array<{ file: string; bytes: number }> = [];
+	for (const file of [...new Set(files)].sort()) {
+		if (file.split("/").some((part) => SKIPPED_DIRS.has(part))) continue;
+		try {
+			const stat = fs.statSync(path.join(cwd, file));
+			// Larger files are generated or data: no consultant reads them whole.
+			if (stat.isFile() && stat.size > 0 && stat.size <= 1_000_000) inventory.push({ file, bytes: stat.size });
+		} catch {
+			// Deleted in the working tree.
+		}
+	}
+	return inventory;
 }
 
 function numberField(value: unknown): number {
@@ -931,21 +1034,26 @@ const GUIDE_DEFAULTS: Record<string, string> = {
  * supervisor turn and the worker prompt already enforces preservation.
  */
 function validateImplementationGuide(guide: string, allowedPaths: string[], minChars: number): { guide: string; defaulted: string[] } {
-	const trimmed = guide.trim();
+	// Guides written as one paragraph ("FILE: a.ts. SYMBOLS: … VERIFY: npm test.") get one section per line, so
+	// sections and VERIFY commands are found wherever the supervisor put them.
+	const trimmed = guide.trim().replace(/([.;])[ \t]+(?=(?:FILES?|SYMBOLS?|CHANGES?|CHANGE\/CHANGES|PRESERVE|VERIFY|ACCEPTANCE)\s*:)/g, "$1\n");
 	if (trimmed.length < minChars) {
 		throw new Error(`Delegation blocked: implementationGuide is too short (${trimmed.length}/${minChars} chars).`);
 	}
-	const has = (section: string) => new RegExp(`(^|\\n)\\s*${section}S?\\s*:`, "i").test(trimmed);
-	const missing = ["FILE", "CHANGE", "VERIFY"].filter((section) => !has(section));
+	const has = (section: string) => new RegExp(`(^|\\n)\\s*${section}S?(?:\\/\\w+)?\\s*:`, "i").test(trimmed);
+	// "FILE: path: what changes there" carries the changes per file: a CHANGES header would only repeat it.
+	const describedFiles = /(^|\n)\s*FILES?\s*:\s*\S+?\s*(?::|—|–|-)\s+\S.{19,}/i.test(trimmed);
+	const missing = ["FILE", "CHANGE", "VERIFY"].filter((section) => !has(section) && !(section === "CHANGE" && describedFiles));
 	if (missing.length) {
 		throw new Error(`Delegation blocked: implementationGuide is missing required sections: ${missing.join(", ")}. Use FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:.`);
 	}
+	// Authorized paths the guide does not name are listed for the worker instead of costing a supervisor turn.
 	const absentPaths = allowedPaths.filter((file) => !trimmed.includes(file));
-	if (absentPaths.length) {
-		throw new Error(`Delegation blocked: every allowed path must appear in the file guide. Missing: ${absentPaths.join(", ")}`);
-	}
 	const defaulted = Object.keys(GUIDE_DEFAULTS).filter((section) => !has(section));
-	return { guide: [trimmed, ...defaulted.map((section) => GUIDE_DEFAULTS[section])].join("\n"), defaulted };
+	return {
+		guide: [trimmed, ...defaulted.map((section) => GUIDE_DEFAULTS[section]), ...(absentPaths.length ? [`ALSO AUTHORIZED (edit only if the change requires it): ${absentPaths.join(", ")}`] : [])].join("\n"),
+		defaulted,
+	};
 }
 
 interface ProcessOutcome {
@@ -1348,6 +1456,150 @@ function collectFiles(cwd: string, paths: string[], maxBytes: number): string | 
 	return parts.join("\n\n");
 }
 
+/** What a review gets besides the diff: see reviewMaterial. */
+interface ReviewMaterial {
+	/** Added to every reviewer's prompt. */
+	context: string;
+	/** Added instead for an API reviewer that gets whole files (the code around the changes would repeat them). */
+	apiContext: string;
+	/** Inline files for the API reviewer; undefined when they do not fit (the API reviewer is skipped). */
+	apiFiles?: string;
+	apiWhole: boolean;
+}
+
+/**
+ * The delegation diff shown in its result. The supervisor reviews the diff anyway: showing it there saves the turn
+ * that would fetch it with supervisor_git, and context pruning shortens it once the task is accepted.
+ */
+const RESULT_DIFF_BYTES = 24_000;
+
+/** Repository rules given to reviewers and consultants: the part that bears on judging code, not all of it. */
+const REVIEW_RULES_BYTES = 8000;
+
+/** Files shorter than this are read whole by a worker anyway: they get no map. */
+const CODE_MAP_MIN_LINES = 500;
+
+/**
+ * A map for a fresh worker of the large authorized files: their outline with line ranges (only the declarations
+ * the guide names, and those enclosing them, when the whole outline is long), then where the named declarations are
+ * used, so the worker reads ranges instead of whole files and sees the callers it must keep working.
+ */
+async function workerCodeMap(cwd: string, allowedPaths: string[], guide: string, maxBytes: number): Promise<string> {
+	const named = (name: string) => /^[\w$]{3,}$/.test(name) && new RegExp(`(^|[^\\w$])${name.replace(/\$/g, "\\$")}([^\\w$]|$)`).test(guide);
+	const outlines: string[] = [];
+	const symbols = new Set<string>();
+	let used = 0;
+	for (const file of allowedPaths) {
+		if (!outlineSupported(file)) continue;
+		let source: string;
+		try {
+			const absolute = path.join(cwd, file);
+			const stat = fs.statSync(absolute);
+			if (!stat.isFile() || stat.size > 2_000_000) continue;
+			source = fs.readFileSync(absolute, "utf8");
+		} catch {
+			continue; // Not created yet.
+		}
+		if (source.split(/\r?\n/).length < CODE_MAP_MIN_LINES) continue;
+		const entries = outlineSource(file, source);
+		const wanted = entries.filter((entry) => named(entryName(entry.text)));
+		wanted.forEach((entry) => symbols.add(entryName(entry.text)));
+		let text = formatOutline(file, source);
+		if (Buffer.byteLength(text, "utf8") > maxBytes / 2) {
+			// Too long whole: the named declarations and what encloses them, else the top level.
+			text = wanted.length
+				? formatOutline(file, source, 400, (entry) => wanted.some((item) => entry === item || (entry.line <= item.line && item.end <= entry.end)))
+				: formatOutline(file, source, 400, (entry) => entry.depth === 0);
+		}
+		const size = Buffer.byteLength(text, "utf8") + 2;
+		if (used + size > (maxBytes * 2) / 3) continue;
+		outlines.push(text);
+		used += size;
+	}
+	if (!outlines.length) return "";
+	let uses = "";
+	if (symbols.size) {
+		try {
+			uses = truncateUtf8(await findReferences(cwd, [...symbols].slice(0, 5), ["."], { usesOnly: true }), Math.max(1000, maxBytes - used));
+		} catch {
+			// Outside Git: no reference search.
+		}
+	}
+	return [outlines.join("\n\n"), uses ? `Uses of the declarations named in the guide (matched by name):\n${uses}` : ""].filter(Boolean).join("\n\n");
+}
+
+/** An audit may ask for defects or for an explanation: findings lines only fit the first. */
+const AUDIT_FORMAT = `When the question asks for defects, risks or a review, answer with findings.\n${FINDINGS_FORMAT}\nWhen it asks for an explanation or a map of the code instead, answer it concisely with file:line references and no findings lines.`;
+
+/** Files at most this long are given whole to an API reviewer on focused material; longer ones as outlines. */
+const FOCUSED_WHOLE_FILE_LINES = 400;
+
+/**
+ * Review material for a diff: the declarations around each change and the uses of the declarations it touches
+ * (reviewers then need fewer reads, and callers a change breaks are in plain sight), plus inline files for the API
+ * reviewer: whole when they fit reviewWholeFilesBytes; up to 250 KB, small files whole and outlines of large ones,
+ * with the code around the changes; beyond that none, so a reviewer that can browse is used.
+ */
+async function reviewMaterial(cwd: string, diff: string, files: string[], config: Config): Promise<ReviewMaterial> {
+	const sources = new Map<string, string | undefined>();
+	const read = (file: string): string | undefined => {
+		if (!sources.has(file)) {
+			try {
+				const buffer = fs.readFileSync(path.join(cwd, file));
+				sources.set(file, buffer.includes(0) ? undefined : buffer.toString("utf8"));
+			} catch {
+				sources.set(file, undefined);
+			}
+		}
+		return sources.get(file);
+	};
+	const fileDiffs = splitDiff(diff);
+	const aroundBudget = Math.floor((config.reviewContextBytes * 2) / 3);
+	const blocks: string[] = [];
+	let used = 0;
+	let omitted = 0;
+	for (const fileDiff of fileDiffs) {
+		const source = read(fileDiff.file);
+		if (source === undefined) continue;
+		const ranges = enclosingRanges(fileDiff.file, source, hunkRanges(fileDiff.text));
+		if (!ranges.length) continue;
+		const block = renderRanges(fileDiff.file, source, ranges);
+		const size = Buffer.byteLength(block, "utf8") + 2;
+		if (used + size > aroundBudget) { omitted++; continue; }
+		blocks.push(block);
+		used += size;
+	}
+	const signatures: string[] = [];
+	const bodies: string[] = [];
+	for (const fileDiff of fileDiffs) {
+		const touched = touchedDeclarations(fileDiff, read(fileDiff.file));
+		signatures.push(...touched.signatures);
+		bodies.push(...touched.bodies);
+	}
+	const names = [...new Set([...signatures, ...bodies])].slice(0, 8);
+	let uses = "";
+	if (names.length) {
+		try {
+			uses = truncateUtf8(await findReferences(cwd, names, ["."], { usesOnly: true }), Math.max(2000, config.reviewContextBytes - used));
+		} catch {
+			// Outside Git: no reference search.
+		}
+	}
+	const around = blocks.length ? `CODE AROUND THE CHANGES (current content, numbered)${omitted ? ` — ${omitted} more file(s) omitted for size: read them if needed` : ""}\n${blocks.join("\n\n")}` : "";
+	const usesBlock = uses ? `USES OF THE DECLARATIONS THE CHANGE TOUCHES (matched by name, like grep; check callers the change could break)\n${uses}` : "";
+	let apiFiles = collectFiles(cwd, files, config.reviewWholeFilesBytes);
+	const apiWhole = apiFiles !== undefined;
+	if (!apiWhole && collectFiles(cwd, files, 250_000) !== undefined) {
+		apiFiles = files.map((file) => {
+			const source = read(file);
+			if (source === undefined) return "";
+			const lines = source.split(/\r?\n/).length;
+			return lines <= FOCUSED_WHOLE_FILE_LINES ? `=== ${file} ===\n${source}` : `=== ${file} (outline only: ${lines} lines; the code around the changes is above) ===\n${formatOutline(file, source)}`;
+		}).filter(Boolean).join("\n\n");
+	}
+	return { context: [around, usesBlock].filter(Boolean).join("\n\n"), apiContext: usesBlock, apiFiles, apiWhole };
+}
+
 const OUTLINE_MAX_FILES = 200;
 
 /**
@@ -1382,7 +1634,7 @@ async function outlineFiles(cwd: string, paths: string[]): Promise<{ list: strin
 }
 
 /** Uses of each symbol, by whole-word name, in the files Git tracks or would track under the given paths. */
-async function findReferences(cwd: string, symbols: string[], paths: string[]): Promise<string> {
+async function findReferences(cwd: string, symbols: string[], paths: string[], options: { usesOnly?: boolean } = {}): Promise<string> {
 	if (!(await gitStdout(cwd, ["rev-parse", "--show-toplevel"]))) throw new Error("References need a Git repository.");
 	const parts: string[] = [];
 	for (const raw of symbols) {
@@ -1392,16 +1644,29 @@ async function findReferences(cwd: string, symbols: string[], paths: string[]): 
 		const name = symbol.split(".").at(-1)!;
 		// Exit code 1 (no match) reads as no output.
 		const output = await gitStdout(cwd, ["-c", "core.quotepath=off", "--literal-pathspecs", "grep", "--untracked", "-I", "-n", "-z", "-w", "-F", "--no-color", "-e", name, "--", ...paths]);
-		const matches: ReferenceMatch[] = [];
+		let matches: ReferenceMatch[] = [];
 		for (const line of (output ?? "").split("\n").filter(Boolean)) {
 			const [file, number, ...text] = line.split("\0");
 			if (file && number) matches.push({ file: normalizeSupervisorPath(file), line: Number(number), text: text.join("\0") });
 		}
 		const sources: Record<string, string | undefined> = {};
-		for (const file of new Set(matches.slice(0, 60).map((match) => match.file))) {
-			if (!outlineSupported(file)) continue;
-			try { sources[file] = fs.readFileSync(path.join(cwd, file), "utf8"); } catch { /* Deleted meanwhile. */ }
+		const load = (file: string) => {
+			if (!(file in sources) && outlineSupported(file)) {
+				try { sources[file] = fs.readFileSync(path.join(cwd, file), "utf8"); } catch { sources[file] = undefined; /* Deleted meanwhile. */ }
+			}
+		};
+		if (options.usesOnly) {
+			// Uses only: drop the declaration and every line inside it (its own body is shown elsewhere).
+			const inside = new Map<string, Array<[number, number]>>();
+			matches = matches.filter((match) => {
+				load(match.file);
+				const source = sources[match.file];
+				if (source === undefined) return true;
+				if (!inside.has(match.file)) inside.set(match.file, outlineSource(match.file, source).filter((entry) => entryName(entry.text) === name).map((entry): [number, number] => [entry.line, entry.end]));
+				return !inside.get(match.file)!.some(([start, end]) => start <= match.line && match.line <= end);
+			});
 		}
+		for (const file of new Set(matches.slice(0, 60).map((match) => match.file))) load(file);
 		parts.push(formatReferences(symbol, matches, sources));
 	}
 	return parts.join("\n\n");
@@ -1505,6 +1770,8 @@ interface ImplementationSpec {
 	resumePrompt?: string;
 	/** Repository rules and lessons for fresh workers. */
 	repoContext?: string;
+	/** Outline and uses of the guide's symbols in large authorized files, for fresh workers. */
+	codeMap?: string;
 }
 
 interface ImplementationOutcome {
@@ -1578,6 +1845,16 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	let delegationRunning = false;
 	let activeBudget: { spent: number; deadline: number } | undefined;
 	let unknownUsageRuns = 0;
+	/**
+	 * Files whose whole diff against HEAD a delegation result showed, with their content at that point. Cleared when
+	 * those results may leave the supervisor's context (task accepted, context pruned, compaction).
+	 */
+	const shownDiffs = new Map<string, string>();
+	/**
+	 * The last review_changes of each branch (working directory, merge base, scope) in this session: the reviewed
+	 * content, the findings and how many reviews it had. In memory only; a Map keeps insertion order.
+	 */
+	const branchReviews = new Map<string, { checkpoint: Checkpoint; files: string[]; findings: string[]; count: number }>();
 	const lastLimitHeaders: Record<string, Record<string, string>> = {};
 	// Learning is global (across sessions and projects), stored next to the extension, never in the session log.
 	let learning: LearningState = loadLearning(learningPath);
@@ -1715,7 +1992,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			try {
 				if (fs.statSync(usageLog).size > USAGE_LOG_MAX_BYTES) fs.renameSync(usageLog, `${usageLog}.1`);
 			} catch { /* No log yet. */ }
-			fs.appendFileSync(usageLog, JSON.stringify({ at: Date.now(), taskId: taskPacket?.id, role, worker: result.worker, provider: result.provider, model: result.model, billing: result.billing ?? "unknown", usage: result.usage, costUsd: result.costUsd, measured: Boolean(result.usage), failed: runFailed(result), timedOut: result.timedOut }) + "\n");
+			fs.appendFileSync(usageLog, JSON.stringify({ at: Date.now(), taskId: openTask()?.id, role, worker: result.worker, provider: result.provider, model: result.model, billing: result.billing ?? "unknown", usage: result.usage, costUsd: result.costUsd, measured: Boolean(result.usage), failed: runFailed(result), timedOut: result.timedOut }) + "\n");
 		} catch { /* Telemetry must never stop implementation. */ }
 		recordModelRun(result, role);
 	}
@@ -2030,7 +2307,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		const verdicts = Object.entries(metrics.reviewVerdicts).map(([verdict, count]) => `${verdict.toUpperCase()} ${count}`).join(", ");
 		const completed = metrics.delegations - metrics.failedDelegations;
 		lines.push(`Quality: ${metrics.delegations} delegations (${completed} completed, ${metrics.failedDelegations} failed) · ${metrics.autoVerifiedDelegations} auto-verified, ${metrics.firstPassDelegations} green at the first attempt, ${metrics.correctionRounds} correction rounds · reviews: ${verdicts || "none"}`);
-		lines.push(`Routing: failovers workers ${metrics.providerFailovers}, supervisor ${metrics.supervisorFailovers} · flagship asked ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved) · consultations ${metrics.readOnlyConsultations} · resumed sessions ${metrics.resumedDelegations} · checks run ${metrics.verifications}, reused ${metrics.reusedChecks}`);
+		lines.push(`Routing: failovers workers ${metrics.providerFailovers}, supervisor ${metrics.supervisorFailovers} · flagship asked ${metrics.flagshipRequests} (${metrics.flagshipApprovals} approved) · consultations ${metrics.readOnlyConsultations} · resumed sessions ${metrics.resumedDelegations} · checks run ${metrics.verifications}, reused ${metrics.reusedChecks} · context pruned ${metrics.contextPrunedResults} result(s), ${Math.round(metrics.contextPrunedBytes / 1024)} KB`);
 		if (completed > 0) lines.push(`Average per completed delegation: ${fmt(Math.round(grand / completed))} tokens · ${money((supervisorCost + workerCost) / completed)}`);
 		lines.push("Per-model costs are API-equivalent; for subscriptions the real cost is the plan usage above. ~ = estimated from Pi's price list.");
 		return lines;
@@ -2115,7 +2392,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				continue;
 			}
 			let resumeId = resumeAvailable && candidate.worker === (spec.resumeWorker ?? "claude") && (!spec.resumeModel || spec.resumeModel === candidate.model) ? spec.resumeSessionId : undefined;
-			let basePrompt = buildWorkerPrompt(spec.task, spec.guide, spec.criteria, spec.allowedPaths, Boolean(resumeId), spec.repoContext);
+			let basePrompt = buildWorkerPrompt(spec.task, spec.guide, spec.criteria, spec.allowedPaths, Boolean(resumeId), spec.repoContext, spec.codeMap);
 			if (resumeId && spec.resumePrompt) {
 				basePrompt = spec.resumePrompt;
 				handoff = "";
@@ -2199,7 +2476,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	}
 
 	/** Read-only consultation with failover across reviewers; any working-tree mutation is reported as a violation. */
-	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; diffComplete?: boolean; diffLabel?: string; requireVerdict?: boolean; role?: UsageRole; maxTurns?: number } = {}): Promise<ConsultOutcome> {
+	async function runConsultation(ctx: ExtensionContext, order: WorkerCandidate[], header: string, question: string, paths: string[], signal: AbortSignal | undefined, options: { diff?: string; diffComplete?: boolean; diffLabel?: string; requireVerdict?: boolean; role?: UsageRole; maxTurns?: number; findings?: boolean; instructions?: string; material?: ReviewMaterial } = {}): Promise<ConsultOutcome> {
 		const { usable, blocked } = rankCandidates(order, workerHealthKeys, health, config.creditHeadroom);
 		const attempts: AttemptRecord[] = blocked.map((item) => ({ label: candidateLabel(item.candidate), ok: false, kind: "credits" as FailureKind, detail: "skipped: exhausted", order: item.index }));
 		const usage: Array<Usage | undefined> = [];
@@ -2208,6 +2485,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		let reviewer: string | undefined;
 		let failed = true;
 		const pathList = paths.map((item) => `- ${item}`).join("\n");
+		// Reviewers run without the repository's instruction files (safe mode, no context files): without them they
+		// cannot judge the code against the project's own rules.
+		const rules = readRepoRules(ctx.cwd, ruleDirs(ctx.cwd, await gitRoot(ctx.cwd), paths), config.repoRulesFiles, REVIEW_RULES_BYTES);
+		const rulesBlock = rules ? `\n\nREPOSITORY RULES (judge the code against them)\n${rules}` : "";
 		const diffBlock = options.diff ? `\n\nCHANGES UNDER REVIEW (${options.diffLabel ?? "made by this delegation"})\n\`\`\`diff\n${options.diff}\n\`\`\`\nBase the review on these changes; read files only for the surrounding context you need.` : "";
 		const verdictLine = options.requireVerdict ? "\nEnd with exactly one final line: VERDICT: PASS (no material defect) | MINOR (only minor issues) | MAJOR (bugs, missed requirements, regressions or unsafe behavior)." : "";
 		let material: string | undefined | null = null;
@@ -2215,11 +2496,14 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (isFlagship(configured.model) || availability(health, workerHealthKeys(configured), config.creditHeadroom).state === "blocked") continue;
 			const candidate: WorkerCandidate = options.maxTurns ? { ...configured, maxTurns: options.maxTurns } : configured;
 			const label = candidateLabel(candidate);
-			const prompt = `${header}\n${question}\nRelevant paths:\n${pathList}${diffBlock}\n\nInspect only the listed paths and directly relevant symbols. Do not edit, write, stage, commit, push, merge, switch branches, or run mutating commands. Return concise findings ordered by severity, concrete evidence with file/symbol references, recommended action, verification ideas, and remaining uncertainty. Do not summarize unrelated code.${verdictLine}`;
+			// An API reviewer given whole files would read the code around the changes twice.
+			const extra = options.material ? (candidate.worker === "api" && options.material.apiWhole ? options.material.apiContext : options.material.context) : "";
+			const guidance = options.instructions ?? (options.findings ? FINDINGS_FORMAT : "Return concise findings ordered by severity, concrete evidence with file/symbol references, recommended action, verification ideas, and remaining uncertainty. Do not summarize unrelated code.");
+			const prompt = `${header}\n${question}\nRelevant paths:\n${pathList}${rulesBlock}${diffBlock}${extra ? `\n\n${extra}` : ""}\n\nInspect only the listed paths and directly relevant symbols. Do not edit, write, stage, commit, push, merge, switch branches, or run mutating commands.\n${guidance}${verdictLine}`;
 			if (candidate.worker === "api") {
 				if (options.diffComplete === false || options.diff?.includes("[Diff truncated")) { attempts.push({ label, ok: false, detail: "skipped: incomplete review material requires browsing", order }); continue; }
 				// An API reviewer cannot browse: it needs the files inline, and only when they fit.
-				if (material === null) material = collectFiles(ctx.cwd, paths, 250_000);
+				if (material === null) material = options.material ? options.material.apiFiles : collectFiles(ctx.cwd, paths, 250_000);
 				if (material === undefined) {
 					attempts.push({ label, ok: false, detail: "skipped: files too large for an API review", order });
 					continue;
@@ -2636,6 +2920,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				});
 				updateTaskPacket({ phase: "completed", accepted: true, lastReport: params.summary });
 				workerSession = undefined;
+				// Context pruning shortens this task's delegation results: their diffs may no longer be in context.
+				shownDiffs.clear();
 			}
 			supervisorFlagshipGrant = undefined;
 			carriedTaskId = undefined;
@@ -2666,7 +2952,28 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor model may request consultations.");
 			const paths = normalizeAllowedPaths(params.paths, false);
 			const profileName = params.profile ?? (params.purpose === "architecture" || params.purpose === "risk-review" || params.purpose === "audit" ? "large" : "medium");
-			const outcome = await runConsultation(ctx, consultOrder(params.reviewer ?? "auto", profileName), `[READ-ONLY CODING CONSULTANT]\nPurpose: ${params.purpose}`, `Question: ${params.question}`, paths, signal);
+			const pool = consultOrder(params.reviewer ?? "auto", profileName);
+			if (params.purpose === "audit") {
+				// More source than one consultant should hold is split by directory among parallel consultants; each
+				// holds only its part in context, and the supervisor gets one merged, verified list of findings.
+				const inventory = await sourceInventory(ctx.cwd, paths);
+				const total = inventory.reduce((sum, item) => sum + item.bytes, 0);
+				const shards = total > config.auditShardBytes ? packShards(inventory, config.auditShardBytes, config.auditMaxShards) : [];
+				const jobs: ShardJob[] = shards.length > 1
+					? shards.map((shard, index) => ({ paths: compressPaths(shard.map((item) => item.file), inventory.map((item) => item.file)), question: `Question: ${params.question}\nThis is part ${index + 1} of ${shards.length} of the audit (${Math.round(total / 1024)} KB of source in all): audit only the paths below; other consultants cover the rest. Note concerns that reach into other parts as Risk lines.` }))
+					: [{ paths, question: `Question: ${params.question}` }];
+				const audit = await runShardedReview(ctx, pool, "[READ-ONLY CODING CONSULTANT]\nPurpose: audit", jobs, signal, { requireVerdict: false, role: "consult", instructions: AUDIT_FORMAT, alternate: (params.reviewer ?? "auto") === "auto" });
+				metrics.readOnlyConsultations += jobs.length;
+				persist();
+				updateStatus(ctx);
+				return {
+					content: [{ type: "text", text: truncateUtf8(`Audit (${profileName}${jobs.length > 1 ? `, ${jobs.length} parts, ${Math.round(total / 1024)} KB of source` : ""}). ${audit.text}`, config.maxOutputBytes) }],
+					details: { purpose: params.purpose, paths, profile: profileName, parts: jobs.length, reviewers: audit.reviewers, violations: audit.violations },
+					isError: audit.failed,
+					usage: combineUsage(audit.usage),
+				};
+			}
+			const outcome = await runConsultation(ctx, pool, `[READ-ONLY CODING CONSULTANT]\nPurpose: ${params.purpose}`, `Question: ${params.question}`, paths, signal, { findings: params.purpose === "implementation-review" || params.purpose === "risk-review" });
 			metrics.readOnlyConsultations++;
 			persist();
 			updateStatus(ctx);
@@ -2678,6 +2985,103 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				details: { purpose: params.purpose, paths, profile: profileName, attempts: outcome.attempts, violations: outcome.violations },
 				isError: outcome.failed,
 				usage: combineUsage(outcome.usage),
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "review_changes",
+		label: "Review branch changes",
+		description: "Independent read-only review of a branch, pull request or local work against a base ref, without loading the diff into your context: the extension takes the diff since the merge base, splits a large one into parts reviewed in parallel by Claude and GPT reviewers, gives them the code around each change and the uses of the declarations it touches, has MAJOR findings verified by a second model, and returns one merged list of findings. A later review of the same branch in this session checks the previous findings and reviews only what changed since. Use it instead of reading a branch diff yourself; then read only the ranges needed to act on the findings. Not for changes made by delegate_implementation, which are reviewed automatically.",
+		parameters: Type.Object({
+			base: Type.Optional(Type.String({ description: "Branch, tag or commit to compare with, e.g. origin/main. Default: the current branch's upstream, else origin/HEAD, main or master." })),
+			paths: Type.Optional(Type.Array(Type.String({ description: "Repository-relative path to limit the review to" }), { minItems: 1 })),
+			focus: Type.Optional(Type.String({ description: "Intent of the change (e.g. the PR description) and what matters most; reviewers judge the change against it." })),
+			uncommitted: Type.Optional(Type.Boolean({ description: "Include uncommitted and untracked changes (default true); false reviews only the commits." })),
+			full: Type.Optional(Type.Boolean({ description: "Review the whole branch again even when it was reviewed earlier in this session (default false: only the changes since that review, plus a check of its findings)." })),
+			profile: Type.Optional(StringEnum(PROFILE_NAMES, { description: "Reviewer strength; default large." })),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx) {
+			if (!enabled) throw new Error("SupervisedCoding is disabled. Run /SupervisedCoding on.");
+			if (delegationRunning) throw new Error("Wait for the running delegation before reviewing changes.");
+			if (!isAllowedSupervisor(ctx, config)) throw new Error("Only an active supervisor model may request reviews.");
+			const paths = params.paths ? normalizeAllowedPaths(params.paths, true) : [];
+			const { ref, mergeBase } = await resolveReviewBase(ctx.cwd, params.base);
+			const uncommitted = params.uncommitted ?? true;
+			const diff = await branchDiff(ctx.cwd, mergeBase, paths, uncommitted);
+			const target = uncommitted ? "the working tree" : "HEAD";
+			if (!diff.trim()) return { content: [{ type: "text", text: `No changes between ${ref} (merge base ${mergeBase.slice(0, 12)}) and ${target}${paths.length ? ` in ${paths.join(", ")}` : ""}.` }], details: { base: ref, mergeBase, files: 0, parts: 0 } };
+			const branchFiles = splitDiff(diff).map((item) => item.file);
+			// A branch reviewed earlier in this session: its unchanged code was reviewed already. The follow-up checks
+			// the earlier findings and reviews what changed since, so fix-and-review rounds converge instead of
+			// re-auditing the whole branch each time.
+			const reviewKey = `${ctx.cwd}|${mergeBase}|${uncommitted}|${paths.join(",")}`;
+			const prior = params.full ? undefined : branchReviews.get(reviewKey);
+			let reviewed = diff;
+			if (prior) {
+				const delta = await changesSince(ctx.cwd, [...new Set([...prior.files, ...branchFiles])], prior.checkpoint, Number.MAX_SAFE_INTEGER);
+				if (!delta.files.length) return { content: [{ type: "text", text: `No changes since review ${prior.count} of this branch; its findings stand:\n${prior.findings.join("\n") || "No findings."}` }], details: { base: ref, mergeBase, files: 0, parts: 0, followUp: true } };
+				reviewed = delta.diff;
+			}
+			const fileDiffs = splitDiff(reviewed).map((item) => ({ ...item, bytes: Buffer.byteLength(item.text, "utf8") }));
+			const shards = packShards(fileDiffs, config.maxDiffBytes, Number.MAX_SAFE_INTEGER);
+			if (shards.length > config.reviewMaxShards) {
+				// Too large for one call: say how it splits, so the supervisor reviews it in parts with paths.
+				const byDir = new Map<string, { files: number; bytes: number }>();
+				for (const item of fileDiffs) {
+					const dir = item.file.includes("/") ? item.file.split("/").slice(0, item.file.split("/").length > 2 ? 2 : 1).join("/") : ".";
+					const known = byDir.get(dir) ?? { files: 0, bytes: 0 };
+					byDir.set(dir, { files: known.files + 1, bytes: known.bytes + item.bytes });
+				}
+				const rows = [...byDir].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 30).map(([dir, item]) => `- ${dir}: ${item.files} file(s), ${Math.round(item.bytes / 1024)} KB of diff`);
+				throw new Error(`The change is too large for one review (${fileDiffs.length} files, ${Math.round(diff.length / 1024)} KB of diff: ${shards.length} parts, at most reviewMaxShards ${config.reviewMaxShards}). Review it in several calls with paths, e.g. by directory:\n${rows.join("\n")}`);
+			}
+			const focus = params.focus?.trim() ? `\nIntent and focus: ${params.focus.trim()}` : "";
+			const scope = prior
+				? `This branch (changes against ${ref}, merge base ${mergeBase.slice(0, 12)}) was reviewed before, and these findings were reported:\n${truncateUtf8(prior.findings.join("\n") || "No findings.", 6000)}\nThe changes below were made since that review. Say for each earlier finding in these files whether it is fixed (report it again if not), and review these changes for new defects. Code unchanged since that review was reviewed already: do not audit it again.`
+				: `Review the changes against ${ref} (merge base ${mergeBase.slice(0, 12)}) up to ${target}.`;
+			const jobs: ShardJob[] = [];
+			for (const [index, shard] of shards.entries()) {
+				const truncated = shard.length === 1 && shard[0].bytes > config.maxDiffBytes;
+				const shardDiff = truncated ? `${truncateUtf8(shard[0].text, config.maxDiffBytes)}\n[Diff truncated at ${config.maxDiffBytes} bytes: read the file for the rest.]` : shard.map((item) => item.text.trimEnd()).join("\n");
+				const files = shard.map((item) => item.file).filter((file) => fs.existsSync(path.join(ctx.cwd, file)));
+				jobs.push({
+					question: `${scope}${focus}${shards.length > 1 ? `\nThis is part ${index + 1} of ${shards.length}; other reviewers cover the other files: note concerns that reach into them as Risk lines.` : ""}\nLook for correctness bugs, regressions, callers the change breaks, unsafe behavior, type/API problems and missing or inadequate tests.`,
+					paths: files.length ? files : shard.map((item) => item.file),
+					diff: shardDiff,
+					diffComplete: !truncated,
+					material: await reviewMaterial(ctx.cwd, shardDiff, files, config),
+				});
+			}
+			onUpdate?.({ content: [{ type: "text", text: `Reviewing ${fileDiffs.length} file(s) in ${jobs.length} part(s) against ${ref}` }], details: { running: true } });
+			const profileName = params.profile ?? "large";
+			delegationRunning = true;
+			let review: Awaited<ReturnType<typeof runShardedReview>>;
+			try {
+				review = await runShardedReview(ctx, reviewPool([profileName, "large", "critical"]), "[INDEPENDENT READ-ONLY CODE REVIEW OF BRANCH CHANGES]", jobs, signal, { requireVerdict: true, role: "review", maxTurns: config.workerMaxTurns[profileName], diffLabel: prior ? `made since review ${prior.count} of this branch` : `since ${ref}` });
+			} finally {
+				delegationRunning = false;
+			}
+			metrics.readOnlyConsultations += jobs.length;
+			const count = (branchReviews.get(reviewKey)?.count ?? 0) + 1;
+			if (!review.failed) {
+				branchReviews.delete(reviewKey);
+				branchReviews.set(reviewKey, { checkpoint: await checkpoint(ctx.cwd, branchFiles), files: branchFiles, findings: review.findings.map((finding) => formatFinding(finding)), count });
+				// Checkpoints hold file contents: keep only the most recent branches.
+				while (branchReviews.size > 4) branchReviews.delete(branchReviews.keys().next().value!);
+			}
+			persist();
+			updateStatus(ctx);
+			const heading = prior
+				? `Follow-up review ${count} of the changes since ${ref}: the earlier findings and the ${fileDiffs.length} file(s) changed since review ${prior.count} (full: true reviews the whole branch).`
+				: `Changes since ${ref} (merge base ${mergeBase.slice(0, 12)}) up to ${target}: ${fileDiffs.length} file(s).`;
+			// Every round finds something new when reviewers dig deeper each time: past the second, the user decides.
+			const convergence = count >= 3 ? `\n\nCONVERGENCE: this branch has now been reviewed ${count} times in this session. Fix only findings that are defects of the requested change; report the rest to the user and ask before another fix-and-review round.` : "";
+			return {
+				content: [{ type: "text", text: truncateUtf8(`${heading}\n${review.text}${convergence}`, config.maxOutputBytes) }],
+				details: { base: ref, mergeBase, files: fileDiffs.length, parts: jobs.length, verdict: review.verdict, reviewers: review.reviewers, violations: review.violations, followUp: Boolean(prior), reviewCount: count },
+				isError: review.failed,
+				usage: combineUsage(review.usage),
 			};
 		},
 	});
@@ -2720,7 +3124,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		delegationRunning = true;
 		let review: ConsultOutcome;
 		try {
-			review = await runConsultation(ctx, reviewOrder(task.implementer, profile), "[INDEPENDENT READ-ONLY CODE REVIEW OF THE WHOLE TASK]", question, changes.complete ? changes.files : start.paths, signal, { diff: changes.diff, diffComplete: changes.complete, diffLabel: "made by the whole task", requireVerdict: true, role: "review", maxTurns: config.workerMaxTurns[profile] });
+			const reviewPaths = changes.complete ? changes.files : start.paths;
+			review = await runConsultation(ctx, reviewOrder(task.implementer, profile), "[INDEPENDENT READ-ONLY CODE REVIEW OF THE WHOLE TASK]", question, reviewPaths, signal, { diff: changes.diff, diffComplete: changes.complete, diffLabel: "made by the whole task", requireVerdict: true, findings: true, role: "review", maxTurns: config.workerMaxTurns[profile], material: await reviewMaterial(ctx.cwd, changes.diff, reviewPaths, config) });
 		} finally {
 			delegationRunning = false;
 		}
@@ -2728,6 +3133,149 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		persist();
 		if (review.reviewer && !review.failed) return { text: `Review of the whole task (${review.reviewer}), verdict ${review.verdict.toUpperCase()}:\n${truncateUtf8Middle(review.text, config.outputLimits.consultBytes)}`, verdict: review.verdict };
 		return { text: `REVIEW OF THE WHOLE TASK UNAVAILABLE: ${review.text}${review.violations.length ? `\nREAD-ONLY VIOLATION: ${review.violations.join("; ")}` : ""}`, verdict: "none" };
+	}
+
+	// ── Sharded reviews and audits ─────────────────────────────────────────────────────────────────
+
+	/** One part of a review or audit, reviewed by its own read-only consultant. */
+	interface ShardJob {
+		question: string;
+		paths: string[];
+		diff?: string;
+		diffComplete?: boolean;
+		material?: ReviewMaterial;
+	}
+
+	/**
+	 * Reviewer order for part `index`: with several parts, the families take turns going first, so a large change
+	 * gets both families' eyes and no single provider carries all the load. Quality order holds within a family.
+	 */
+	function shardOrder(pool: WorkerCandidate[], index: number, parts: number): WorkerCandidate[] {
+		const families = [...new Set(pool.map(modelFamily))];
+		if (parts < 2 || families.length < 2) return pool;
+		const wanted = families[index % families.length];
+		return [...pool].sort((a, b) => Number(modelFamily(b) === wanted) - Number(modelFamily(a) === wanted));
+	}
+
+	/** Code cited by findings: the declaration around each line (up to 120 lines), else 25 lines around it. */
+	function citedCode(cwd: string, findings: Finding[], maxBytes: number): string {
+		const byFile = new Map<string, number[]>();
+		for (const finding of findings) if (finding.file && finding.line) byFile.set(finding.file, [...(byFile.get(finding.file) ?? []), finding.line]);
+		const blocks: string[] = [];
+		let used = 0;
+		for (const [file, lines] of byFile) {
+			let source: string;
+			try { source = fs.readFileSync(path.join(cwd, file), "utf8"); } catch { continue; }
+			const total = source.split(/\r?\n/).length;
+			const entries = outlineSupported(file) ? outlineSource(file, source) : [];
+			const ranges = lines.map((line): [number, number] => {
+				const around = entries.filter((entry) => entry.line <= line && line <= entry.end && entry.end - entry.line < 120).sort((a, b) => (b.end - b.line) - (a.end - a.line))[0];
+				return around ? [around.line, around.end] : [Math.max(1, line - 25), Math.min(total, line + 25)];
+			}).sort((a, b) => a[0] - b[0]);
+			const merged: Array<[number, number]> = [];
+			for (const range of ranges) {
+				const last = merged.at(-1);
+				if (last && range[0] <= last[1] + 1) last[1] = Math.max(last[1], range[1]);
+				else merged.push([...range]);
+			}
+			const block = renderRanges(file, source, merged);
+			if (used + Buffer.byteLength(block, "utf8") > maxBytes) continue;
+			blocks.push(block);
+			used += Buffer.byteLength(block, "utf8");
+		}
+		return blocks.join("\n\n");
+	}
+
+	/**
+	 * A second reviewer, of another family than the one that reported them where possible, checks MAJOR findings
+	 * against the code. Rejected ones are set apart (still listed, so the supervisor can overrule the verifier);
+	 * confirmed ones are marked; the rest stay unverified.
+	 */
+	async function verifyFindings(ctx: ExtensionContext, findings: Finding[], pool: WorkerCandidate[], reporterFamilies: string[], signal: AbortSignal | undefined): Promise<{ kept: Finding[]; rejected: string[]; note: string; usage: Array<Usage | undefined> }> {
+		const majors = findings.filter((finding) => finding.severity === "MAJOR");
+		if (!majors.length) return { kept: findings, rejected: [], note: "", usage: [] };
+		const checked = majors.slice(0, 15);
+		const families = [...new Set(reporterFamilies)];
+		const order = families.length === 1 ? [...pool].sort((a, b) => Number(modelFamily(a) === families[0]) - Number(modelFamily(b) === families[0])) : pool;
+		const cited = citedCode(ctx.cwd, checked, 40_000);
+		const outcome = await runConsultation(ctx, order, "[READ-ONLY VERIFICATION OF REVIEW FINDINGS]", `Independent reviewers reported the MAJOR defects below. Check each one against the code: the cited code is below; read more only when needed.\n${checked.map((finding, index) => formatFinding(finding, index + 1)).join("\n")}`, [...new Set(checked.map((finding) => finding.file).filter(Boolean))], signal, {
+			role: "review",
+			instructions: "Answer with exactly one line per finding and nothing else: `#<n> CONFIRMED — reason` when the defect is real and material (wrong results, crashes, data loss, unsafe behavior or broken callers in realistic use), `#<n> MINOR — reason` when it is real but not material, `#<n> REJECTED — evidence` when the code does not have it, `#<n> UNSURE — what is missing` otherwise.",
+			material: { context: cited ? `CITED CODE (current content, numbered)\n${cited}` : "", apiContext: "", apiFiles: "", apiWhole: false },
+		});
+		if (outcome.failed) return { kept: findings, rejected: [], note: `Verification of MAJOR findings unavailable: ${outcome.text.slice(0, 200)}`, usage: outcome.usage };
+		const statuses = parseVerification(outcome.text);
+		const rejected: string[] = [];
+		const kept = findings.filter((finding) => {
+			const index = checked.indexOf(finding);
+			if (index < 0) return true;
+			const status = statuses.get(index + 1);
+			if (status?.status === "rejected") {
+				rejected.push(`${formatFinding(finding)} — rejected: ${status.reason || "no reason given"}`);
+				return false;
+			}
+			if (status?.status === "minor") {
+				finding.severity = "MINOR";
+				finding.status = "downgraded";
+			} else {
+				finding.status = status?.status === "confirmed" ? "confirmed" : "unverified";
+			}
+			return true;
+		});
+		// Downgraded findings join the MINOR ones.
+		kept.sort((a, b) => Number(a.severity === "MINOR") - Number(b.severity === "MINOR"));
+		return { kept, rejected, note: `MAJOR findings verified by ${outcome.reviewer}.`, usage: outcome.usage };
+	}
+
+	/**
+	 * Runs the parts in parallel (reviewConcurrency at a time), merges their findings, verifies the MAJOR ones and
+	 * returns one consolidated report: the supervisor sees findings, not the reviewers' transcripts.
+	 */
+	async function runShardedReview(ctx: ExtensionContext, pool: WorkerCandidate[], header: string, jobs: ShardJob[], signal: AbortSignal | undefined, options: { requireVerdict: boolean; maxTurns?: number; role: UsageRole; diffLabel?: string; instructions?: string; alternate?: boolean }): Promise<{ text: string; verdict: ReviewVerdict; failed: boolean; usage: Array<Usage | undefined>; violations: string[]; reviewers: string[]; findings: Finding[] }> {
+		const outcomes = await mapLimit(jobs, config.reviewConcurrency, (job, index) => runConsultation(ctx, options.alternate === false ? pool : shardOrder(pool, index, jobs.length), header, job.question, job.paths, signal, { diff: job.diff, diffComplete: job.diffComplete, diffLabel: options.diffLabel, requireVerdict: options.requireVerdict, findings: true, instructions: options.instructions, role: options.role, maxTurns: options.maxTurns, material: job.material }));
+		const usage = outcomes.flatMap((outcome) => outcome.usage);
+		const violations = [...new Set(outcomes.flatMap((outcome) => outcome.violations))];
+		const lists: Finding[][] = [];
+		const risks = new Set<string>();
+		const notes: string[] = [];
+		const unavailable: string[] = [];
+		const reporterFamilies: string[] = [];
+		let unparsedMajor = false;
+		let anyMinor = false;
+		outcomes.forEach((outcome, index) => {
+			const part = jobs.length > 1 ? `Part ${index + 1}/${jobs.length} (${jobs[index].paths.slice(0, 4).join(", ")}${jobs[index].paths.length > 4 ? ", …" : ""})` : "Review";
+			if (outcome.failed || !outcome.reviewer) {
+				unavailable.push(`${part}: ${outcome.text.slice(0, 300)}`);
+				return;
+			}
+			const parsed = parseFindings(outcome.text, outcome.reviewer);
+			lists.push(parsed.findings);
+			parsed.risks.forEach((risk) => risks.add(risk));
+			const family = pool.find((item) => candidateLabel(item) === outcome.reviewer);
+			if (parsed.findings.some((finding) => finding.severity === "MAJOR") && family) reporterFamilies.push(modelFamily(family));
+			if (outcome.verdict === "minor" || outcome.verdict === "major") anyMinor = true;
+			// A reviewer that ignored the format still reported something: keep its words rather than lose them.
+			if (!parsed.findings.length && (outcome.verdict === "minor" || outcome.verdict === "major" || !options.requireVerdict) && parsed.other.length) {
+				if (outcome.verdict === "major") unparsedMajor = true;
+				notes.push(`${part} — ${outcome.reviewer}:\n${truncateUtf8Middle(parsed.other.join("\n"), Math.max(3000, Math.floor(config.outputLimits.consultBytes / jobs.length)))}`);
+			}
+		});
+		const verified = await verifyFindings(ctx, mergeFindings(lists), pool, reporterFamilies, signal);
+		usage.push(...verified.usage);
+		const findings = verified.kept;
+		const majors = findings.filter((finding) => finding.severity === "MAJOR").length;
+		const verdict: ReviewVerdict = unavailable.length === jobs.length ? "none" : majors || unparsedMajor ? "major" : findings.length || anyMinor ? "minor" : "pass";
+		const reviewers = [...new Set(outcomes.map((outcome) => outcome.reviewer).filter((item): item is string => Boolean(item)))];
+		const text = [
+			`${jobs.length > 1 ? `${jobs.length} parts reviewed in parallel` : "Reviewed"} by ${reviewers.join(", ") || "no reviewer"}. ${options.requireVerdict ? `Verdict: ${verdict.toUpperCase()}` : `${findings.length} finding(s)`}${unavailable.length && unavailable.length < jobs.length ? " (INCOMPLETE: some parts were not reviewed)" : ""}.${verified.note ? ` ${verified.note}` : ""}`,
+			findings.length ? `Findings (${majors} MAJOR, ${findings.length - majors} MINOR):\n${findings.map((finding) => formatFinding(finding)).join("\n")}` : "No findings.",
+			verified.rejected.length ? `Rejected by verification (overrule only with evidence):\n${verified.rejected.join("\n")}` : "",
+			notes.length ? `Notes:\n${notes.join("\n\n")}` : "",
+			risks.size ? `Risks:\n${[...risks].slice(0, 8).map((risk) => `- ${risk}`).join("\n")}` : "",
+			unavailable.length ? `NOT REVIEWED:\n${unavailable.join("\n")}` : "",
+			violations.length ? `READ-ONLY VIOLATION: ${violations.join("; ")}` : "",
+		].filter(Boolean).join("\n\n");
+		return { text: truncateUtf8Middle(text, config.outputLimits.consultBytes), verdict, failed: unavailable.length > 0 || violations.length > 0, usage, violations, reviewers, findings };
 	}
 
 	async function executeDelegation(params: any, parentSignal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
@@ -2811,6 +3359,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 			try {
 				const repoContext = await repoContextFor(ctx.cwd, allowedPaths);
+				const codeMap = config.workerCodeMapBytes > 0 ? await workerCodeMap(ctx.cwd, allowedPaths, implementationGuide, config.workerCodeMapBytes) : "";
 				const verifyCommands = config.autoVerify ? dedupeVerifyCommands(ctx.cwd, extractVerifyCommands(implementationGuide, config.verificationCommands, UNSAFE_COMMAND_CHARS)) : [];
 				// Baseline first: checks that already failed are reported, never blamed on (or credited to) the worker.
 				// A check counts as pre-existing only if it fails now AND failed when the task started: whatever an
@@ -2873,7 +3422,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				};
 				const beforeContent = await checkpoint(ctx.cwd, allowedPaths);
 				await extendTaskCheckpoint(ctx.cwd, taskPacket.id, allowedPaths, beforeContent);
-				const spec: ImplementationSpec = { task: params.recoveryNote ? `${params.task}\n\n${params.recoveryNote}` : params.task, guide: implementationGuide, criteria, allowedPaths, profileName, assessment: assessed.assessment, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, resumeWorker: workerSession?.worker ?? "claude", resumeModel: workerSession?.model, repoContext, checkpoint: beforeContent };
+				const spec: ImplementationSpec = { task: params.recoveryNote ? `${params.task}\n\n${params.recoveryNote}` : params.task, guide: implementationGuide, criteria, allowedPaths, profileName, assessment: assessed.assessment, preferWorker: params.preferWorker, effort: params.effort, resumeSessionId, resumeWorker: workerSession?.worker ?? "claude", resumeModel: workerSession?.model, repoContext, codeMap, checkpoint: beforeContent };
 				checkResults.clear();
 				const outcome = await executeImplementation(ctx, spec, signal, (text, label) => onUpdate?.({ content: [{ type: "text", text: truncateUtf8(text, 4000) }], details: { running: true, profile: profileName, worker: label } }));
 				if (outcome.resumed) metrics.resumedDelegations++;
@@ -2972,7 +3521,8 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					const question = `Task: ${params.task}\nAcceptance criteria:\n${criteria.length ? criteria.map((item) => `- ${item}`).join("\n") : "- Satisfy the authorized task and repository requirements."}\n${verificationText ? `\nAutomatic checks: ${verification}.\n` : ""}\nLook for correctness bugs, missed requirements, regressions, unsafe behavior, type/API problems, and inadequate tests. If no material defect is found, say so explicitly and list residual risks.`;
 					const changes = await changesSince(ctx.cwd, allowedPaths, beforeContent, config.maxDiffBytes);
 					const reviewPaths = [...new Set([...changes.files, ...allowedPaths.filter(p => !fs.existsSync(path.join(ctx.cwd, p)) || !fs.statSync(path.join(ctx.cwd, p)).isDirectory())])];
-					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, changes.complete ? reviewPaths : allowedPaths, signal, { diff: changes.diff, diffComplete: changes.complete, requireVerdict: true, role: "review", maxTurns: config.workerMaxTurns[profileName] });
+					const reviewTargets = changes.complete ? reviewPaths : allowedPaths;
+					const review = await runConsultation(ctx, reviewOrder(implementer, profileName), "[INDEPENDENT READ-ONLY CODE REVIEW]", question, reviewTargets, signal, { diff: changes.diff, diffComplete: changes.complete, requireVerdict: true, findings: true, role: "review", maxTurns: config.workerMaxTurns[profileName], material: await reviewMaterial(ctx.cwd, changes.diff, reviewTargets, config) });
 					usage.push(...review.usage);
 					reviewVerdict = review.verdict;
 					reviewText = review.reviewer && !review.failed
@@ -2995,9 +3545,10 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				const usageLine = combined ? `Combined tokens: ${combined.input} in + ${combined.output} out + ${combined.cacheRead} cache-read; reported cost $${combined.cost.total.toFixed(2)}` : "Usage unavailable";
 				const safetyItems = [...scopeViolations, ...[...checkSafety].map((item) => `verification ${item}`)];
 				const safetyLine = safetyItems.length ? `SAFETY VIOLATIONS: ${safetyItems.join("; ")}\n` : "";
-				const changedLine = afterAll.available ? `Changed files in this delegation: ${filesChangedBetween(outcome.before, afterAll).join(", ") || "none"}\n` : "Git unavailable: scope enforcement degraded outside Git repositories.\n";
+				const changedFiles = afterAll.available ? filesChangedBetween(outcome.before, afterAll) : [];
+				const changedLine = afterAll.available ? `Changed files in this delegation: ${changedFiles.join(", ") || "none"}\n` : "Git unavailable: scope enforcement degraded outside Git repositories.\n";
 				// The supervisor reviews the change right here instead of spending extra turns on supervisor_git.
-				const delta = afterAll.available ? await changesSince(ctx.cwd, allowedPaths, beforeContent, 12_000) : undefined;
+				const delta = afterAll.available ? await changesSince(ctx.cwd, allowedPaths, beforeContent, RESULT_DIFF_BYTES) : undefined;
 				const diffSection = delta?.complete ? `DIFF (this delegation only)\n\`\`\`diff\n${delta.diff}\n\`\`\`` : delta ? `DIFF: incomplete; inspect with supervisor_git. Changed paths: ${delta.files.join(", ")}.` : "";
 				const verificationLine = verifyCommands.length
 					? `Automatic verification: ${verification}${correctionRounds ? ` after ${correctionRounds} correction round(s)` : ""} — already run by the extension on the final code: ${ranCommands.join(", ")}. Do not re-run these; use run_verification only for other checks.\n`
@@ -3012,13 +3563,21 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				];
 				const withoutDiff = Buffer.byteLength(sections.join("\n\n"), "utf8");
 				// A diff is useful only whole: when it does not fit, point to it instead of cutting it.
-				sections.splice(4, 0, diffSection && withoutDiff + Buffer.byteLength(diffSection, "utf8") + 2 > config.maxOutputBytes && delta
+				const tooLong = withoutDiff + Buffer.byteLength(diffSection, "utf8") + 2 > config.maxOutputBytes;
+				const diffFits = Boolean(delta?.complete) && !tooLong;
+				sections.splice(4, 0, diffSection && tooLong && delta
 					? `DIFF: omitted to keep this result within maxOutputBytes; inspect with supervisor_git. Changed paths: ${delta.files.join(", ")}.`
 					: diffSection);
+				// The result shows the change whole: while nothing changes, supervisor_git need not send it again. Only
+				// for files clean before the delegation, where git diff and the delegation's diff are the same change.
+				for (const file of changedFiles) {
+					if (diffFits && !outcome.before.changedFiles.includes(file)) shownDiffs.set(file, fileFingerprint(ctx.cwd, file));
+					else shownDiffs.delete(file);
+				}
 				const text = truncateUtf8(sections.filter(Boolean).join("\n\n"), config.maxOutputBytes);
 				return {
 					content: [{ type: "text", text }],
-					details: { attempts: outcome.attempts, implementer, before: outcome.before, after: afterAll, scopeViolations, verificationChanged: [...checkChanges], verificationSafetyViolations: [...checkSafety], verificationCommandsRun: verification === "unverified" ? [] : ranCommands, checksReusedAtStart: reusedAtStart, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict, limitReached, sessionPreserved: Boolean(workerSession && workerSession.taskId === taskPacket?.id) },
+					details: { attempts: outcome.attempts, implementer, changedFiles, before: outcome.before, after: afterAll, scopeViolations, verificationChanged: [...checkChanges], verificationSafetyViolations: [...checkSafety], verificationCommandsRun: verification === "unverified" ? [] : ranCommands, checksReusedAtStart: reusedAtStart, profile: profileName, resumed: outcome.resumed, taskPacketId: taskPacket?.id, verification, correctionRounds, reviewVerdict, limitReached, sessionPreserved: Boolean(workerSession && workerSession.taskId === taskPacket?.id) },
 					isError: failed,
 					usage: combined,
 				};
@@ -3184,6 +3743,21 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const paths = params.paths ?? [];
 			const pathArgs = ["--", ...paths];
 			const unified = `--unified=${params.unifiedLines ?? 3}`;
+			if (params.action === "diff" && (params.unifiedLines ?? 3) <= 5 && shownDiffs.size) {
+				// Asking again for a diff a delegation result already showed whole costs its size once more.
+				const [names, staged, untracked] = await Promise.all([
+					gitStdout(ctx.cwd, ["diff", "--name-only", "--relative", "-z", ...pathArgs]),
+					gitStdout(ctx.cwd, ["diff", "--cached", "--name-only", "--relative", "-z", ...pathArgs]),
+					gitStdout(ctx.cwd, ["ls-files", "--others", "--exclude-standard", "-z", ...pathArgs]),
+				]);
+				const files = [...nulSeparated(names), ...nulSeparated(untracked)];
+				if (files.length && !nulSeparated(staged).length && files.every((file) => shownDiffs.get(file) === fileFingerprint(ctx.cwd, file))) {
+					return {
+						content: [{ type: "text", text: `No change since the delegation results of this task: their DIFF sections already show these changes whole (${files.join(", ")}). For more context read the ranges you need, or ask again with unifiedLines above 5.` }],
+						details: { action: params.action, paths, unifiedLines: params.unifiedLines ?? 3, outputBytes: 0, alreadyShown: true },
+					};
+				}
+			}
 			const argsByAction: Record<typeof params.action, string[]> = {
 				status: ["status", "--short", "--branch", ...pathArgs],
 				diff: ["diff", "--no-ext-diff", unified, ...pathArgs],
@@ -3332,7 +3906,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it, or where a symbol is used), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it, or where a symbol is used), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings. To review a branch, a pull request or local work not done by delegate_implementation, call review_changes (with base and, when known, the intent in focus) instead of reading the diff yourself. Findings marked (confirmed) or (downgraded) were already checked against the code by a second model: read their code only to act on them, never just to confirm them again. Stay within the user's request: fix findings that are defects of the requested change or of its stated scope; report the others (pre-existing code, extra hardening) to the user instead of fixing them unasked, and never start a third fix-and-review round on the same change without asking the user. Between prompts, bulky tool results of accepted tasks are replaced with short notes and reads of files a later delegation changed are marked outdated: read again what you need.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n4. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n5. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n6. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n7. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
 				display: false,
 			},
 		};
@@ -3357,7 +3931,20 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
-		if (!enabled || event.outcome !== "error" || !config.supervisorFailover || supervisorRecoveryRunning) return;
+		if (!enabled) return;
+		if (event.outcome === "completed") {
+			// Between runs, never inside one: the edits cost one prompt-cache miss for the next prompt (often cold by
+			// then anyway) and make every later turn smaller.
+			if (!config.contextPruning.enabled || delegationRunning) return;
+			const { edits, savedBytes } = planContextEdits(event.context.contextEntries as any, { cwd: ctx.cwd, minResultBytes: config.contextPruning.minResultBytes, minTotalBytes: config.contextPruning.minTotalBytes });
+			if (!edits.length) return;
+			metrics.contextPrunedBytes += savedBytes;
+			metrics.contextPrunedResults += edits.length;
+			shownDiffs.clear();
+			persist();
+			return { entries: edits };
+		}
+		if (event.outcome !== "error" || !config.supervisorFailover || supervisorRecoveryRunning) return;
 		const failure = findLastAssistantError(event.context.contextMessages) ?? findLastAssistantError(ctx.sessionManager.getBranch());
 		if (!failure) return;
 		const kind = classifyFailure(failure.errorMessage);
@@ -3399,6 +3986,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 
 	pi.on("session_compact", () => {
 		policyInjected = false;
+		shownDiffs.clear();
 	});
 
 	pi.on("session_shutdown", () => {

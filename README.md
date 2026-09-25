@@ -23,12 +23,14 @@ Its priorities, in order:
 - **Automatic verification against a task baseline.** Your test, typecheck and lint commands run before and after every change. A check that turned red during the task is a regression, even if an earlier step broke it. Only checks already red when the task began, and still failing the same way, are treated as pre-existing: a new failing test inside a red command is a regression, while passing tests added by the worker are not. A check that already ran on exactly the same code in the same prompt is not run again.
 - **Self-correction in context.** The worker that caused a regression fixes it in its own session (up to 2 rounds by default), without weakening or deleting tests.
 - **Independent review across families.** Large and critical work is reviewed by a model of another family first, and never by the implementer's own model unless nothing else is available. Before a large or critical task done in several steps is accepted, its whole diff is reviewed as one.
+- **Reviews and audits for large repositories.** `review_changes` reviews a branch, pull request or local work against a base ref without the supervisor reading the diff: a large diff is split into parts reviewed in parallel by both families, and one merged list of findings comes back. Audits of more source than one consultant should hold are split by directory the same way. Reviewers get the code around each change and the uses of the declarations it touches, report one line per finding, and a second model of the other family verifies every MAJOR finding before it reaches the supervisor.
 - **Explicit acceptance.** A task closes only through `complete_task`. It cannot be accepted with open regressions, a MAJOR finding or a missing review.
 - **Credit-aware failover.** Exhausted providers are skipped until they reset, and near-limit ones move to the back. A worker that runs out mid-task hands its partial diff to the next one; a supervisor that runs out is replaced and the turn resumes on its own.
 - **Learning from its own results.** Per repository and task kind, the extension raises effort when quality drops, escalates to a stronger model when that is not enough, lowers effort only after long clean streaks, and remembers repository-specific pitfalls as lessons.
 - **Flagship models on request only.** Top-tier models (e.g. Claude Fable, GPT-6 Astra) run only on critical tasks and only after you say yes.
 - **Budgets that keep your work.** Turn, time and cost limits stop a delegation between phases. The worker's session is kept, so the next step resumes it instead of starting over.
 - **Guard rails.** Path allowlists, Git checks after every run, read-only reviewers, and no commit or push without your confirmation.
+- **A lean supervisor context.** Between prompts, bulky tool results of accepted tasks become one-line notes and reads of files a later delegation changed are marked outdated (Pi context edits: the session history is kept). Fresh workers get a map of large files (outline with line ranges, uses of the symbols the guide names), so they read ranges instead of whole files.
 - **Transparent accounting.** Tokens and cost per model and role, with subscriptions kept apart from pay-per-use spend, plus a log of every invocation.
 
 ## How it works
@@ -193,6 +195,7 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `delegate_implementation` | runs the profile's worker chain with verification, self-correction, review and failover; `preferWorker` (`claude` / `gpt`) puts a family first |
 | `complete_task` | `accept` closes the task (after the whole-task review when needed); `pause` keeps it open for later. Both release the flagship supervisor and reset the effort |
 | `consult_readonly` | a focused read-only opinion from any model, or an audit of many files read in the consultant's context instead of the supervisor's (`purpose: audit`); `reviewer` (`claude` / `gpt`) picks the preferred family |
+| `review_changes` | independent review of a branch, pull request or local work against `base` (default: upstream, `origin/HEAD`, `main` or `master`), with `focus` for the intent; large diffs are split into parts reviewed in parallel, MAJOR findings are verified by a second model, and only the merged findings reach the supervisor; a later review of the same branch checks the earlier findings and reviews only what changed since (`full: true` reviews it all) |
 | `run_verification` | one allowlisted test, typecheck, lint or build command not already covered by `VERIFY` |
 | `code_outline` | functions, classes, methods, types and tests of source files (headings for Markdown) with their line ranges, so the supervisor reads only the ranges it needs; with `references`, where a symbol is used and which function contains each use; deterministic, no model call |
 | `record_lesson` | a durable repository pitfall for future workers |
@@ -219,6 +222,10 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `workerCommand`, `piCommand`, `piWorkerTools`, `piReadOnlyTools`, `worker*`, `claudeReadOnly*` | CLIs and tool permissions |
 | `repoRulesFiles`, `minImplementationGuideChars`, `maxDiffBytes`, `maxOutputBytes`, `reviewMaxTokens`, `maxProcessOutputBytes` | prompts and output limits |
 | `outputLimits` | per-tool caps on what reaches the supervisor's context: passing and failing `run_verification` output, consultations and reviews, the worker's report, `code_outline` |
+| `contextPruning` | `enabled`, `minResultBytes` (smaller results of accepted tasks stay), `minTotalBytes` (edits are applied only when they save at least this much, since each batch costs one prompt-cache miss) |
+| `reviewConcurrency`, `reviewMaxShards`, `auditShardBytes`, `auditMaxShards` | parallel reviewers; parts of a `review_changes` diff (each up to `maxDiffBytes`); source per audit consultant and number of consultants |
+| `reviewWholeFilesBytes`, `reviewContextBytes` | whole changed files for the API reviewer up to this size (above it, up to 250 KB, the code around the changes and outlines of large files); code around the changes and uses of changed declarations given to every reviewer |
+| `workerCodeMapBytes` | map of large authorized files given to fresh workers (0 disables it) |
 | `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `supervisorTools`, `contextWarningPercent` | supervisor behavior |
 
 ## Data and privacy
@@ -250,6 +257,9 @@ The tests never call a real model: they run the real extension against fake Clau
 | `learning.ts` | outcomes, effort calibration, lessons, verdicts, `VERIFY` extraction |
 | `routing.ts` | task assessment, escalation, evidence-based ordering |
 | `changes.ts` | checkpoints and per-delegation diffs |
+| `outline.ts` | deterministic outlines and references |
+| `review.ts` | review material, findings format, merging, shards |
+| `pruning.ts` | supervisor context pruning |
 | `config.json` | default configuration |
 | `CHANGELOG.md` | release notes |
 
@@ -282,12 +292,14 @@ Le sue priorità, in ordine:
 - **Verifica automatica rispetto alla baseline del task.** I comandi di test, typecheck e lint girano prima e dopo ogni modifica. Un controllo diventato rosso durante il task è una regressione, anche se l'ha causato un passo precedente. Sono considerati preesistenti solo i controlli già rossi all'inizio del task che falliscono ancora nello stesso modo: un nuovo test fallito dentro un comando già rosso è una regressione, mentre i test aggiunti dal worker che passano non lo sono. Un controllo già eseguito sullo stesso identico codice nello stesso prompt non viene rieseguito.
 - **Auto-correzione nel contesto.** Il worker che ha causato una regressione la corregge nella propria sessione (fino a 2 giri di default), senza indebolire o cancellare test.
 - **Review indipendente tra famiglie.** I lavori large e critical vengono rivisti prima da un modello di un'altra famiglia, e mai dal modello dell'implementatore se c'è un'alternativa. Prima di accettare un task large o critical svolto in più passi, il suo diff complessivo viene rivisto per intero.
+- **Review e audit per repository grandi.** `review_changes` rivede un branch, una pull request o del lavoro locale rispetto a un ref di base senza che il supervisore legga il diff: un diff grande viene diviso in parti riviste in parallelo da entrambe le famiglie, e torna un'unica lista di problemi. Gli audit su più sorgente di quanto un consulente debba tenere vengono divisi per cartella allo stesso modo. I revisori ricevono il codice attorno a ogni modifica e gli usi delle dichiarazioni toccate, riportano un problema per riga, e un secondo modello dell'altra famiglia verifica ogni problema MAJOR prima che arrivi al supervisore.
 - **Accettazione esplicita.** Un task si chiude solo con `complete_task`, che non accetta regressioni aperte, verdetti MAJOR o review mancanti.
 - **Failover consapevole dei crediti.** I provider esauriti vengono saltati fino al reset, quelli vicini al limite vanno in fondo. Un worker che esaurisce i crediti a metà lavoro passa il diff parziale al successivo; un supervisore esaurito viene sostituito e il turno riprende da solo.
 - **Apprendimento dai propri risultati.** Per repository e tipo di task l'estensione alza l'effort quando la qualità cala, passa a un modello più forte quando non basta, abbassa l'effort solo dopo lunghe serie pulite e ricorda le insidie del repository come lezioni.
 - **Modelli di punta solo su richiesta.** I modelli di fascia alta (es. Claude Fable, GPT-6 Astra) si usano solo nei task critical e solo dopo il tuo sì.
 - **Budget che non buttano il lavoro.** Limiti di turni, tempo e costo fermano una delega tra una fase e l'altra. La sessione del worker resta, quindi il passo successivo la riprende invece di ricominciare.
 - **Protezioni.** Percorsi autorizzati, controlli Git dopo ogni esecuzione, revisori in sola lettura, nessun commit o push senza la tua conferma.
+- **Contesto del supervisore snello.** Tra un prompt e l'altro, i risultati voluminosi dei task accettati diventano note di una riga e le letture di file poi modificati da una delega vengono segnate come obsolete (context edit di Pi: la cronologia della sessione resta). I worker nuovi ricevono una mappa dei file grandi (struttura con intervalli di righe, usi dei simboli nominati nella guida), così leggono intervalli invece di file interi.
 - **Consumi trasparenti.** Token e costi per modello e per ruolo, con gli abbonamenti separati dalla spesa a consumo, più un registro di ogni invocazione.
 
 ## Come funziona
@@ -452,6 +464,7 @@ Se scegli un modello a mano, la selezione del supervisore diventa `manual` (il f
 | `delegate_implementation` | esegue la catena di worker del profilo con verifica, auto-correzione, review e failover; `preferWorker` (`claude` / `gpt`) mette una famiglia in testa |
 | `complete_task` | `accept` chiude il task (dopo la review complessiva quando serve); `pause` lo lascia aperto per dopo. Entrambi rilasciano il supervisore di punta e azzerano l'effort |
 | `consult_readonly` | un parere mirato in sola lettura da qualsiasi modello, oppure un audit di molti file letti nel contesto del consulente anziché in quello del supervisore (`purpose: audit`); `reviewer` (`claude` / `gpt`) sceglie la famiglia preferita |
+| `review_changes` | review indipendente di un branch, una pull request o del lavoro locale rispetto a `base` (default: upstream, `origin/HEAD`, `main` o `master`), con `focus` per l'intento; i diff grandi sono divisi in parti riviste in parallelo, i problemi MAJOR verificati da un secondo modello, e al supervisore arriva solo la lista unita dei problemi; una review successiva dello stesso branch controlla i problemi già segnalati e rivede solo ciò che è cambiato nel frattempo (`full: true` rivede tutto) |
 | `run_verification` | un comando autorizzato di test, typecheck, lint o build non già coperto da `VERIFY` |
 | `code_outline` | funzioni, classi, metodi, tipi e test dei file sorgente (titoli per il Markdown) con i loro intervalli di righe, così il supervisore legge solo gli intervalli che servono; con `references`, dove è usato un simbolo e quale funzione contiene ogni uso; deterministico, senza chiamate a modelli |
 | `record_lesson` | un'insidia duratura del repository per i worker futuri |
@@ -478,6 +491,10 @@ Se scegli un modello a mano, la selezione del supervisore diventa `manual` (il f
 | `workerCommand`, `piCommand`, `piWorkerTools`, `piReadOnlyTools`, `worker*`, `claudeReadOnly*` | CLI e permessi degli strumenti |
 | `repoRulesFiles`, `minImplementationGuideChars`, `maxDiffBytes`, `maxOutputBytes`, `reviewMaxTokens`, `maxProcessOutputBytes` | prompt e limiti di output |
 | `outputLimits` | limiti per tool su ciò che entra nel contesto del supervisore: output di `run_verification` riuscito o fallito, consulenze e review, report del worker, `code_outline` |
+| `contextPruning` | `enabled`, `minResultBytes` (i risultati più piccoli dei task accettati restano), `minTotalBytes` (le modifiche si applicano solo se fanno risparmiare almeno questo, perché ogni gruppo costa un mancato uso della cache del prompt) |
+| `reviewConcurrency`, `reviewMaxShards`, `auditShardBytes`, `auditMaxShards` | revisori in parallelo; parti di un diff di `review_changes` (ciascuna fino a `maxDiffBytes`); sorgente per consulente di audit e numero di consulenti |
+| `reviewWholeFilesBytes`, `reviewContextBytes` | file modificati interi per il revisore API fino a questa dimensione (oltre, fino a 250 KB, il codice attorno alle modifiche e la struttura dei file grandi); codice attorno alle modifiche e usi delle dichiarazioni modificate dati a ogni revisore |
+| `workerCodeMapBytes` | mappa dei file autorizzati grandi data ai worker nuovi (0 la disattiva) |
 | `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `supervisorTools`, `contextWarningPercent` | comportamento del supervisore |
 
 ## Dati e privacy
@@ -509,6 +526,9 @@ I test non chiamano mai un modello reale: eseguono la vera estensione contro CLI
 | `learning.ts` | esiti, calibrazione dell'effort, lezioni, verdetti, estrazione di `VERIFY` |
 | `routing.ts` | assessment del task, escalation, ordinamento basato su evidenze |
 | `changes.ts` | checkpoint e diff per singola delega |
+| `outline.ts` | strutture e riferimenti deterministici |
+| `review.ts` | materiale di review, formato dei problemi, unione, parti |
+| `pruning.ts` | alleggerimento del contesto del supervisore |
 | `config.json` | configurazione di default |
 | `CHANGELOG.md` | note di rilascio |
 

@@ -349,3 +349,225 @@ test("a guide without SYMBOLS/PRESERVE is completed with safe defaults instead o
 	assert.match(calls()[0].prompt, /PRESERVE:\n- Existing public API/);
 	assert.match(result.content[0].text, /DIFF \(this delegation only\)[\s\S]*-old[\s\S]*\+x/, "the supervisor sees the diff without extra turns");
 });
+
+function commitAll(repo: string): void {
+	execFileSync("git", ["add", "-A"], { cwd: repo, stdio: "pipe" });
+	execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "change"], { cwd: repo, stdio: "pipe" });
+}
+
+test("review_changes reviews a branch without the supervisor reading its diff; a rejected MAJOR finding is set apart", async () => {
+	configure({}, {
+		"claude-opus-5-5": [{ text: "- [MAJOR] src/lib.ts:1 — callers pass one argument — keep the old signature\n- [MINOR] src/lib.ts:2 — magic number — name it\nRisk: no test for factor\nVERDICT: MAJOR" }],
+		"gpt-5.5": [{ text: "#1 REJECTED — factor has a default, so one-argument callers still work" }],
+	});
+	const repo = makeRepo({ "src/lib.ts": "export function scale(value: number) {\n\treturn value * 2;\n}\n", "src/use.ts": "import { scale } from \"./lib.ts\";\nexport const doubled = scale(3);\n" });
+	fs.writeFileSync(path.join(repo, "src/lib.ts"), "export function scale(value: number, factor = 2) {\n\treturn value * factor;\n}\n");
+	commitAll(repo);
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("review_changes", { base: "HEAD~1", focus: "Make the factor configurable" });
+	assert.equal(result.isError, false, result.content[0].text);
+	const [review, verification] = calls();
+	assert.equal(review.model, "claude-opus-5-5");
+	assert.equal(review.tools, "Read,Glob,Grep", "reviewers are read-only");
+	assert.match(review.prompt, /Intent and focus: Make the factor configurable/);
+	assert.match(review.prompt, /\+export function scale\(value: number, factor = 2\)/);
+	assert.match(review.prompt, /USES OF THE DECLARATIONS THE CHANGE TOUCHES[\s\S]*src\/use\.ts/, "callers of the changed signature are given");
+	assert.match(review.prompt, /- \[MAJOR\] path\/to\/file\.ext:LINE/, "reviewers are asked for one line per finding");
+	assert.equal(verification.model, "gpt-5.5", "the other family verifies MAJOR findings");
+	assert.match(verification.prompt, /CITED CODE[\s\S]*src\/lib\.ts:1-3/);
+	const text = result.content[0].text;
+	assert.match(text, /Verdict: MINOR/);
+	assert.match(text, /\[MINOR\] src\/lib\.ts:2 — magic number/);
+	assert.match(text, /Rejected by verification[\s\S]*callers pass one argument — keep the old signature — rejected: factor has a default/);
+	assert.match(text, /Risks:\n- no test for factor/);
+	assert.equal(result.details.verdict, "minor");
+});
+
+test("review_changes splits a large change into parts reviewed by alternating families, or asks for narrower paths", async () => {
+	const plan = { "claude-opus-5-5": [{ text: "No findings.\nVERDICT: PASS" }], "gpt-5.5": [{ text: "No findings.\nVERDICT: PASS" }] };
+	configure({ maxDiffBytes: 128, reviewConcurrency: 1 }, plan);
+	const repo = makeRepo({ "front/app.ts": "export const a = 1;\n", "back/api.ts": "export const b = 1;\n" });
+	fs.writeFileSync(path.join(repo, "front/app.ts"), "export const a = 2;\n");
+	fs.writeFileSync(path.join(repo, "back/api.ts"), "export const b = 2;\n");
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("review_changes", { base: "HEAD" });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(result.details.parts, 2);
+	const reviews = calls();
+	assert.deepEqual(reviews.map((item) => item.model).sort(), ["claude-opus-5-5", "gpt-5.5"]);
+	assert.ok(reviews.every((item) => /This is part [12] of 2/.test(item.prompt)));
+	assert.match(result.content[0].text, /2 parts reviewed in parallel[\s\S]*Verdict: PASS/);
+	configure({ maxDiffBytes: 128, reviewMaxShards: 1 }, plan);
+	const narrow = makeHost(repo);
+	await narrow.on();
+	await assert.rejects(narrow.call("review_changes", { base: "HEAD" }), /too large for one review[\s\S]*- (back|front): 1 file/);
+});
+
+test("a later review of the same branch checks earlier findings and reviews only what changed since; rounds are bounded", async () => {
+	const reply = { text: "- [MINOR] a.ts:1 — vague name — rename it\nVERDICT: MINOR" };
+	configure({}, { "claude-opus-5-5": [reply, reply, reply, reply] });
+	const repo = makeRepo({ "a.ts": "export const a = 1;\n", "b.ts": "export const b = 1;\n" });
+	fs.writeFileSync(path.join(repo, "a.ts"), "export const a = 2;\n");
+	fs.writeFileSync(path.join(repo, "b.ts"), "export const b = 2;\n");
+	const host = makeHost(repo);
+	await host.on();
+	const first = await host.call("review_changes", { base: "HEAD" });
+	assert.equal(first.details.reviewCount, 1);
+	const unchanged = await host.call("review_changes", { base: "HEAD" });
+	assert.match(unchanged.content[0].text, /No changes since review 1 of this branch; its findings stand:\n- \[MINOR\] a\.ts:1 — vague name/);
+	assert.equal(calls().length, 1, "nothing to review: no model call");
+	fs.writeFileSync(path.join(repo, "b.ts"), "export const b = 3;\n");
+	const second = await host.call("review_changes", { base: "HEAD" });
+	const followUp = calls()[1].prompt;
+	assert.match(followUp, /was reviewed before, and these findings were reported:\n- \[MINOR\] a\.ts:1 — vague name/);
+	assert.match(followUp, /-export const b = 2;\n\+export const b = 3;/, "only the change since the last review");
+	assert.doesNotMatch(followUp, /export const a = 2/);
+	assert.match(second.content[0].text, /^Follow-up review 2/);
+	assert.doesNotMatch(second.content[0].text, /CONVERGENCE/);
+	fs.writeFileSync(path.join(repo, "b.ts"), "export const b = 4;\n");
+	const third = await host.call("review_changes", { base: "HEAD" });
+	assert.match(third.content[0].text, /CONVERGENCE: this branch has now been reviewed 3 times/);
+	const full = await host.call("review_changes", { base: "HEAD", full: true });
+	assert.match(calls()[3].prompt, /Review the changes against HEAD[\s\S]*\+export const a = 2;[\s\S]*\+export const b = 4;/);
+	assert.equal(full.details.followUp, false);
+});
+
+test("an audit larger than one consultant should hold is split by directory and merged into one verified list", async () => {
+	configure({ auditShardBytes: 128, reviewConcurrency: 1 }, {
+		"claude-opus-5-5": [{ text: "- [MAJOR] a/x.ts:1 — unchecked input — validate it\n- [MAJOR] a/x.ts:2 — NaN passes — reject it" }],
+		"gpt-5.5": [{ text: "- [MINOR] b/y.ts:2 — duplicated logic — share it" }, { text: "#1 CONFIRMED — the input reaches the query unchecked\n#2 MINOR — only reachable from tests" }],
+	});
+	const body = (name: string) => `export function ${name}(input: string) {\n\treturn input;\n}\n// ${"padding ".repeat(20)}\n`;
+	const host = makeHost(makeRepo({ "a/x.ts": body("x"), "b/y.ts": body("y"), "AGENTS.md": "Validate every external input.\n" }));
+	await host.on();
+	const result = await host.call("consult_readonly", { purpose: "audit", question: "Find input validation bugs", paths: ["a", "b"] });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(result.details.parts, 2);
+	const [first, second] = calls();
+	assert.match(first.prompt, /Relevant paths:\n- a\n/);
+	assert.doesNotMatch(first.prompt, /\n- b\n/, "each consultant holds only its part");
+	assert.match(second.prompt, /Relevant paths:\n- b\n/);
+	assert.match(first.prompt, /REPOSITORY RULES \(judge the code against them\)\n\[AGENTS\.md\]\nValidate every external input\./, "consultants judge against the repository rules");
+	const text = result.content[0].text;
+	assert.match(text, /Findings \(1 MAJOR, 2 MINOR\)/);
+	assert.match(text, /- \[MAJOR\] \(confirmed\) a\/x\.ts:1 — unchecked input/);
+	assert.match(text, /- \[MINOR\] \(downgraded\) a\/x\.ts:2 — NaN passes/, "a real but immaterial finding is downgraded by the verifier");
+	assert.match(text, /- \[MINOR\] b\/y\.ts:2 — duplicated logic/);
+});
+
+test("a fresh worker gets a code map of large authorized files: outline ranges and uses of the named symbols", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "big.ts": "changed\n" } }] });
+	const filler = Array.from({ length: 260 }, (_, index) => `\tstep(${index});`).join("\n");
+	const big = `export function alpha() {\n${filler}\n}\n\nexport function beta() {\n${filler}\n}\n`;
+	const host = makeHost(makeRepo({ "big.ts": big, "caller.ts": "import { beta } from \"./big.ts\";\nbeta();\n", "small.ts": "export const s = 1;\n" }));
+	await host.on();
+	const withSymbol = guide(["big.ts", "small.ts"]).replace("SYMBOLS: none (plain files used by the integration test)", "SYMBOLS: beta, the second function of big.ts (alpha stays untouched)");
+	await host.call("delegate_implementation", { task: "Change beta", profile: "medium", implementationGuide: withSymbol, allowedPaths: ["big.ts", "small.ts"] });
+	const prompt = calls()[0].prompt;
+	assert.match(prompt, /CODE MAP[\s\S]*big\.ts \(525 lines\)[\s\S]*264-525\s+export function beta\(\)/);
+	assert.match(prompt, /Uses of the declarations named in the guide[\s\S]*caller\.ts/);
+	assert.doesNotMatch(prompt, /small\.ts \(/, "small files are read whole: no map");
+});
+
+test("above reviewWholeFilesBytes the API reviewer gets the code around the change and outlines, not whole large files", async () => {
+	const fn = (name: string, marker: string) => `export function ${name}() {\n${Array.from({ length: 100 }, (_, index) => `\tstep("${marker}-${index}");`).join("\n")}\n}\n`;
+	const before = ["one", "two", "three", "four", "five"].map((name) => fn(name, name)).join("\n");
+	const after = before.replace('step("three-50");', 'step("three-50-changed");');
+	configure(
+		{ independentReviewProfiles: ["critical"], reviewWholeFilesBytes: 1000, reviewApi: { provider: "openai-codex", model: "gpt-5.5", reasoning: "high" }, workerChains: { ...baseConfig.workerChains, critical: [{ worker: "claude", model: "fake-opus", effort: "xhigh" }, { worker: "pi", provider: "openai-codex", model: "gpt-5.5", effort: "xhigh" }] } },
+		{ "fake-opus": [{ write: { "big.ts": after } }] },
+	);
+	const host = makeHost(makeRepo({ "big.ts": before }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "Change three", profile: "critical", implementationGuide: guide(["big.ts"]), allowedPaths: ["big.ts"] });
+	assert.equal(host.apiCalls.length, 1, result.content[0].text);
+	const content = host.apiCalls[0].content;
+	assert.match(content, /CODE AROUND THE CHANGES[\s\S]*big\.ts:207-308\n207\| export function three\(\)/, "the whole changed function");
+	assert.match(content, /three: no references/, "uses exclude the changed declaration's own body");
+	assert.match(content, /=== big\.ts \(outline only: \d+ lines/);
+	assert.doesNotMatch(content, /step\("one-50"\)/, "code far from the change is not sent");
+});
+
+test("a guide describing the change on each FILE line is accepted without a CHANGES header", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "x.txt": "x\n" } }] });
+	const host = makeHost(makeRepo({ "x.txt": "old\n" }));
+	await host.on();
+	const perFile = "FILE: x.txt: replace the whole content with one single line holding only the letter x, keeping the trailing newline; this guide is deliberately long enough to pass the minimum guide length of the medium profile, which asks for four hundred characters of structured guidance before any worker may start working on the requested change in this small test repository.\nPRESERVE: everything else.\nVERIFY: read the file back.";
+	const result = await host.call("delegate_implementation", { task: "Rewrite x.txt", profile: "medium", implementationGuide: perFile, allowedPaths: ["x.txt"] });
+	assert.equal(result.isError, false, result.content[0].text);
+	await assert.rejects(host.call("delegate_implementation", { task: "Rewrite x.txt", profile: "medium", implementationGuide: `FILE: x.txt\n${"PRESERVE: everything else. ".repeat(20)}\nVERIFY: read it.`, allowedPaths: ["x.txt"] }), /missing required sections: CHANGE/);
+});
+
+test("a one-paragraph guide is split into sections, its VERIFY runs, and unnamed authorized paths are listed for the worker", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok", "extra.txt": "extra\n" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK }));
+	await host.on();
+	const paragraph = "FILE: extra.txt. SYMBOLS: none, it is a plain text file created by this change. CHANGE/CHANGES: create extra.txt with a single line that says extra, and keep value.txt exactly as it is so that the existing test keeps passing; this sentence deliberately pads the guide beyond the medium minimum of four hundred characters of guidance. PRESERVE: value.txt, its test and every other file in the repository. VERIFY: node --test.";
+	const result = await host.call("delegate_implementation", { task: "Add extra.txt", profile: "medium", implementationGuide: paragraph, allowedPaths: ["extra.txt", "notes.txt"] });
+	assert.equal(result.isError, false, result.content[0].text);
+	assert.equal(result.details.verification, "passed", "VERIFY: node --test. runs node --test");
+	const prompt = calls()[0].prompt;
+	assert.match(prompt, /FILE: extra\.txt\.\nSYMBOLS: none[\s\S]*\nCHANGE\/CHANGES: create[\s\S]*\nVERIFY: node --test\./);
+	assert.match(prompt, /ALSO AUTHORIZED \(edit only if the change requires it\): notes\.txt/);
+});
+
+test("supervisor_git does not send again a diff the delegation result already showed whole", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "x.txt": "new\n" } }] });
+	const repo = makeRepo({ "x.txt": "old\n" });
+	const host = makeHost(repo);
+	await host.on();
+	await host.call("delegate_implementation", { task: "Rewrite x.txt", profile: "medium", implementationGuide: guide(["x.txt"]), allowedPaths: ["x.txt"] });
+	const again = await host.call("supervisor_git", { action: "diff", paths: ["x.txt"], unifiedLines: 5 });
+	assert.match(again.content[0].text, /No change since the delegation results of this task/);
+	assert.equal(again.details.alreadyShown, true);
+	const wider = await host.call("supervisor_git", { action: "diff", paths: ["x.txt"], unifiedLines: 20 });
+	assert.match(wider.content[0].text, /\+new/, "more context is still available on request");
+	// A later step of the same task on another file: both diffs were shown whole, by different results.
+	configure({}, { "claude-sonnet-5": [{ write: { "y.txt": "why\n" } }] });
+	await host.call("delegate_implementation", { task: "Add y.txt", profile: "medium", continuePrevious: true, implementationGuide: guide(["y.txt"]), allowedPaths: ["y.txt"] });
+	assert.equal((await host.call("supervisor_git", { action: "diff" })).details.alreadyShown, true);
+	fs.writeFileSync(path.join(repo, "x.txt"), "edited by hand\n");
+	const changed = await host.call("supervisor_git", { action: "diff" });
+	assert.match(changed.content[0].text, /\+edited by hand/, "a file that changed is diffed again");
+	fs.writeFileSync(path.join(repo, "x.txt"), "new\n");
+	assert.equal((await host.call("supervisor_git", { action: "diff", paths: ["x.txt"] })).details.alreadyShown, true);
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed both steps and their diffs." });
+	const afterAccept = await host.call("supervisor_git", { action: "diff", paths: ["x.txt"] });
+	assert.match(afterAccept.content[0].text, /\+new/, "once the task is accepted its results may be pruned: the diff is sent again");
+});
+
+test("a delegation diff over the result's diff budget is reported as incomplete, and supervisor_git still sends it", async () => {
+	const big = Array.from({ length: 1800 }, (_, index) => `line ${index} ${"x".repeat(10)}`).join("\n");
+	configure({}, { "claude-sonnet-5": [{ write: { "x.txt": `${big}\n` } }] });
+	const host = makeHost(makeRepo({ "x.txt": "old\n" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "Rewrite x.txt", profile: "medium", implementationGuide: guide(["x.txt"]), allowedPaths: ["x.txt"] });
+	assert.match(result.content[0].text, /DIFF: incomplete; inspect with supervisor_git\. Changed paths: x\.txt\./);
+	assert.doesNotMatch(result.content[0].text, /omitted to keep this result within maxOutputBytes/);
+	const diff = await host.call("supervisor_git", { action: "diff", paths: ["x.txt"] });
+	assert.match(diff.content[0].text, /\+line 1799/);
+});
+
+test("after an accepted task, the end of the run replaces its bulky tool results with short notes", async () => {
+	configure({ contextPruning: { enabled: true, minResultBytes: 1500, minTotalBytes: 1000 } }, {});
+	const host = makeHost(makeRepo({}));
+	await host.on();
+	const entry = (id: string, message: any) => ({ sourceEntry: { id, type: "message" }, messages: [message] });
+	const contextEntries = [
+		entry("u1", { role: "user", content: "fix it" }),
+		entry("a1", { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "x.ts" } }] }),
+		entry("t1", { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "x".repeat(6000) }] }),
+		entry("t2", { role: "toolResult", toolCallId: "c2", toolName: "delegate_implementation", content: [{ type: "text", text: "done" }], details: { taskPacketId: "T" } }),
+		entry("t3", { role: "toolResult", toolCallId: "c3", toolName: "complete_task", content: [{ type: "text", text: "Task accepted and completed." }], details: { taskId: "T", accepted: true } }),
+	];
+	const settle = host.handlers.get("agent_before_settle");
+	const pruned = await settle({ outcome: "completed", context: { contextEntries } }, host.ctx);
+	assert.deepEqual(pruned.entries.map((item: any) => [item.type, item.targetId]), [["context_edit", "t1"]]);
+	assert.match(pruned.entries[0].replacement.content[0].text, /^\[pruned\] Read of x\.ts omitted after its task was accepted/);
+	configure({ contextPruning: { enabled: false } }, {});
+	const off = makeHost(makeRepo({}));
+	await off.on();
+	assert.equal(await off.handlers.get("agent_before_settle")({ outcome: "completed", context: { contextEntries } }, off.ctx), undefined);
+});
