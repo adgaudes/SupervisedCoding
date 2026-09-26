@@ -67,6 +67,17 @@ function makeRepo(files: Record<string, string>): string {
 	return repo;
 }
 
+/**
+ * The learning key of a repository, normalized exactly as the extension's repoKey does: the Git root with forward
+ * slashes, case-folded only on Windows. Lower-casing it everywhere hid the seeded outcomes on Linux and macOS, where
+ * paths are case-sensitive, so this only ever worked on Windows.
+ */
+function learningRepoKey(repo: string): string {
+	const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, encoding: "utf8" }).trim();
+	const normalized = path.resolve(root).replace(/\\/g, "/");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
 function makeHost(repo: string) {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
@@ -258,7 +269,7 @@ test("repository rules and recorded lessons reach every fresh worker", async () 
 test("repeated poor outcomes raise the worker effort for that profile and model", async () => {
 	fs.mkdirSync(path.dirname(dataFile), { recursive: true });
 	const repo = makeRepo({ "value.txt": "ok", "value.test.mjs": PASSING_CHECK });
-	const poor = { evidenceVersion: 2, taskKind: "general", at: Date.now(), repo: repo.replace(/\\/g, "/").toLowerCase(), taskId: "seed", profile: "medium", worker: "claude", model: "claude-sonnet-5", effort: "high", verification: "failed", correctionRounds: 2, review: "none", failed: true, tokens: 0, costUsd: 0 };
+	const poor = { evidenceVersion: 2, taskKind: "general", at: Date.now(), repo: learningRepoKey(repo), taskId: "seed", profile: "medium", worker: "claude", model: "claude-sonnet-5", effort: "high", verification: "failed", correctionRounds: 2, review: "none", failed: true, tokens: 0, costUsd: 0 };
 	fs.writeFileSync(dataFile, JSON.stringify({ version: 1, outcomes: [0,1,2].map(i => ({...poor, taskId: "seed-" + i})), lessons: [], effortAdjustments: {} }));
 	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "value.txt": "broken" } }, { write: { "other.txt": "x\n" } }] });
 	const host = makeHost(repo);
