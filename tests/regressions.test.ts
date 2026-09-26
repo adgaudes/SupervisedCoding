@@ -1516,7 +1516,7 @@ test("ASSESSMENT: a consequential path declared as low risk is questioned once, 
 	assert.equal(questioned.details.delegated, false);
 	assert.equal(questioned.details.suspectedKind, "security");
 	assert.deepEqual(calls(), [], "nothing is spent while the assessment is in doubt");
-	assert.match(questioned.content[0].text, /reads as security work[\s\S]*declares risk low/);
+	assert.match(questioned.content[0].text, /reads as security work[\s\S]*keeps this task at the medium profile/);
 	// Questioned once only: the same call again runs, so no supervisor can be trapped in a loop.
 	const second = await host.call("delegate_implementation", { ...args, assessment: optimistic });
 	assert.notEqual(second.isError, true, second.content[0].text);
@@ -1525,7 +1525,6 @@ test("ASSESSMENT: a consequential path declared as low risk is questioned once, 
 
 test("ASSESSMENT: a declared risk, or a path that only looks sensitive, delegates straight away", async () => {
 	for (const [name, files, params] of [
-		["the risk is declared", { "src/auth/login.ts": "old" }, { allowedPaths: ["src/auth/login.ts"], assessment: { kind: "feature", risk: "medium", uncertainty: "low", scope: "local" } }],
 		["the kind is declared", { "src/auth/login.ts": "old" }, { allowedPaths: ["src/auth/login.ts"], assessment: { kind: "security", risk: "low", uncertainty: "low", scope: "local" } }],
 		["author.ts is not authentication", { "src/author.ts": "old" }, { allowedPaths: ["src/author.ts"], assessment: { kind: "feature", risk: "low", uncertainty: "low", scope: "local" } }],
 	] as Array<[string, Record<string, string>, any]>) {
@@ -1552,4 +1551,75 @@ test("REPO RULES: a nested instruction file is found whatever spelling of the pa
 	const prompt = calls()[0].prompt;
 	assert.match(prompt, /REPOSITORY RULES[\s\S]*Root rule[\s\S]*Package rule: keep exports sorted/);
 	assert.doesNotMatch(prompt, /\.\.[\\/]\.\./, "no rule is labelled through a detour out of the repository");
+});
+
+/** A guide without a SYMBOLS section: validateImplementationGuide adds one of its own, which the gate must not read. */
+const noSymbolsGuide = (file: string) => [
+	`FILE: ${file}`,
+	"CHANGES:",
+	"- Apply the scripted change; the fake worker writes the file itself.",
+	"PRESERVE:",
+	"- Everything outside the listed file; this guide is padded to exceed the minimum guide length required by the medium and larger profiles, which ask for four hundred characters of structured guidance before any worker may start.",
+	"VERIFY:",
+	"- Read the file back.",
+].join("\n");
+
+test("TOKEN FLOOR: the refusal reads the guide the supervisor wrote, not the defaults added to it", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	// The guide names no symbols at all. The validated guide handed to the worker carries the default SYMBOLS line, and
+	// reading that back instead of this one made the whole refusal unreachable.
+	const refused = await host.call("delegate_implementation", { task: "drop the unused import", profile: "small", assessment: TINY, allowedPaths: ["a.txt"], implementationGuide: noSymbolsGuide("a.txt") });
+	assert.equal(refused.details.delegated, false, refused.content[0].text);
+	assert.deepEqual(calls(), [], "no worker is started");
+});
+
+test("ASSESSMENT: an omitted assessment is the default assessment, and is corroborated all the same", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old", "b.txt": "old" }));
+	await host.on();
+	// No assessment at all: the defaults are local scope and medium risk, which is exactly what the corroboration and
+	// the sensitive-path question must still see through.
+	const result = await host.call("delegate_implementation", { task: "change both", profile: "small", allowedPaths: ["a.txt", "b.txt"], implementationGuide: guide(["a.txt", "b.txt"]) });
+	assert.equal(result.details.profile, "medium", "two authorized paths are multi-file work even when nothing is declared");
+});
+
+test("ASSESSMENT: a sensitive path is questioned even when no risk was declared at all", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "db/migrations/004.sql": "new" } }] });
+	const host = makeHost(makeRepo({ "db/migrations/004.sql": "old" }));
+	await host.on();
+	const questioned = await host.call("delegate_implementation", { task: "adjust the migration", profile: "medium", allowedPaths: ["db/migrations/004.sql"], implementationGuide: guide(["db/migrations/004.sql"]) });
+	assert.equal(questioned.details.delegated, false, questioned.content[0].text);
+	assert.equal(questioned.details.suspectedKind, "migration");
+	assert.deepEqual(calls(), [], "nothing is spent while the assessment is in doubt");
+});
+
+test("DIRECT CHANGE: a check that ran before a later edit is not evidence for it", async () => {
+	configure({}, {});
+	const repo = makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK });
+	const host = makeHost(repo);
+	await host.on();
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	// The supervisor edits after its check: the recorded result says nothing about the code as it stands now.
+	fs.writeFileSync(path.join(repo, "value.txt"), "changed after the check");
+	await assert.rejects(
+		host.call("complete_task", { decision: "accept", summary: "Edited after running the check." }),
+		/ran on code you have since changed/,
+	);
+	// Running it again on the current code restores the evidence.
+	await host.call("run_verification", { command: "node --test check.test.mjs" }).catch(() => undefined);
+	fs.writeFileSync(path.join(repo, "value.txt"), "ok");
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "Checked the current code." });
+	assert.equal(accepted.details.accepted, true);
+});
+
+test("DIRECT CHANGE: acceptance does not depend on the check-reuse cache being on", async () => {
+	configure({ reuseChecks: false }, {});
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "Ran the check with reuse disabled." });
+	assert.equal(accepted.details.accepted, true, "reuse is an optimisation; it is not where the evidence lives");
 });

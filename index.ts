@@ -1468,6 +1468,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	const checkResults = new Map<string, { cwd: string; promptSeq: number; fingerprint: string; result: CheckResult }>();
 	/** Path sets already questioned for an optimistic assessment: each is questioned once, so no call can loop. */
 	const assessmentQuestioned = new Set<string>();
+	/**
+	 * Checks the supervisor ran itself, with the working tree they ran on. Kept apart from checkResults, which exists
+	 * for reuse and therefore holds nothing when reuse is off, and which forgets a check that failed to leave the tree
+	 * untouched. Acceptance of a change the supervisor made itself rests on these, so they must survive both.
+	 */
+	const ownChecks: Array<{ cwd: string; promptSeq: number; fingerprint: string | undefined; command: string; ok: boolean }> = [];
 
 	function checkReuseEnabled(): boolean {
 		return config.reuseChecks && !config.supervisorTools.includes("bash");
@@ -2316,15 +2322,30 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			// and no per-delegation review. Its checks are the whole evidence there is, so acceptance requires them.
 			if (!openTask()) {
 				if (!taskPacket && params.decision === "pause") throw new Error("No supervised task to pause.");
-				const own = [...checkResults.values()].filter((item) => item.cwd === ctx.cwd && item.promptSeq === promptSeq);
-				const failing = own.filter((item) => !item.result.ok).map((item) => item.result.command);
+				const fingerprint = await workingTreeFingerprint(ctx.cwd);
+				const mine = ownChecks.filter((item) => item.cwd === ctx.cwd && item.promptSeq === promptSeq);
+				// Only what was run on the code as it stands counts: a result from before a later edit is neither proof
+				// nor a blocker, it is stale and has to be run again. Outside a Git repository neither side has a
+				// fingerprint and nothing can tell the two apart, so the check counts, as everywhere else the extension
+				// degrades when Git is unavailable. One verdict per command, the last one, so a failure that was then
+				// fixed and re-run on the same code does not block for the rest of the prompt.
+				const current = new Map<string, boolean>();
+				for (const item of mine) {
+					if (item.fingerprint === undefined || fingerprint === undefined || item.fingerprint === fingerprint) current.set(item.command, item.ok);
+				}
+				const failing = [...current].filter(([, ok]) => !ok).map(([command]) => command);
 				if (failing.length) throw new Error(`Cannot accept a change of your own while ${failing.join(", ")} fails: fix it and run the check again.`);
-				if (!own.length) throw new Error("Nothing to accept: no task is open and no check of yours ran in this prompt. Run the project's checks with run_verification first, or delegate the change.");
+				const own = [...current.keys()];
+				if (!own.length) {
+					throw new Error(mine.length
+						? `Cannot accept: ${[...new Set(mine.map((item) => item.command))].join(", ")} ran on code you have since changed. Run the checks again on the current code, then accept.`
+						: "Nothing to accept: no task is open and no check of yours ran in this prompt. Run the project's checks with run_verification first, or delegate the change.");
+				}
 				supervisorFlagshipGrant = undefined;
 				carriedTaskId = undefined;
 				applySupervisorEffort();
 				persist(); updateStatus(ctx);
-				return { content: [{ type: "text", text: `Change of your own accepted on its checks: ${own.map((item) => item.result.command).join(", ")}. No delegation was involved, so nothing was recorded for worker learning.` }], details: { decision: params.decision, accepted: true, direct: true, checks: own.map((item) => item.result.command) } };
+				return { content: [{ type: "text", text: `Change of your own accepted on its checks: ${own.join(", ")}. No delegation was involved, so nothing was recorded for worker learning.` }], details: { decision: params.decision, accepted: true, direct: true, checks: own } };
 			}
 			if (!taskPacket) throw new Error("No supervised task to complete.");
 			let taskReview = "";
@@ -2724,7 +2745,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 	function tinyDelegation(cwd: string, assessment: TaskAssessment | undefined, profile: ExecutionProfileName, allowedPaths: string[], guide: string, continuePrevious: boolean): { bytes: number; path: string } | undefined {
 		if (!config.tinyDelegationBytes || continuePrevious || profile !== "small" || allowedPaths.length !== 1) return undefined;
 		if (!assessment || !["mechanical", "docs"].includes(assessment.kind) || assessment.risk !== "low" || assessment.scope !== "local") return undefined;
-		if (/^\s*(?:#{1,6}\s*)?\**\s*SYMBOLS?\s*\**\s*:\s*\S/im.test(guide) && !/SYMBOLS?\s*:\s*(?:none|n\/a|-)\b/i.test(guide)) return undefined;
+		// The guide as the supervisor wrote it: validateImplementationGuide adds a SYMBOLS line of its own when the
+		// section is missing, and reading that back would make "no symbols to study" impossible to satisfy.
+		if (namedSymbols(guide)) return undefined;
 		const target = path.resolve(cwd, allowedPaths[0]);
 		let bytes = 0;
 		try {
@@ -2755,6 +2778,20 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return undefined;
 	}
 
+	/** Whether a guide names symbols to study: its SYMBOLS section exists and says more than "none". */
+	function namedSymbols(guide: string): boolean {
+		const lines = guide.split(/\r?\n/);
+		const start = lines.findIndex((line) => /^\s*(?:#{1,6}\s*)?\**\s*SYMBOLS?\s*\**\s*:/i.test(line));
+		if (start < 0) return false;
+		const body = [lines[start].replace(/^[^:]*:/, "")];
+		for (const line of lines.slice(start + 1)) {
+			if (/^\s*(?:#{1,6}\s*)?\**\s*[A-Z][A-Z /]*\s*\**\s*:/.test(line)) break;
+			body.push(line);
+		}
+		const text = body.join(" ").replace(/^\s*[-*•]\s*/gm, "").trim();
+		return Boolean(text) && !/^(?:(?:none|n\/a|na|nothing)\b|[-–—]\s*$)/i.test(text);
+	}
+
 	async function executeDelegation(params: any, parentSignal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
 		if (delegationRunning) throw new Error('A delegation is already running; wait for its result.');
 		delegationRunning = true;
@@ -2775,7 +2812,16 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const declared = params.assessment ?? (belongsToTask ? previousTask?.assessment : undefined);
 			// The authorized paths corroborate the declared scope: several files are multi-file work whatever the guide
 			// says, so an optimistic assessment cannot walk under the profile floor. It only ever raises, like the floors.
-			const observed = allowedPaths.length > 1 && declared?.scope === "local" ? { ...declared, scope: "multi-file" as const } : declared;
+			// An omitted assessment, or an omitted scope, is the default scope ("local"): both must be corroborated, or
+			// the floor is skipped by saying nothing. One authorized directory is breadth too, whatever it holds today.
+			const breadth = allowedPaths.length > 1 || allowedPaths.some((item) => {
+				try {
+					return fs.statSync(path.resolve(ctx.cwd, item)).isDirectory();
+				} catch {
+					return false;
+				}
+			});
+			const observed = breadth && (declared?.scope ?? "local") === "local" ? { ...declared, scope: "multi-file" as const } : declared;
 			const assessed = assessTask(params.profile ?? (belongsToTask ? previousTask?.profile : undefined) ?? config.defaultExecutionProfile, observed);
 			const profileName = assessed.profile;
 			const { guide: implementationGuide } = validateImplementationGuide(params.implementationGuide, allowedPaths, config.minImplementationGuideChars[profileName]);
@@ -2784,15 +2830,17 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			// it just refuses to take "low risk" on such a path without the supervisor saying so deliberately.
 			const suspected = sensitiveKind(allowedPaths);
 			const questionKey = `${taskPacket?.id ?? "none"}:${allowedPaths.join(",")}`;
-			if (suspected && assessed.assessment.risk === "low" && !["security", "concurrency", "migration"].includes(assessed.assessment.kind) && !assessmentQuestioned.has(questionKey)) {
+			// Not conditioned on the declared risk: an omitted assessment defaults to medium risk, which would have let
+			// exactly the optimistic case through. Below critical, and not already declared consequential, is enough.
+			if (suspected && profileName !== "critical" && !["security", "concurrency", "migration"].includes(assessed.assessment.kind) && !assessmentQuestioned.has(questionKey)) {
 				assessmentQuestioned.add(questionKey);
 				return {
-					content: [{ type: "text", text: `Delegation not started: the assessment looks optimistic for these paths.\n${suspected.path} reads as ${suspected.kind} work, and the assessment declares risk low with kind ${assessed.assessment.kind}. Judge it again: if this change really touches ${suspected.kind}-sensitive behaviour, say so through kind and risk, because that decides the profile, the reviewer and the effort. If it does not, and the path only happens to be named that way, delegate again with the assessment you stand behind and it will run.` }],
+					content: [{ type: "text", text: `Delegation not started: the assessment looks optimistic for these paths.\n${suspected.path} reads as ${suspected.kind} work, while the assessment says kind ${assessed.assessment.kind} with risk ${assessed.assessment.risk}, which keeps this task at the ${profileName} profile. Judge it again: if this change really touches ${suspected.kind}-sensitive behaviour, say so through kind and risk, because that decides the profile, the reviewer and the effort. If it does not, and the path only happens to be named that way, delegate again with the assessment you stand behind and it will run.` }],
 					details: { profile: profileName, taskPacketId: taskPacket?.id, delegated: false, reason: "optimistic assessment on sensitive paths", suspectedKind: suspected.kind, path: suspected.path },
 					isError: true,
 				};
 			}
-			const tiny = params.delegateAnyway ? undefined : tinyDelegation(ctx.cwd, assessed.assessment, profileName, allowedPaths, implementationGuide, Boolean(params.continuePrevious));
+			const tiny = params.delegateAnyway ? undefined : tinyDelegation(ctx.cwd, assessed.assessment, profileName, allowedPaths, params.implementationGuide, Boolean(params.continuePrevious));
 			if (tiny) {
 				learning = loadLearning(learningPath);
 				const floor = cheapestDelegationTokens(learning.outcomes, await repoKey(ctx.cwd));
@@ -3189,6 +3237,9 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const check = await runCheck(ctx, command, signal);
 			// Nothing ran: no result for the task, whatever its state.
 			if (check.launchError) throw new Error(`run_verification could not start ${command}: ${check.launchError}. Nothing was recorded for the task.`);
+			// Recorded with the tree it ran on, whatever reuse is configured: this is the only evidence a change the
+			// supervisor made itself can be accepted on, and it must not disappear when the check leaves files behind.
+			ownChecks.push({ cwd: ctx.cwd, promptSeq, fingerprint: await workingTreeFingerprint(ctx.cwd), command, ok: check.ok });
 			// A failure blocks acceptance of the open task, unless the check was already red when the task started and
 			// still fails the same way. A completed task is never reopened by a later check.
 			const open = openTask();
