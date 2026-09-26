@@ -302,6 +302,20 @@ export function lessonsFor(state: LearningState, repo: string, limit = MAX_LESSO
 		.slice(0, limit);
 }
 
+/**
+ * The cheapest delegation this repository has recorded: a delegation's floor, measured instead of assumed. The minimum
+ * of the recent window, not the mean, because the question it answers is "what does a delegation cost even when the
+ * change is trivial"; a mean would be dominated by the large refactors in the same log. Undefined until there is
+ * evidence, so the caller states a default instead of an invented number.
+ */
+export function cheapestDelegationTokens(outcomes: OutcomeRecord[], repo: string, window = 20, now = Date.now()): number | undefined {
+	const recent = outcomes
+		.filter((item) => item.repo === repo && item.tokens > 0 && now - item.at <= 90 * 86400_000)
+		.slice(-window)
+		.map((item) => item.tokens);
+	return recent.length ? Math.min(...recent) : undefined;
+}
+
 export function removeLesson(state: LearningState, id: string): boolean {
 	const before = state.lessons.length;
 	state.lessons = state.lessons.filter((item) => item.id !== id);

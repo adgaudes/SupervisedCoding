@@ -311,6 +311,7 @@
   "reviewWholeFilesBytes": 100000,
   "reviewContextBytes": 24000,
   "workerCodeMapBytes": 10000,
+  "tinyDelegationBytes": 8192,
   "supervisorProfiles": {},
   "probeTtlMinutes": 15,
   "probeMaxTokens": 128,

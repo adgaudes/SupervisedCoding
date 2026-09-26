@@ -1433,3 +1433,74 @@ test("DIRECT CHANGE: a failing check of its own blocks acceptance", async () => 
 		/Cannot accept a change of your own while node --test check\.test\.mjs fails/,
 	);
 });
+
+const TINY = { kind: "mechanical" as const, risk: "low" as const, uncertainty: "low" as const, scope: "local" as const };
+
+test("TOKEN FLOOR: a delegation smaller than its own cost is refused once, and the supervisor can still insist", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const refused = await host.call("delegate_implementation", { task: "drop the unused import", profile: "small", assessment: TINY, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(refused.isError, true);
+	assert.equal(refused.details.delegated, false);
+	assert.deepEqual(calls(), [], "no worker is started, so nothing is spent");
+	assert.match(refused.content[0].text, /Delegation not started: it would cost more than the change/);
+	assert.match(refused.content[0].text, /on the order of 100k tokens/, "with no evidence yet it states the default, not an invented number");
+	assert.match(refused.content[0].text, /Make it yourself with edit\/write/);
+	// The supervisor keeps the last word: it only has to say that the change needs a worker.
+	const anyway = await host.call("delegate_implementation", { task: "drop the unused import", profile: "small", assessment: TINY, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]), delegateAnyway: true });
+	assert.notEqual(anyway.isError, true, anyway.content[0].text);
+	assert.equal(calls().filter((call) => call.cli === "claude").length, 1);
+});
+
+test("TOKEN FLOOR: the refusal quotes the cheapest delegation this repository recorded", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old" });
+	const host = makeHost(repo);
+	await host.on();
+	// One real delegation first, so there is evidence to quote; its fake usage is 120 tokens.
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	const refused = await host.call("delegate_implementation", { task: "tiny follow-up", profile: "small", assessment: TINY, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.match(refused.content[0].text, /The cheapest delegation recorded in this repository still cost 120 tokens/);
+	assert.equal(refused.details.measuredFloorTokens, 120);
+});
+
+test("TOKEN FLOOR: only a genuinely tiny, mechanical, single-path change is questioned", async () => {
+	const big = "x".repeat(9000);
+	for (const [name, target, params] of [
+		["a big file is not a tiny change", "big.txt", { profile: "small", assessment: TINY, allowedPaths: ["big.txt"], implementationGuide: guide(["big.txt"]) }],
+		["two paths are not one small change", "a.txt", { profile: "small", assessment: TINY, allowedPaths: ["a.txt", "b.txt"], implementationGuide: guide(["a.txt", "b.txt"]) }],
+		["a feature is not mechanical", "a.txt", { profile: "small", assessment: { ...TINY, kind: "feature" }, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) }],
+		["risk keeps the worker", "a.txt", { profile: "small", assessment: { ...TINY, risk: "medium" }, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) }],
+		["a named symbol means code to study", "a.txt", { profile: "small", assessment: TINY, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]).replace("SYMBOLS: none (plain files used by the integration test)", "SYMBOLS: parseConfig") }],
+	] as Array<[string, string, any]>) {
+		configure({}, { "claude-sonnet-5": [{ write: { [target]: "done" } }] });
+		const host = makeHost(makeRepo({ "a.txt": "old", "b.txt": "old", "big.txt": big }));
+		await host.on();
+		const result = await host.call("delegate_implementation", { task: "change", ...params });
+		assert.doesNotMatch(result.content[0].text, /Delegation not started/, name);
+		assert.ok(calls().some((call) => call.cli === "claude"), `${name}: a worker must start`);
+	}
+});
+
+test("TOKEN FLOOR: tinyDelegationBytes 0 disables the check", async () => {
+	configure({ tinyDelegationBytes: 0 }, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "small", assessment: TINY, allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.notEqual(result.isError, true, result.content[0].text);
+});
+
+test("ASSESSMENT: several authorized paths are multi-file work, whatever the guide declares", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old", "b.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", {
+		task: "change both",
+		profile: "small",
+		assessment: { kind: "feature", risk: "low", uncertainty: "low", scope: "local" },
+		allowedPaths: ["a.txt", "b.txt"],
+		implementationGuide: guide(["a.txt", "b.txt"]),
+	});
+	assert.equal(result.details.profile, "medium", "the declared local scope cannot walk under the multi-file floor");
+});

@@ -8,6 +8,7 @@ import {
 	addLesson,
 	effectiveEffort,
 	emptyLearning,
+	cheapestDelegationTokens,
 	extractVerifyCommands,
 	failureSignature,
 	lessonsFor,
@@ -240,4 +241,16 @@ test("verification commands: an imperative introducing a bare command is dropped
 		assert.deepEqual(check(line), [], line);
 	}
 	assert.deepEqual(check("Run rm -rf dist"), [], "only an allowlisted command is ever derived");
+});
+
+test("the delegation floor is the cheapest delegation on record, not their mean", () => {
+	const at = NOW;
+	const record = (patch: Partial<OutcomeRecord>) => outcome({ at, repo: "r", ...patch });
+	const outcomes = [record({ tokens: 1_600_000 }), record({ tokens: 118_000 }), record({ tokens: 900_000 })];
+	assert.equal(cheapestDelegationTokens(outcomes, "r", 20, at), 118_000, "a mean would be dominated by the big refactors in the same log");
+	assert.equal(cheapestDelegationTokens(outcomes, "other", 20, at), undefined, "another repository is no evidence for this one");
+	assert.equal(cheapestDelegationTokens([], "r", 20, at), undefined, "no evidence yields no number to quote");
+	assert.equal(cheapestDelegationTokens([record({ tokens: 0 })], "r", 20, at), undefined, "an unmeasured delegation is not a floor of zero");
+	assert.equal(cheapestDelegationTokens([record({ tokens: 50_000, at: at - 200 * 86400_000 }), record({ tokens: 300_000 })], "r", 20, at), 300_000, "stale evidence is ignored");
+	assert.equal(cheapestDelegationTokens([record({ tokens: 10_000 }), record({ tokens: 400_000 })], "r", 1, at), 400_000, "only the recent window counts");
 });

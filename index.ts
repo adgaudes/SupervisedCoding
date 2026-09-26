@@ -30,6 +30,7 @@ import {
 import {
 	addLesson,
 	effectiveEffort,
+	cheapestDelegationTokens,
 	extractVerifyCommands,
 	failureSignature,
 	lessonsFor,
@@ -239,6 +240,8 @@ interface Config {
 	reviewContextBytes: number;
 	/** Outline and uses of the guide's symbols given to fresh workers for large files (0 disables it). */
 	workerCodeMapBytes: number;
+	/** A delegation whose only target is smaller than this, for a mechanical change, is questioned once. 0 disables the check. */
+	tinyDelegationBytes: number;
 }
 
 interface OutputLimits {
@@ -642,6 +645,7 @@ function loadConfig(): Config {
 		reviewWholeFilesBytes: raw.reviewWholeFilesBytes ?? 100_000,
 		reviewContextBytes: raw.reviewContextBytes ?? 24_000,
 		workerCodeMapBytes: raw.workerCodeMapBytes ?? 10_000,
+		tinyDelegationBytes: raw.tinyDelegationBytes ?? 8192,
 	};
 }
 
@@ -3046,6 +3050,31 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return { text: truncateUtf8Middle(text, config.outputLimits.consultBytes), verdict, failed: unavailable.length > 0 || violations.length > 0, usage, violations, reviewers, findings };
 	}
 
+	/**
+	 * Whether a delegation costs more than the change it carries. A worker re-reads its whole context on every turn, so
+	 * starting one has a floor of its own (measured by cheapestDelegationTokens) that a few lines of mechanical work can
+	 * never repay: the supervisor has edit/write for exactly this case. Deliberately a narrow conjunction, because the
+	 * one thing the extension cannot see is what the supervisor already holds in context, which is what really decides
+	 * the trade: a single small or not-yet-created target, one authorized path, a mechanical or documentation change at
+	 * the small profile, no symbols to study, and no session to continue. Everything else is left to the supervisor.
+	 */
+	function tinyDelegation(cwd: string, assessment: TaskAssessment | undefined, profile: ExecutionProfileName, allowedPaths: string[], guide: string, continuePrevious: boolean): { bytes: number; path: string } | undefined {
+		if (!config.tinyDelegationBytes || continuePrevious || profile !== "small" || allowedPaths.length !== 1) return undefined;
+		if (!assessment || !["mechanical", "docs"].includes(assessment.kind) || assessment.risk !== "low" || assessment.scope !== "local") return undefined;
+		if (/^\s*(?:#{1,6}\s*)?\**\s*SYMBOLS?\s*\**\s*:\s*\S/im.test(guide) && !/SYMBOLS?\s*:\s*(?:none|n\/a|-)\b/i.test(guide)) return undefined;
+		const target = path.resolve(cwd, allowedPaths[0]);
+		let bytes = 0;
+		try {
+			const stat = fs.statSync(target);
+			// A directory is never one small change, whatever its size.
+			if (stat.isDirectory()) return undefined;
+			bytes = stat.size;
+		} catch {
+			bytes = 0; // Not created yet: a new short file is the cheapest case of all.
+		}
+		return bytes <= config.tinyDelegationBytes ? { bytes, path: allowedPaths[0] } : undefined;
+	}
+
 	async function executeDelegation(params: any, parentSignal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
 		if (delegationRunning) throw new Error('A delegation is already running; wait for its result.');
 		delegationRunning = true;
@@ -3063,9 +3092,25 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			// Same task: another delegation of this prompt, a continuation, or unfinished work carried into this prompt
 			// (planned, or failed): a failed task must keep its baseline, or a fresh one would hide its regressions.
 			const belongsToTask = drivesThisPrompt(previousTask) || Boolean(params.continuePrevious) || previousTask?.phase === "planned";
-			const assessed = assessTask(params.profile ?? (belongsToTask ? previousTask?.profile : undefined) ?? config.defaultExecutionProfile, params.assessment ?? (belongsToTask ? previousTask?.assessment : undefined));
+			const declared = params.assessment ?? (belongsToTask ? previousTask?.assessment : undefined);
+			// The authorized paths corroborate the declared scope: several files are multi-file work whatever the guide
+			// says, so an optimistic assessment cannot walk under the profile floor. It only ever raises, like the floors.
+			const observed = allowedPaths.length > 1 && declared?.scope === "local" ? { ...declared, scope: "multi-file" as const } : declared;
+			const assessed = assessTask(params.profile ?? (belongsToTask ? previousTask?.profile : undefined) ?? config.defaultExecutionProfile, observed);
 			const profileName = assessed.profile;
 			const { guide: implementationGuide } = validateImplementationGuide(params.implementationGuide, allowedPaths, config.minImplementationGuideChars[profileName]);
+			const tiny = params.delegateAnyway ? undefined : tinyDelegation(ctx.cwd, assessed.assessment, profileName, allowedPaths, implementationGuide, Boolean(params.continuePrevious));
+			if (tiny) {
+				learning = loadLearning(learningPath);
+				const floor = cheapestDelegationTokens(learning.outcomes, await repoKey(ctx.cwd));
+				const cost = floor ? `The cheapest delegation recorded in this repository still cost ${floor.toLocaleString("en-US")} tokens` : "A delegation costs on the order of 100k tokens before it changes a line";
+				const size = tiny.bytes ? `${tiny.bytes} bytes` : "a file that does not exist yet";
+				return {
+					content: [{ type: "text", text: `Delegation not started: it would cost more than the change.\n${cost}, because a worker re-reads its whole context on every one of its turns. This one is a ${assessed.assessment.kind} change to ${tiny.path} (${size}), at the small profile, with no symbols to study.\n\nMake it yourself with edit/write, run the project's checks with run_verification, then complete_task. If it really needs a worker — unfamiliar code, dependencies you cannot see from here — call again with delegateAnyway: true.` }],
+					details: { profile: profileName, taskPacketId: taskPacket?.id, delegated: false, reason: "smaller than a delegation", target: tiny.path, targetBytes: tiny.bytes, measuredFloorTokens: floor ?? null },
+					isError: true,
+				};
+			}
 			const contextUsage = ctx.getContextUsage();
 			if (contextUsage?.percent !== null && contextUsage?.percent !== undefined && contextUsage.percent >= config.contextWarningPercent) {
 				ctx.ui.notify(`Supervisor context is ${Math.round(contextUsage.percent)}% full. Keep review concise; compact before another broad exploration if needed.`, "warning");
@@ -3429,6 +3474,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			implementationGuide: Type.String({ minLength: Math.min(...Object.values(config.minImplementationGuideChars)), description: "Guide using FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:. Be concise where possible, but include every detail needed for reliable execution and mention every allowed path." }),
 			acceptanceCriteria: Type.Optional(Type.Array(Type.String({ description: "Concrete, non-duplicative checks" }))),
 			allowedPaths: Type.Array(Type.String({ description: "Relative path for every file the worker may modify" }), { minItems: 1 }),
+			delegateAnyway: Type.Optional(Type.Boolean({ description: "Only after the extension refused a delegation as smaller than its own cost: true states that this change really needs a worker (unfamiliar code, hidden dependencies) even though it looks small." })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			return executeDelegation(params, signal, onUpdate, ctx);
