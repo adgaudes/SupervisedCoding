@@ -72,3 +72,17 @@ test("an oversized diff is truncated, marked incomplete, and lists the files it 
 	assert.match(changes.diff, /\[Diff truncated; inspect listed files\.\]$/);
 	assert.ok(changes.omitted.includes("b.txt"), "files after the cut are listed as omitted");
 });
+
+test("untracked files enter a diff bounded, and a binary one only by name", async () => {
+	const { untrackedDiffs, UNTRACKED_FILE_MAX_BYTES } = await import("../git-safety.ts");
+	const dir = repo({ "tracked.txt": "x" });
+	fs.writeFileSync(path.join(dir, "big.txt"), "a".repeat(UNTRACKED_FILE_MAX_BYTES * 3));
+	fs.writeFileSync(path.join(dir, "blob.bin"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02]));
+	const diffs = await untrackedDiffs(dir, []);
+	const big = diffs.find((item) => item.includes("big.txt"))!;
+	assert.ok(big.length < UNTRACKED_FILE_MAX_BYTES * 1.2, `bounded: ${big.length} bytes`);
+	assert.match(big, /untracked file truncated: first \d+ of \d+ bytes shown/);
+	const blob = diffs.find((item) => item.includes("blob.bin"))!;
+	assert.match(blob, /binary, 7 bytes/);
+	assert.doesNotMatch(blob, /\+\u0089/, "binary bytes never reach the diff");
+});

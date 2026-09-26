@@ -9,6 +9,7 @@ import {
 	effectiveEffort,
 	emptyLearning,
 	cheapestDelegationTokens,
+	lowEffortStruggles,
 	extractVerifyCommands,
 	failureSignature,
 	lessonsFor,
@@ -253,4 +254,18 @@ test("the delegation floor is the cheapest delegation on record, not their mean"
 	assert.equal(cheapestDelegationTokens([record({ tokens: 0 })], "r", 20, at), undefined, "an unmeasured delegation is not a floor of zero");
 	assert.equal(cheapestDelegationTokens([record({ tokens: 50_000, at: at - 200 * 86400_000 }), record({ tokens: 300_000 })], "r", 20, at), 300_000, "stale evidence is ignored");
 	assert.equal(cheapestDelegationTokens([record({ tokens: 10_000 }), record({ tokens: 400_000 })], "r", 1, at), 400_000, "only the recent window counts");
+});
+
+test("the cold-start low effort is withdrawn once tasks run at low were poor", () => {
+	const state = emptyLearning();
+	const low = (taskId: string, patch: Partial<OutcomeRecord>) => recordOutcome(state, outcome({ evidenceVersion: 2, taskId, repo: "r", profile: "small", taskKind: "mechanical", effort: "low", ...patch }));
+	for (let i = 0; i < 3; i++) low(`t${i}`, { verification: "failed", failed: true });
+	assert.equal(lowEffortStruggles(state, "small", "claude-sonnet-5", "r", "mechanical", undefined, NOW), false, "three tasks are not yet evidence");
+	low("t3", { verification: "failed", failed: true });
+	assert.equal(lowEffortStruggles(state, "small", "claude-sonnet-5", "r", "mechanical", undefined, NOW), true, "four poor tasks at low withdraw the reduction");
+	assert.equal(lowEffortStruggles(state, "small", "claude-sonnet-5", "r", "docs", undefined, NOW), false, "another kind is other evidence");
+	assert.equal(lowEffortStruggles(state, "small", "claude-sonnet-5", "other", "mechanical", undefined, NOW), false, "another repository is other evidence");
+	const good = emptyLearning();
+	for (let i = 0; i < 6; i++) recordOutcome(good, outcome({ evidenceVersion: 2, taskId: `g${i}`, repo: "r", profile: "small", taskKind: "mechanical", effort: "low" }));
+	assert.equal(lowEffortStruggles(good, "small", "claude-sonnet-5", "r", "mechanical", undefined, NOW), false, "low that works keeps working");
 });

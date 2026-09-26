@@ -173,13 +173,34 @@ export async function scopedDiff(cwd: string, paths: string[], maxBytes: number)
 }
 
 /** Untracked files as diffs of new files (git diff omits them). */
+/**
+ * How much of one untracked file enters a synthetic diff. Callers truncate the assembled diff later, but by then a
+ * large generated file or a binary has already been read whole into memory and, for reviewers, into their context.
+ */
+export const UNTRACKED_FILE_MAX_BYTES = 64 * 1024;
+
 export async function untrackedDiffs(cwd: string, scope: string[]): Promise<string[]> {
 	const untracked = nulSeparated(await gitStdout(cwd, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope]));
 	const added: string[] = [];
 	for (const file of untracked) {
 		try {
-			const content = fs.readFileSync(path.join(cwd, file), "utf8");
-			added.push(`diff --git a/${file} b/${file}\nnew file (untracked)\n+++ b/${file}\n${content.split("\n").map((line) => `+${line}`).join("\n")}`);
+			const full = path.join(cwd, file);
+			const size = fs.statSync(full).size;
+			const handle = fs.openSync(full, "r");
+			const head = Buffer.alloc(Math.min(size, UNTRACKED_FILE_MAX_BYTES));
+			try {
+				fs.readSync(handle, head, 0, head.length, 0);
+			} finally {
+				fs.closeSync(handle);
+			}
+			// A NUL byte in what was read marks a binary file: its bytes would be noise in a diff and cost tokens.
+			if (head.includes(0)) {
+				added.push(`diff --git a/${file} b/${file}\nnew file (untracked, binary, ${size} bytes)`);
+				continue;
+			}
+			const content = head.toString("utf8");
+			const cut = size > head.length ? `\n[untracked file truncated: first ${head.length} of ${size} bytes shown]` : "";
+			added.push(`diff --git a/${file} b/${file}\nnew file (untracked)\n+++ b/${file}\n${content.split("\n").map((line) => `+${line}`).join("\n")}${cut}`);
 		} catch {
 			added.push(`new file (untracked, unreadable): ${file}`);
 		}

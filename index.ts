@@ -30,6 +30,7 @@ import {
 import {
 	addLesson,
 	effectiveEffort,
+	lowEffortStruggles,
 	cheapestDelegationTokens,
 	extractVerifyCommands,
 	failureSignature,
@@ -257,6 +258,13 @@ interface TaskPacket {
 	reviewScope?: "task" | "delegation";
 	/** Implementer of the last delegation, so a task-level review can pick independent reviewers. */
 	implementer?: WorkerCandidate;
+	/**
+	 * Working tree the task's checks last passed on (a delegation's final checks). The supervisor can edit after
+	 * that, so acceptance compares it with the tree as it stands and asks for the checks again when they differ.
+	 */
+	checkedFingerprint?: string;
+	/** Working tree the last passing independent review saw; a later change makes that review stale. */
+	reviewedFingerprint?: string;
 	/** Paused with complete_task: it stops carrying its supervisor and effort into new prompts. */
 	paused?: boolean;
 	updatedAt: number;
@@ -358,7 +366,7 @@ function buildRepoContext(rules: string, lessons: string[]): string {
 
 function buildWorkerPrompt(task: string, implementationGuide: string, acceptanceCriteria: string[], allowedPaths: string[], isContinuation: boolean, repoContext = "", codeMap = ""): string {
 	return `[CODING WORKER — ${isContinuation ? "TARGETED CORRECTION" : "EXECUTE, DO NOT REPLAN"}]
-${!isContinuation && repoContext ? `${repoContext}\n\n` : ""}Implement only the task and file guide below. ${isContinuation ? "Reuse the existing session context; inspect only what changed or what the correction explicitly references." : "Check Git status first; preserve existing changes."} Never weaken, skip or delete tests to make checks pass. Start from the named symbols and use narrow/ranged reads where possible, expanding only when dependencies or uncertainty require it. Edit surgically and avoid broad exploration or unrelated refactors. Never stage, commit, push, merge, switch branches, rewrite history, or invoke agents. Do not modify paths outside the allowlist. If instructions conflict with the code or admit multiple material approaches, stop and report the ambiguity. Run pertinent checks. On success return only changed files, concise change summary, tests and residual risks; on failure include the diagnostics needed to resolve it.
+${!isContinuation && repoContext ? `${repoContext}\n\n` : ""}Implement only the task and file guide below. ${isContinuation ? "Reuse the existing session context; inspect only what changed or what the correction explicitly references." : "Check Git status first; preserve existing changes."} Never weaken, skip or delete tests to make checks pass. Start from the named symbols and use narrow/ranged reads where possible, expanding only when dependencies or uncertainty require it. Edit surgically and avoid broad exploration or unrelated refactors. Never stage, commit, push, merge, switch branches, rewrite history, or invoke agents. Do not modify paths outside the allowlist. If instructions conflict with the code or admit multiple material approaches, stop and report the ambiguity. Do not claim a check you did not run: the extension runs the guide's VERIFY commands on your finished work. On success return only changed files, concise change summary, tests and residual risks; on failure include the diagnostics needed to resolve it.
 
 TASK
 ${task}
@@ -1797,8 +1805,15 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			const currentAvailability = availability(health, workerHealthKeys(configured), config.creditHeadroom);
 			if (currentAvailability.state === "blocked") { attempts.push({ label: candidateLabel(configured), ok: false, detail: "skipped: account became unavailable during this chain", order }); continue; }
 			// Effort: the supervisor's explicit override, else what learning calibrated for this profile/model, else config.json.
-			const baseEffort = taskEffort(spec.profileName, spec.assessment, configured.effort);
-			const learnedEffort = config.learning.enabled && config.learning.autoTuneEffort && !spec.candidates ? effectiveEffort(learning, spec.profileName, configured.model, baseEffort, repo, spec.assessment?.kind) : baseEffort;
+			// The cold-start reduction to low for small, low-risk mechanical work is a first guess. It yields to learning
+			// that already moved this combination's effort, and it is withdrawn once tasks run at low here were poor.
+			const tuning = config.learning.enabled && config.learning.autoTuneEffort && !spec.candidates;
+			const taskKind = spec.assessment?.kind ?? "general";
+			const reduced = taskEffort(spec.profileName, spec.assessment, configured.effort);
+			const learnedFromConfigured = tuning ? effectiveEffort(learning, spec.profileName, configured.model, configured.effort, repo, taskKind) : configured.effort;
+			const reductionHolds = reduced !== configured.effort && learnedFromConfigured === configured.effort && !(tuning && lowEffortStruggles(learning, spec.profileName, configured.model, repo, taskKind));
+			const baseEffort = reductionHolds ? reduced : configured.effort;
+			const learnedEffort = tuning ? effectiveEffort(learning, spec.profileName, configured.model, baseEffort, repo, spec.assessment?.kind) : baseEffort;
 			const candidate: WorkerCandidate = { ...configured, maxTurns: config.workerMaxTurns[spec.profileName], effort: resolveEffort(spec.effort, learnedEffort, spec.profileName) };
 			const label = candidateLabel(candidate);
 			if (isFlagship(candidate.model) && !(await approveFlagship(ctx, candidate.model, modelDisplayName(ctx, candidate.provider ?? "anthropic", candidate.model)))) {
@@ -2313,7 +2328,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			decision: StringEnum(["accept", "pause"] as const),
 			summary: Type.String({ minLength: 10, description: "Evidence for acceptance, or what is still missing." }),
-			manualReview: Type.Optional(Type.Boolean({ description: "For a required independent review that was unavailable: true only if you independently reviewed the full change and explain the evidence in summary." })),
+			manualReview: Type.Optional(Type.Boolean({ description: "Only when the extension could not produce evidence itself: a required independent review that was unavailable, or a task no check applies to. True only if you reviewed the full change yourself and explain the evidence in summary." })),
 		}),
 		async execute(_id, params, signal, _update, ctx) {
 			if (!enabled) throw new Error("SupervisedCoding is disabled. Run /SupervisedCoding on.");
@@ -2351,10 +2366,31 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			let taskReview = "";
 			if (params.decision === "accept") {
 				if (taskPacket.phase !== "implemented" || taskPacket.verification === "failed" || taskPacket.reviewVerdict === "major") throw new Error("Task cannot be accepted: implementation or material findings remain unresolved.");
+				// Evidence first. Where an independent review is required, it is run below if missing, and it is evidence.
+				// Elsewhere a task no check ever ran on is accepted only on the supervisor's explicit word, the same way an
+				// unavailable review is: otherwise a small task could close with neither a check nor a review.
+				const reviewRequired = config.independentReviewProfiles.includes(taskPacket.maxProfile ?? taskPacket.profile);
+				if (taskPacket.verification === "unverified" && !reviewRequired && !params.manualReview) {
+					throw new Error("Task cannot be accepted without evidence: no check ran on it and no review covered it. Run the project's checks with run_verification (a passing run counts for the task), or, if none applies to this change, review it yourself and accept with manualReview=true and the evidence in summary.");
+				}
+				// Evidence about the code as it stands. The supervisor may edit after the task's checks passed (fixing a
+				// finding, say); the checks then say nothing about what is being accepted, and must run again on it.
+				const fingerprint = await workingTreeFingerprint(ctx.cwd);
+				const stale = (recorded: string | undefined) => recorded !== undefined && fingerprint !== undefined && recorded !== fingerprint;
+				if (stale(taskPacket.checkedFingerprint)) {
+					const required = Object.keys(taskPacket.baseline ?? {});
+					const current = new Map<string, boolean>();
+					for (const item of ownChecks) if (item.cwd === ctx.cwd && item.fingerprint === fingerprint) current.set(item.command, item.ok);
+					const failing = required.filter((command) => current.get(command) === false);
+					if (failing.length) throw new Error(`Task cannot be accepted: ${failing.join(", ")} fails on the current code.`);
+					const missing = required.filter((command) => !current.has(command));
+					if (missing.length) throw new Error(`Task cannot be accepted: the code changed after its checks passed. Run ${missing.join(", ")} on the current code with run_verification, then accept.`);
+				}
 				// Review requirements follow the strongest profile the task ever had, and cover the whole task: after
-				// several delegations, per-delegation reviews saw only their own delta.
+				// several delegations, per-delegation reviews saw only their own delta. A review of code that has changed
+				// since is not a review of what is being accepted, so the whole task is reviewed again.
 				const reviewProfile = taskPacket.maxProfile ?? taskPacket.profile;
-				const reviewed = (taskPacket.reviewVerdict === "pass" || taskPacket.reviewVerdict === "minor") && taskPacket.reviewScope === "task";
+				const reviewed = (taskPacket.reviewVerdict === "pass" || taskPacket.reviewVerdict === "minor") && taskPacket.reviewScope === "task" && !stale(taskPacket.reviewedFingerprint);
 				if (config.independentReviewProfiles.includes(reviewProfile) && !reviewed) {
 					const review = await reviewWholeTask(ctx, reviewProfile, signal);
 					if (review) {
@@ -2363,7 +2399,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 							updateTaskPacket({ phase: "failed", reviewVerdict: "major", reviewScope: "task", failedChecks: undefined });
 							return { content: [{ type: "text", text: truncateUtf8(`Task NOT accepted: the review of the whole task found material defects.\n\n${review.text}`, config.maxOutputBytes) }], details: { taskId: taskPacket.id, decision: params.decision, accepted: false }, isError: true };
 						}
-						if (review.verdict !== "none") updateTaskPacket({ reviewVerdict: review.verdict, reviewScope: "task" });
+						if (review.verdict !== "none") updateTaskPacket({ reviewVerdict: review.verdict, reviewScope: "task", reviewedFingerprint: fingerprint });
 						else if (!params.manualReview) return { content: [{ type: "text", text: truncateUtf8(`Task NOT accepted: ${review.text}\nReview the complete change yourself, then accept with manualReview=true and the evidence in summary.`, config.maxOutputBytes) }], details: { taskId: taskPacket.id, decision: params.decision, accepted: false }, isError: true };
 					} else if (!params.manualReview) {
 						throw new Error("A review of the whole task is required but its starting state is unknown (e.g. after a restart): review the complete change yourself, then accept with manualReview=true and the evidence in summary.");
@@ -2946,7 +2982,12 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					if (check.safetyViolations.length || check.launchError) break;
 					// A task persisted before signatures existed adopts this delegation's start as its reference: the
 					// best evidence left, and still stricter than the old boolean.
-					if (taskBaseline[command] === undefined || (taskBaseline[command] === false && taskSignatures[command] === undefined && check.signature)) {
+					if (taskBaseline[command] === undefined && (taskPacket.delegationCount ?? 1) > 1) {
+						// First listed in a later delegation: the code already carries the earlier delegations' changes, so
+						// a failure now says nothing about the task's start. Tolerating it as pre-existing would hide a
+						// regression an earlier step introduced; it counts as green at the start, and a failure is fixed.
+						taskBaseline[command] = true;
+					} else if (taskBaseline[command] === undefined || (taskBaseline[command] === false && taskSignatures[command] === undefined && check.signature)) {
 						taskBaseline[command] ??= check.ok;
 						if (check.signature) taskSignatures[command] = check.signature;
 					}
@@ -3109,11 +3150,13 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 				const launchBlockers = [...notStarted, ...heldBack];
 				// Only a task failed by its checks alone can be restored by passing checks (run_verification).
 				const onlyChecksFailed = (regressions.length > 0 || launchBlockers.length > 0) && !outcome.failed && !correctionFailed && !limitReached && !scopeViolations.length && !checkSafety.size;
+				const passingVerification = !launchBlockers.length && ["passed", "fixed", "unchanged_failures"].includes(verification);
 				updateTaskPacket({
 					phase: failed || launchBlockers.length ? "failed" : "implemented",
 					primaryWorker: candidateLabel(implementer),
 					implementer,
 					lastReport: report,
+					checkedFingerprint: passingVerification ? await workingTreeFingerprint(ctx.cwd) : undefined,
 					verification: launchBlockers.length ? "failed" : verification,
 					failedChecks: onlyChecksFailed ? [...new Set([...regressions.map((check) => check.command), ...launchBlockers])] : undefined,
 					launchFailedChecks: launchBlockers.length ? launchBlockers : undefined,
@@ -3140,7 +3183,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 					// The first delegation's diff is the whole task so far; later ones cover only their own delta.
 					// The review ran only on a delegation that had not failed: failing now, it failed the task for more than its
 					// checks, so passing checks can no longer restore it.
-					updateTaskPacket({ phase: failed || launchBlockers.length ? "failed" : "implemented", lastReport: `${report}\n\n${reviewText}`, reviewVerdict, reviewScope: taskPacket.delegationCount === 1 ? "task" : "delegation", ...(failed ? { failedChecks: undefined } : {}) });
+					updateTaskPacket({ phase: failed || launchBlockers.length ? "failed" : "implemented", lastReport: `${report}\n\n${reviewText}`, reviewVerdict, reviewScope: taskPacket.delegationCount === 1 ? "task" : "delegation", reviewedFingerprint: reviewVerdict === "pass" || reviewVerdict === "minor" ? await workingTreeFingerprint(ctx.cwd) : undefined, ...(failed ? { failedChecks: undefined } : {}) });
 				}
 
 				const combined = combineUsage(usage);
@@ -3239,11 +3282,14 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 			if (check.launchError) throw new Error(`run_verification could not start ${command}: ${check.launchError}. Nothing was recorded for the task.`);
 			// Recorded with the tree it ran on, whatever reuse is configured: this is the only evidence a change the
 			// supervisor made itself can be accepted on, and it must not disappear when the check leaves files behind.
-			ownChecks.push({ cwd: ctx.cwd, promptSeq, fingerprint: await workingTreeFingerprint(ctx.cwd), command, ok: check.ok });
 			// A failure blocks acceptance of the open task, unless the check was already red when the task started and
 			// still fails the same way. A completed task is never reopened by a later check.
 			const open = openTask();
 			const state = open ? classifyCheck(check, open.baseline?.[command] === false, open.baselineSignatures?.[command]) : undefined;
+			// Recorded with the tree it ran on, whatever reuse is configured: acceptance rests on these when the code has
+			// changed since the task's own checks, and for a change the supervisor made itself. A failure the task
+			// started with, and that still fails the same way, is acceptable here exactly as it is in the task's checks.
+			ownChecks.push({ cwd: ctx.cwd, promptSeq, fingerprint: await workingTreeFingerprint(ctx.cwd), command, ok: check.ok || state === "unchanged" });
 			if (check.safetyViolations.length) {
 				// No worker may be resumed (continuePrevious) on Git state a check changed, whatever task it belongs to.
 				workerSession = undefined;
@@ -3532,7 +3578,7 @@ export default function supervisedCoding(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: POLICY_TYPE,
-				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it, or where a symbol is used), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings. To review a branch, a pull request or local work not done by delegate_implementation, call review_changes (with base and, when known, the intent in focus) instead of reading the diff yourself. Findings marked (confirmed) or (downgraded) were already checked against the code by a second model: read their code only to act on them, never just to confirm them again. Stay within the user's request: fix findings that are defects of the requested change or of its stated scope; report the others (pre-existing code, extra hardening) to the user instead of fixing them unasked, and never start a third fix-and-review round on the same change without asking the user. Between prompts, bulky tool results of accepted tasks are replaced with short notes and reads of files a later delegation changed are marked outdated: read again what you need.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. Decide whether to delegate at all. A delegation starts a worker with its own context, which it re-reads on every one of its turns: it costs on the order of 100k tokens before it changes a line, so it only pays for itself when it keeps bulky code out of your context. Make the change yourself with edit/write when it is small and fully determined \u2014 roughly twenty lines or fewer, or one short new file \u2014 you already know its exact content, and you have already read what it touches; then call run_verification for the project's checks and complete_task as usual. Delegate when the change needs exploration, spans several files or symbols, is long, or is risky. Never split one change between yourself and a worker, and never delegate a change you have already made.\n4. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n5. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n6. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n7. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings.\n8. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
+				content: "[SUPERVISED CODING]\nGoal: correct, well-made code with as few defects as possible. Quality always beats speed; save tokens only where quality is not affected.\nRoles: you explore, plan, delegate, verify and accept. Workers implement. The extension picks worker models and fails over automatically when a provider runs out of credits; never switch models to hide a coding or test failure.\nWorkflow for every new task:\n1. Read only the files and symbols needed to judge the task, requesting them together in one turn (parallel tool calls); never paste source into handoffs. Everything you read stays in your context and is resent on every later turn: prefer narrow grep patterns and ranged reads (offset/limit) of the relevant symbols to whole files (code_outline gives a large file's declarations with line ranges without reading it, or where a symbol is used), never re-read a range already in context, and read documentation only when the task concerns it. For an audit or analysis spanning many files or large modules, do not read them yourself: call consult_readonly (purpose audit) with the paths and precise questions, then read only the ranges needed to confirm or act on its findings. To review a branch, a pull request or local work not done by delegate_implementation, call review_changes (with base and, when known, the intent in focus) instead of reading the diff yourself. Findings marked (confirmed) or (downgraded) were already checked against the code by a second model: read their code only to act on them, never just to confirm them again. Stay within the user's request: fix findings that are defects of the requested change or of its stated scope; report the others (pre-existing code, extra hardening) to the user instead of fixing them unasked, and never start a third fix-and-review round on the same change without asking the user. Between prompts, bulky tool results of accepted tasks are replaced with short notes and reads of files a later delegation changed are marked outdated: read again what you need.\n2. Classify assessment.kind, risk, uncertainty and scope using the tool schema. High risk and security/concurrency/migrations have a critical floor; architecture and high uncertainty have a large floor. Choose the profile: small = localized/mechanical; medium = normal multi-file; large = complex architecture or hard debugging; critical = security, concurrency, data migrations or truly exceptional complexity. Choose critical only when a top-tier model is clearly worth it, because it triggers the user's approval for flagship models. When torn between small/medium/large, choose the stronger one. Call plan_task first only for large or critical tasks or when the task needs several delegations; for a single small or medium delegation pass the profile directly to delegate_implementation.\n3. Decide whether to delegate at all. A delegation starts a worker with its own context, which it re-reads on every one of its turns: it costs on the order of 100k tokens before it changes a line, so it only pays for itself when it keeps bulky code out of your context. Make the change yourself with edit/write when it is small and fully determined \u2014 roughly twenty lines or fewer, or one short new file \u2014 you already know its exact content, and you have already read what it touches; then call run_verification for the project's checks and complete_task as usual. Delegate when the change needs exploration, spans several files or symbols, is long, or is risky. Never split one change between yourself and a worker, and never delegate a change you have already made.\n4. delegate_implementation with a concise task and a structured guide (FILE:, SYMBOLS:, CHANGES:, PRESERVE:, VERIFY:, every allowedPath mentioned). Use effort only when this specific change needs more or less reasoning than its profile. Otherwise use consult_readonly only for concrete uncertainty.\n5. Put the exact test/typecheck/lint commands in VERIFY (e.g. `npm test`, `npx tsc --noEmit`): the extension runs them before and after the change and lets the worker fix regressions itself. Prefer the project's whole test command over the tests of the changed file, unless the suite is slow: a change can break code elsewhere. The delegation result already contains the diff when it is small: review it there and use supervisor_git only for what it does not show; use run_verification for anything VERIFY could not cover.\n6. For corrections or follow-up steps of the same task use continuePrevious=true; do not call plan_task again for the same task.\n7. Call complete_task with accept after reviewing the final diff and checks, before your final response; use pause for unfinished work. Never accept unresolved regressions or MAJOR findings. Acceptance needs evidence about the code as it stands: if you edit after the checks passed, run them again before accepting; if no check applies and no review is required, review the change yourself and accept with manualReview=true and the evidence in summary.\n8. When a failure, correction round or review finding reveals a durable repository-specific pitfall, call record_lesson with one concrete instruction; never record task-specific details.\nIf the supervisor model changes after a provider failure, re-check the task state and Git status before continuing and do not redo completed delegations. Final acceptance is your responsibility. Never commit or push unless the user explicitly asks; then use only the confirmation tools. Never merge.",
 				display: false,
 			},
 		};

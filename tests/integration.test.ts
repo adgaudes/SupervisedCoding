@@ -548,7 +548,7 @@ test("supervisor_git does not send again a diff the delegation result already sh
 	assert.match(changed.content[0].text, /\+edited by hand/, "a file that changed is diffed again");
 	fs.writeFileSync(path.join(repo, "x.txt"), "new\n");
 	assert.equal((await host.call("supervisor_git", { action: "diff", paths: ["x.txt"] })).details.alreadyShown, true);
-	await host.call("complete_task", { decision: "accept", summary: "Reviewed both steps and their diffs." });
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed both steps and their diffs.", manualReview: true });
 	const afterAccept = await host.call("supervisor_git", { action: "diff", paths: ["x.txt"] });
 	assert.match(afterAccept.content[0].text, /\+new/, "once the task is accepted its results may be pruned: the diff is sent again");
 });

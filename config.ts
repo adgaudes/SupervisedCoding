@@ -193,6 +193,17 @@ export function mergeConfig(base: Record<string, unknown>, override: Record<stri
 	return merged;
 }
 
+/**
+ * Profile names from the configuration, checked like the commands they gate. A misspelt entry ("larg") would silently
+ * switch off the review it was meant to require, so the configuration is refused instead, naming the entry.
+ */
+function validProfiles(value: unknown, key: string, source: string): ExecutionProfileName[] {
+	if (!Array.isArray(value)) throw new Error(`${key} must be an array of profile names (${source}).`);
+	const unknown = value.filter((item) => !PROFILE_NAMES.includes(item as ExecutionProfileName));
+	if (unknown.length) throw new Error(`Invalid ${key} entry ${JSON.stringify(unknown[0])}: expected one of ${PROFILE_NAMES.join(", ")} (${source}).`);
+	return value as ExecutionProfileName[];
+}
+
 export function loadConfig(configPath: string, userConfigPath: string | undefined, customTools: Iterable<string>): Config {
 	const defaults = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
 	// Personal settings live outside the package, so updates never overwrite them.
@@ -301,7 +312,7 @@ export function loadConfig(configPath: string, userConfigPath: string | undefine
 		claudeReadOnlyDisallowedTools: raw.claudeReadOnlyDisallowedTools ?? ["Edit", "Write", "Bash(*)"],
 		workerChains,
 		defaultExecutionProfile: requestedDefault && PROFILE_NAMES.includes(requestedDefault) ? requestedDefault : "medium",
-		independentReviewProfiles: raw.independentReviewProfiles ?? ["large", "critical"],
+		independentReviewProfiles: validProfiles(raw.independentReviewProfiles ?? ["large", "critical"], "independentReviewProfiles", configPath),
 		supervisorChain: (raw.supervisorChain ?? []).map(({ provider, model }) => ({ provider, model })),
 		flagshipModels,
 		supervisorEffort: { default: "medium", small: "medium", medium: "medium", large: "high", critical: "xhigh", ...raw.supervisorEffort },

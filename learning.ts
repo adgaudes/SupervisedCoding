@@ -228,6 +228,23 @@ export function tuneEfforts(state: LearningState, targets: TuningTarget[], rules
 	return changes;
 }
 
+/**
+ * Whether the cold-start low effort has proved too little for this profile, model, repository and kind: at least
+ * raiseMinSamples recent tasks run at low, with a mean quality under raiseBelowQuality. tuneEfforts cannot see those
+ * outcomes, because it tunes upward from the configured effort and they were recorded at low, so without this a
+ * reduction that keeps failing would never be withdrawn.
+ */
+export function lowEffortStruggles(state: LearningState, profile: string, model: string, repo: string, kind: string, rules: TuningRules = DEFAULT_TUNING, now = Date.now()): boolean {
+	const evidence = state.outcomes.filter((item) => item.profile === profile && item.model === model && item.effort === "low" && item.repo === repo && item.evidenceVersion === 2 && (item.taskKind ?? "general") === kind && now - item.at <= 90 * 86400_000);
+	const samples = byTask(evidence)
+		.map((items) => items.map(outcomeQuality).filter((value): value is number => value !== undefined))
+		.filter((scores) => scores.length)
+		.map((scores) => Math.min(...scores))
+		.slice(-rules.window);
+	if (samples.length < rules.raiseMinSamples) return false;
+	return samples.reduce((sum, quality) => sum + quality, 0) / samples.length < rules.raiseBelowQuality;
+}
+
 export function effectiveEffort(state: LearningState, profile: string, model: string, configured: Effort | undefined, repo?: string, kind?: string): Effort | undefined {
 	if (!configured) return configured;
 	const adjustment = state.effortAdjustments[tuningKey({ profile, model, repo, kind })];

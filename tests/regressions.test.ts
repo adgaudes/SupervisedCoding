@@ -191,7 +191,7 @@ test("AUDIT: explicit acceptance closes a critical task and resets effort", asyn
   configure({}, {"claude-fable-5-1":[{write:{"a.txt":"done"}}]});
   const host=makeHost(makeRepo({"a.txt":"old"})); await host.on();
   await host.call("delegate_implementation",{task:"change",profile:"critical",allowedPaths:["a.txt"],implementationGuide:guide(["a.txt"])});
-  await host.call("complete_task",{decision:"accept",summary:"Reviewed the final change and its requirements."});
+  await host.call("complete_task",{decision:"accept",summary:"Reviewed the final change and its requirements.",manualReview:true});
   await host.handlers.get("agent_settled")({},host.ctx);
   await host.handlers.get("before_agent_start")({prompt:"A new request"},host.ctx);
   await host.command("status");
@@ -446,7 +446,7 @@ test("AUDIT-2 B6: the default configuration does not switch supervisor models ar
 	await host.handlers.get("before_agent_start")({ prompt: "Fix a.txt" }, host.ctx);
 	const before = host.notifications.length;
 	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
-	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change." });
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change.", manualReview: true });
 	assert.deepEqual(host.notifications.slice(before).filter((text) => text.startsWith("Supervisor model:")), []);
 });
 
@@ -481,7 +481,7 @@ test("AUDIT-2 B6: complete_task never switches the supervisor before the final a
 	await host.handlers.get("before_agent_start")({ prompt: "Fix a.txt" }, host.ctx);
 	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
 	assert.equal(host.ctx.model.id, "gpt-6-sol", "the configured small-task supervisor");
-	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change." });
+	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change.", manualReview: true });
 	assert.equal(host.ctx.model.id, "gpt-6-sol");
 	await host.handlers.get("before_agent_start")({ prompt: "Something else" }, host.ctx);
 	assert.equal(host.ctx.model.id, "gpt-5.5", "the next prompt selects the general supervisor");
@@ -1622,4 +1622,62 @@ test("DIRECT CHANGE: acceptance does not depend on the check-reuse cache being o
 	await host.call("run_verification", { command: "node --test check.test.mjs" });
 	const accepted = await host.call("complete_task", { decision: "accept", summary: "Ran the check with reuse disabled." });
 	assert.equal(accepted.details.accepted, true, "reuse is an optimisation; it is not where the evidence lives");
+});
+
+test("CONFIG: a misspelt review profile refuses the configuration instead of silently dropping the review", () => {
+	for (const bad of [["larg"], ["large", "Critical"], "large"]) {
+		configure({ independentReviewProfiles: bad }, {});
+		assert.throws(() => makeHost(makeRepo({ "a.txt": "old" })), /independentReviewProfiles/, JSON.stringify(bad));
+	}
+	configure({ independentReviewProfiles: [] }, {});
+	assert.doesNotThrow(() => makeHost(makeRepo({ "a.txt": "old" })), "an empty list is a deliberate choice");
+});
+
+test("EVIDENCE: a delegated task no check or review covered is accepted only on the supervisor's explicit word", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	// No VERIFY command and no review profile: the task ends "unverified".
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.equal(result.details.verification, "unverified");
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "Looks fine to me." }), /cannot be accepted without evidence/);
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "Read the whole diff: one line, as specified.", manualReview: true });
+	assert.equal(accepted.details.accepted, true);
+});
+
+test("EVIDENCE: a passing run_verification is evidence for an unverified delegated task", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "bad", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"]) });
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "The check passes on the delegated change." });
+	assert.equal(accepted.details.accepted, true);
+});
+
+test("EVIDENCE: a delegated task edited after its checks passed needs its checks again on the current code", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }] });
+	const repo = makeRepo({ "value.txt": "bad", "check.test.mjs": PASSING_CHECK });
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]) });
+	assert.equal(result.details.verification, "passed", result.content[0].text);
+	// The supervisor touches the code after the checks passed, as when it fixes a finding itself.
+	fs.writeFileSync(path.join(repo, "value.txt"), "ok\n");
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "Adjusted the file after the checks." }), /code changed after its checks passed[\s\S]*node --test check\.test\.mjs/);
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "Checks ran again on the current code." });
+	assert.equal(accepted.details.accepted, true);
+});
+
+test("BASELINE: a check first listed in a later delegation cannot hide an earlier delegation's regression", async () => {
+	configure({ maxCorrectionRounds: 0 }, { "claude-sonnet-5": [{ write: { "value.txt": "broken" } }, { write: { "other.txt": "x" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "other.txt": "", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	// Step 1 breaks value.txt and verifies nothing about it.
+	await host.call("delegate_implementation", { task: "step 1", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"]) });
+	// Step 2 is the first to list the check: it is red at step 2's start only because step 1 broke it.
+	const second = await host.call("delegate_implementation", { task: "step 2", profile: "medium", continuePrevious: true, allowedPaths: ["other.txt"], implementationGuide: guide(["other.txt"], ["node --test check.test.mjs"]) });
+	assert.notEqual(second.details.verification, "unchanged_failures", "tolerating it as pre-existing would hide step 1's regression");
+	assert.equal(second.details.verification, "failed", second.content[0].text);
 });
