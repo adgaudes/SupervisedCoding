@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { allowlisted, formatCommand, parseCommand, splitWords } from "./verification.ts";
 
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORT_LEVELS)[number];
@@ -326,37 +327,115 @@ export function parseVerdict(text: string): ReviewVerdict {
  */
 const GUIDE_SECTION_HEADER = /^\s*(?:#{1,6}\s*)?\**\s*(?:FILE|FILES|FILE GUIDE|SYMBOL|SYMBOLS|CHANGE|CHANGES|PRESERVE|ACCEPTANCE|ACCEPTANCE CRITERIA|NOTE|NOTES|RISK|RISKS|RESIDUAL RISKS|CONTEXT|CONSTRAINTS|OUT OF SCOPE|NON-GOALS|TASK|OBJECTIVE|PATH ALLOWLIST|ALLOWED PATHS|VERIFY)\s*\**\s*:/;
 
+/**
+ * Words that may introduce a bare command ("Run npm test", "Then execute npm test"): dropped from the front when what
+ * follows is an allowlisted command. Deliberately no negation or modal ("do", "not", "never", "avoid"), so a line that
+ * forbids a command ("Do not run npm test") still matches nothing and no check is derived from it.
+ */
+const LEAD_WORDS = new Set(["run", "runs", "rerun", "re-run", "running", "execute", "executes", "invoke", "call", "then", "next", "first", "finally", "afterwards", "afterward", "also", "please", "now", "just", "and"]);
+
 /** Words that start prose after a bare command ("npm test should pass"): never passed to the command as arguments. */
 const PROSE_WORDS = new Set(["should", "must", "will", "shall", "can", "and", "or", "then", "to", "with", "without", "in", "on", "for", "from", "after", "before", "until", "when", "which", "that", "is", "are", "all", "still", "again", "passes", "pass", "passing", "succeeds", "succeed", "green", "ok", "fails", "fail", "expected", "expect", "e.g.", "i.e."]);
 
 /**
  * Keep a bare command up to the first word of prose. Conservative: running a broader command is harmless, while
  * prose passed as arguments makes the check fail for the wrong reason. Backticked commands are never trimmed.
+ * A quoted argument is one word, whatever it contains.
  */
 function stripProse(command: string, allowedPrefixes: string[]): string {
-	const words = command.split(" ");
+	const words = splitWords(command);
 	const kept: string[] = [];
 	for (const word of words) {
 		if (PROSE_WORDS.has(word.toLowerCase()) || /^[(—–]/.test(word)) {
 			// "cargo test --features all": an option left without its value would break the command; drop it too,
 			// unless it is part of the allowlisted command itself ("node --test").
 			const shorter = kept.slice(0, -1).join(" ");
-			if (kept.length > 1 && kept[kept.length - 1].startsWith("-") && allowedPrefixes.some((item) => shorter === item || shorter.startsWith(`${item} `))) kept.pop();
+			if (kept.length > 1 && kept[kept.length - 1].startsWith("-") && allowlistedText(shorter, allowedPrefixes)) kept.pop();
 			break;
 		}
-		// "npm test, then lint": a word ending a clause is the command's last word.
-		if (/[,:]$/.test(word)) { kept.push(word.slice(0, -1)); break; }
+		// "npm test, then lint": a word ending a clause is the command's last word. A full stop ends the sentence, so
+		// what follows it is prose ("npm pack --dry-run --json. Also validate the YAML"); it counts only after a word
+		// character or a closing quote, so "npx tsc -p ." and "npx eslint src/." keep theirs.
+		if (/[,:]$/.test(word) || /(?<=[\w)\]'"])\.$/.test(word)) { kept.push(word.replace(/[,:.]$/, "")); break; }
 		kept.push(word);
 	}
 	return kept.join(" ");
 }
 
 /**
- * Pull verification commands out of a guide's VERIFY section: backticked commands or bullet lines that
- * start with an allowlisted prefix. Unknown or unsafe commands are ignored (the supervisor can still run them).
- * A line with backticks contributes only its backticked commands; a bare command loses any trailing prose.
+ * What parseCommand rejects as line breaks (Unicode separators, vertical tab, form feed included) or control
+ * characters. splitWords would turn most of them into plain spaces, so they are caught before it runs.
  */
-export function extractVerifyCommands(guide: string, allowedPrefixes: string[], unsafe: RegExp): string[] {
+const HIDDEN_BREAKS = /[\r\n\v\f\x85\p{Zl}\p{Zp}\x00-\x08\x0e-\x1f\x7f]/gu;
+
+/**
+ * Commands that change the environment of the ones written after them: splitting a line on its separators would run
+ * the rest in another directory or with another environment, so such a line is left whole and rejected as before.
+ */
+const ENVIRONMENT_COMMANDS = new Set(["cd", "chdir", "pushd", "popd", "export", "set", "unset", "env", "source", "."]);
+
+/**
+ * "npm test; npx tsc --noEmit" and "npm test && npx tsc --noEmit" list two commands; they need no shell, because each
+ * part becomes its own check, parsed and allowlisted on its own. Only these two separators split a line: a single "&"
+ * (background), a pipe, "||" and redirections still reject it, because they change what the command does.
+ */
+function splitChainedCommands(command: string): string[] {
+	const parts = command.split(/;|&&/).map((part) => part.trim()).filter(Boolean);
+	if (parts.length < 2) return parts;
+	const executable = (part: string) => (splitWords(part)[0] ?? "").replace(/["']/g, "").toLowerCase();
+	// One "cd x && npm test" is a single command: running only "npm test" would check the wrong directory.
+	return parts.some((part) => ENVIRONMENT_COMMANDS.has(executable(part))) ? [command.trim()] : parts;
+}
+
+/**
+ * Drop an imperative that introduces a bare command, one word at a time, and stop at the first allowlisted result:
+ * "Run npm test after the extraction" is the check "npm test". A command already allowlisted is returned untouched, and
+ * a line that never becomes one is returned unchanged, so it is ignored exactly as before.
+ */
+function dropLeadingImperative(command: string, allowedPrefixes: string[]): string {
+	if (allowlistedText(command, allowedPrefixes)) return command;
+	const words = splitWords(command);
+	for (let start = 1; start < words.length; start++) {
+		if (!LEAD_WORDS.has(words[start - 1].replace(/["']/g, "").toLowerCase())) break;
+		const candidate = words.slice(start).join(" ");
+		if (allowlistedText(candidate, allowedPrefixes)) return candidate;
+	}
+	return command;
+}
+
+function allowlistedText(command: string, allowedPrefixes: string[]): boolean {
+	try {
+		return allowlisted(parseCommand(command), allowedPrefixes);
+	} catch {
+		return false;
+	}
+}
+
+/** A command that does not parse still reads as an allowlisted one when its words begin with a prefix's arguments. */
+function looksAllowlisted(command: string, allowedPrefixes: string[]): boolean {
+	const words = splitWords(command).map((word) => word.replace(/["']/g, ""));
+	return allowedPrefixes.some((prefix) => {
+		let tokens: string[];
+		try {
+			tokens = parseCommand(prefix);
+		} catch {
+			return false;
+		}
+		return tokens.length <= words.length && tokens.every((token, index) => words[index].startsWith(token));
+	});
+}
+
+/**
+ * Pull verification commands out of a guide's VERIFY section: backticked commands or bullet lines, parsed and kept
+ * only when allowlisted argument by argument. A line listing several commands separated by ";" or "&&" contributes
+ * each of them (see splitChainedCommands): they are run one by one, never through a shell.
+ * Unknown commands are ignored (the supervisor can still run them);
+ * allowlisted-looking ones that are unsafe or malformed are never run, and are listed with the reason in `rejected`.
+ * A line with backticks contributes only its backticked commands; a bare command loses any trailing prose, but
+ * cleanup never removes shell syntax: a line whose removed part has any is rejected whole.
+ * Commands are returned in canonical form (formatCommand).
+ */
+export function extractVerifyCommands(guide: string, allowedPrefixes: string[], unsafe: RegExp, rejected?: string[]): string[] {
 	const lines = guide.split(/\r?\n/);
 	const start = lines.findIndex((line) => /^\s*(?:#{1,6}\s*)?\**\s*VERIFY\s*\**\s*:/i.test(line));
 	if (start < 0) return [];
@@ -366,23 +445,56 @@ export function extractVerifyCommands(guide: string, allowedPrefixes: string[], 
 		section.push(line);
 	}
 	const candidates: Array<{ command: string; bare: boolean }> = [];
+	const add = (command: string, bare: boolean) => {
+		for (const part of splitChainedCommands(command)) candidates.push({ command: part, bare });
+	};
 	for (const line of section) {
 		const quoted = [...line.matchAll(/`([^`\n]+)`/g)].map((match) => match[1]);
-		if (quoted.length) candidates.push(...quoted.map((command) => ({ command, bare: false })));
-		else candidates.push({ command: line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ""), bare: true });
+		if (quoted.length) for (const command of quoted) add(command, false);
+		else add(line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, ""), true);
 	}
 	const result: string[] = [];
 	for (const candidate of candidates) {
-		let command = candidate.command.trim().replace(/\s+/g, " ");
-		// A sentence's full stop ("VERIFY: npm test.") is not part of the command; "npx tsc -p ." and "./..." keep theirs.
-		if (candidate.bare) command = command.replace(/(?<=[\w)\]'"])[.;,]$/, "");
-		if (!allowedPrefixes.some((item) => command === item || command.startsWith(`${item} `))) continue;
-		// Drop trailing prose after the command ("npm test — all green").
+		if (candidate.command.search(HIDDEN_BREAKS) >= 0) {
+			let reason = "line breaks and control characters are not allowed";
+			try {
+				parseCommand(candidate.command);
+			} catch (error) {
+				reason = error instanceof Error ? error.message : String(error);
+			}
+			const shown = candidate.command.trim().replace(HIDDEN_BREAKS, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+			if (looksAllowlisted(candidate.command, allowedPrefixes)) rejected?.push(`${shown} (${reason})`);
+			continue;
+		}
+		// Whitespace collapses between words only: quoted arguments keep theirs.
+		const raw = splitWords(candidate.command).join(" ");
+		let command = raw;
+		// A sentence's full stop or comma ("VERIFY: npm test.") is not part of the command; "npx tsc -p ." and "./..."
+		// keep theirs. A semicolon is shell syntax, never punctuation.
+		if (candidate.bare) command = command.replace(/(?<=[\w)\]'"])[.,]$/, "");
+		// Drop trailing prose after the command ("npm test — all green"); "->" is not prose, ">" redirects.
 		// ("--" is kept: npm uses it to forward arguments, e.g. "npm test -- --grep parser").
-		command = command.split(/\s+(?:—|->|→)\s*/)[0].trim();
-		if (candidate.bare) command = stripProse(command, allowedPrefixes);
-		// The prefix must survive the cleanup, and the unsafe check sees exactly what would run.
-		if (!command || unsafe.test(command) || !allowedPrefixes.some((item) => command === item || command.startsWith(`${item} `))) continue;
+		const words = splitWords(command);
+		const arrow = words.findIndex((word) => /^[—→]/.test(word));
+		if (arrow >= 0) command = words.slice(0, arrow).join(" ");
+		if (candidate.bare) command = stripProse(dropLeadingImperative(command, allowedPrefixes), allowedPrefixes);
+		// Cleanup removes prose only. Shell syntax in the removed part ("npm test should pass; rm x") keeps the whole
+		// line, which is then rejected; a remark in parentheses without shell syntax is prose ("node --test (all suites)").
+		const removed = raw.startsWith(command) ? raw.slice(command.length) : raw;
+		if (unsafe.test(removed.replace(/\([^()]*\)/g, (group) => (unsafe.test(group.slice(1, -1)) ? group : "")))) command = raw;
+		if (!command) continue;
+		// The unsafe check and the parser see exactly what would run; nothing malformed runs in any other shape.
+		let argv: string[];
+		try {
+			if (unsafe.test(command)) throw new Error("shell operators, redirections and variables are not allowed");
+			argv = parseCommand(command);
+		} catch (error) {
+			if (looksAllowlisted(command, allowedPrefixes)) rejected?.push(`${command} (${error instanceof Error ? error.message : String(error)})`);
+			continue;
+		}
+		// The decision is structural, on the parsed arguments, never on the text.
+		if (!allowlisted(argv, allowedPrefixes)) continue;
+		command = formatCommand(argv);
 		if (!result.includes(command)) result.push(command);
 	}
 	return result.slice(0, 4);

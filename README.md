@@ -11,10 +11,12 @@ SupervisedCoding turns Pi into a small engineering team. The model you talk to b
 Its priorities, in order:
 
 1. correct, well-made code with as few defects as possible;
-2. the right model and effort for each situation;
-3. no interruptions when a model runs out of credits: the next one takes over;
-4. as few tokens as possible, **never** at the expense of quality;
+2. the fewest tokens that quality allows — **fewer in total**, not the same amount moved to another model;
+3. the right model and effort for each situation;
+4. no interruptions when a model runs out of credits: the next one takes over;
 5. speed comes last.
+
+Delegation is a means, not the goal. The supervisor delegates when handing work to a disposable context costs less than holding that code in its own, and makes the change itself when it does not. [When it pays off](#when-it-pays-off) has the numbers.
 
 ## Features
 
@@ -30,8 +32,46 @@ Its priorities, in order:
 - **Flagship models on request only.** Top-tier models (e.g. Claude Fable, GPT-6 Astra) run only on critical tasks and only after you say yes.
 - **Budgets that keep your work.** Turn, time and cost limits stop a delegation between phases. The worker's session is kept, so the next step resumes it instead of starting over.
 - **Guard rails.** Path allowlists, Git checks after every run, read-only reviewers, and no commit or push without your confirmation.
+- **Small changes without a worker.** A change of about twenty lines or fewer, or one short new file, whose exact content the supervisor already knows costs no delegation at all: it edits, runs the checks with `run_verification` and accepts. A worker is started only when it keeps code out of the supervisor's context that would otherwise stay there for the rest of the session.
+- **Workers do not repeat the checks.** The extension runs the `VERIFY` commands on the finished work and hands back any failure, so the worker does not spend turns — and its whole test output, on every later turn — running them itself. Turn caps per profile (16/32/64/96) bound what a worker can accumulate before it reports.
 - **A lean supervisor context.** Between prompts, bulky tool results of accepted tasks become one-line notes and reads of files a later delegation changed are marked outdated (Pi context edits: the session history is kept). Fresh workers get a map of large files (outline with line ranges, uses of the symbols the guide names), so they read ranges instead of whole files.
 - **Transparent accounting.** Tokens and cost per model and role, with subscriptions kept apart from pay-per-use spend, plus a log of every invocation.
+
+## When it pays off
+
+A model re-reads its whole context on every turn, so what a session costs is roughly *turns × context*, not the size of the code it writes. That single fact decides when two models are cheaper than one.
+
+**A delegation has a floor.** Starting a Claude Code worker costs on the order of 100k tokens before it changes a line: its own prompt, tools and file reads, re-read on each of its turns. Measured here, writing one 27-line file cost 118k tokens of worker; deleting one unused import cost about as much.
+
+**What a delegation buys back** is context the supervisor never has to hold. Code the supervisor reads stays in its context and is re-sent on every later turn of the session; code a worker reads dies with the worker. So:
+
+> delegate when *(tokens of code you would have to hold) × (your remaining turns)* exceeds the delegation's floor.
+
+With 20k of code and five turns left, a delegation is already cheaper. With two lines of YAML, it never is.
+
+The same small task — add a CI workflow to this repository — measured three ways, end to end:
+
+| | tokens | cost | wall |
+|---|---|---|---|
+| delegating it (before) | 285k | $0.20 metered + a worker on subscription | 7.0 min |
+| one model alone, no extension | 218k | $0.33 | 4.2 min |
+| the supervisor doing it itself (now) | 70k | $0.13 | 2.1 min |
+
+Same result, and a better one: all three of the project's checks actually ran, which the delegated version could not do.
+
+**Where it clearly wins**
+
+- Long sessions with many tasks in one repository: every file a worker read and discarded would otherwise have been re-sent for the rest of the session, and the supervisor reaches the end without compaction — which costs a full pass and loses detail.
+- Large, exploratory or multi-file work: refactoring, debugging across modules, migrations.
+- Reviews and audits of more code than one context should hold: `review_changes` and `consult_readonly` keep whole diffs and whole directories out of the supervisor entirely. This is where the extension is cheapest by a wide margin, delegation or not.
+- Work spanning subscriptions and pay-per-use accounts, or a provider running out mid-task.
+
+**Where it does not**
+
+- One small, fully specified change in a short session: two contexts cost more than one. The supervisor now makes such a change itself instead.
+- Tasks where quality needs the review machinery: independent review, MAJOR-finding verification and correction rounds **add** tokens by design. They buy defect detection, not savings, and stay gated by profile for that reason.
+
+**What saves tokens regardless of delegation** is context discipline, and it is the largest effect measured here: `code_outline` gave the supervisor a 4,176-line file as 20 KB of declarations with line ranges instead of 260 KB of source — about 66k tokens saved on that turn *and on every later turn of the session*. Ranged reads, no re-reads, `consult_readonly` for bulk, and pruning of accepted tasks' results work the same way.
 
 ## How it works
 
@@ -47,10 +87,11 @@ Its priorities, in order:
 
 1. **Explore.** The supervisor reads only the files needed to judge the task, in parallel.
 2. **Classify.** It picks a profile — `small`, `medium`, `large`, `critical` — and an assessment. The assessment can only **raise** the profile: security, concurrency, migrations or high risk mean critical; architecture, cross-system scope or high uncertainty mean at least large; several files mean at least medium. Large and critical work, or work that needs several steps, is recorded with `plan_task` first.
-3. **Delegate.** `delegate_implementation` receives the guide and the authorized paths. The extension picks the worker, runs the `VERIFY` commands (baseline), lets the worker implement, runs the commands again, and hands regressions back to the same worker session.
-4. **Review.** For large and critical profiles, an independent reviewer gets the diff of this step, plus the changed files when they fit.
-5. **Accept.** The supervisor reads the result (the diff is included) and calls `complete_task`. For large or critical tasks done in several steps (or whose last step was not reviewed), this first runs a review of the whole task diff.
-6. **Learn.** The outcome is recorded for calibration. Durable pitfalls become lessons (`record_lesson`), which every later worker in the repository receives.
+3. **Decide whether to delegate.** A small, fully determined change the supervisor can write itself is made directly and verified with `run_verification`; anything that needs exploration, spans several files or symbols, is long or is risky goes to a worker. One change is never split between the two.
+4. **Delegate.** `delegate_implementation` receives the guide and the authorized paths. The extension picks the worker, runs the `VERIFY` commands (baseline), lets the worker implement, runs the commands again, and hands regressions back to the same worker session.
+5. **Review.** For large and critical profiles, an independent reviewer gets the diff of this step, plus the changed files when they fit.
+6. **Accept.** The supervisor reads the result (the diff is included) and calls `complete_task`. For large or critical tasks done in several steps (or whose last step was not reviewed), this first runs a review of the whole task diff.
+7. **Learn.** The outcome is recorded for calibration. Durable pitfalls become lessons (`record_lesson`), which every later worker in the repository receives.
 
 ### How the model and effort are chosen
 
@@ -216,7 +257,7 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `learning.enabled`, `learning.autoTuneEffort`, `learning.autoRouteModels`, `learning.minModelSamples` | learning, effort calibration, evidence-based reordering |
 | `autoVerify`, `maxCorrectionRounds`, `verificationCommands`, `verificationTimeoutMinutes` | automatic verification and allowlisted commands |
 | `reuseChecks` | reuse a check's result within one prompt when it already ran on exactly the same repository state (HEAD, index, every changed or untracked file); off when the supervisor has `bash` |
-| `workerMaxTurns`, `delegationTimeoutMinutes`, `delegationBudgetUsd` | budgets |
+| `workerMaxTurns`, `delegationTimeoutMinutes`, `delegationBudgetUsd` | budgets. `workerMaxTurns` (default 16/32/64/96 per profile) is what bounds a worker's cost, since it re-reads its context on every turn: reaching the cap stops the delegation but keeps the session and the work, so the supervisor continues it |
 | `creditHeadroom`, `exhaustedCooldownMinutes`, `unavailableCooldownMinutes`, `probeTtlMinutes`, `probeMaxTokens` | credit handling |
 | `transientRetryAttempts`, `transientRetryDelayMs`, `workerTimeoutMinutes`, `consultTimeoutMinutes` | retries and timeouts (0 = none) |
 | `workerCommand`, `piCommand`, `piWorkerTools`, `piReadOnlyTools`, `worker*`, `claudeReadOnly*` | CLIs and tool permissions |
@@ -226,7 +267,8 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `reviewConcurrency`, `reviewMaxShards`, `auditShardBytes`, `auditMaxShards` | parallel reviewers; parts of a `review_changes` diff (each up to `maxDiffBytes`); source per audit consultant and number of consultants |
 | `reviewWholeFilesBytes`, `reviewContextBytes` | whole changed files for the API reviewer up to this size (above it, up to 250 KB, the code around the changes and outlines of large files); code around the changes and uses of changed declarations given to every reviewer |
 | `workerCodeMapBytes` | map of large authorized files given to fresh workers (0 disables it) |
-| `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `supervisorTools`, `contextWarningPercent` | supervisor behavior |
+| `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `contextWarningPercent` | supervisor behavior |
+| `supervisorTools` | what the supervisor keeps while the extension is on. `edit` and `write` are included so a small, fully specified change costs no worker; removing them makes every change go through a delegation again |
 
 ## Data and privacy
 
@@ -253,6 +295,9 @@ The tests never call a real model: they run the real extension against fake Clau
 | File | Contents |
 |---|---|
 | `index.ts` | Pi integration: tools, command, events, workers, verification, review, supervisor selection |
+| `process-runner.ts` | process invocation, output limits, timeout and abort handling, executable resolution |
+| `git-safety.ts` | Git commands, snapshots and fingerprints, changed-file comparison, path scope |
+| `verification.ts` | verification commands parsed without a shell, allowlist, launcher resolution |
 | `lib.ts` | failure classification, limit parsing, provider health, ranking |
 | `learning.ts` | outcomes, effort calibration, lessons, verdicts, `VERIFY` extraction |
 | `routing.ts` | task assessment, escalation, evidence-based ordering |
@@ -280,10 +325,12 @@ SupervisedCoding trasforma Pi in un piccolo team di sviluppo. Il modello con cui
 Le sue priorità, in ordine:
 
 1. codice corretto, ben fatto e con meno errori possibili;
-2. il modello e l'effort giusti per ogni situazione;
-3. nessuna interruzione quando un modello esaurisce i crediti: subentra il successivo;
-4. il minor consumo di token possibile, ma **mai** a scapito della qualità;
+2. il minor consumo di token che la qualità permette — **meno in totale**, non la stessa quantità spostata su un altro modello;
+3. il modello e l'effort giusti per ogni situazione;
+4. nessuna interruzione quando un modello esaurisce i crediti: subentra il successivo;
 5. la velocità viene per ultima.
+
+La delega è un mezzo, non l'obiettivo. Il supervisore delega quando passare il lavoro a un contesto usa-e-getta costa meno che tenersi quel codice nel proprio, e fa la modifica da sé quando non è così. [Quando conviene](#quando-conviene) ha i numeri.
 
 ## Funzionalità
 
@@ -299,8 +346,46 @@ Le sue priorità, in ordine:
 - **Modelli di punta solo su richiesta.** I modelli di fascia alta (es. Claude Fable, GPT-6 Astra) si usano solo nei task critical e solo dopo il tuo sì.
 - **Budget che non buttano il lavoro.** Limiti di turni, tempo e costo fermano una delega tra una fase e l'altra. La sessione del worker resta, quindi il passo successivo la riprende invece di ricominciare.
 - **Protezioni.** Percorsi autorizzati, controlli Git dopo ogni esecuzione, revisori in sola lettura, nessun commit o push senza la tua conferma.
+- **Modifiche piccole senza worker.** Una modifica di circa venti righe o meno, o un file nuovo breve, di cui il supervisore conosce già il contenuto esatto non costa nessuna delega: modifica, esegue le verifiche con `run_verification` e accetta. Un worker parte solo quando tiene fuori dal contesto del supervisore codice che altrimenti resterebbe lì per tutto il resto della sessione.
+- **I worker non ripetono le verifiche.** L'estensione esegue i comandi `VERIFY` sul lavoro finito e rimanda indietro gli errori, così il worker non spende turni — e l'intero output dei test, a ogni suo turno successivo — per eseguirli da sé. I limiti di turni per profilo (16/32/64/96) delimitano quanto un worker può accumulare prima di riportare.
 - **Contesto del supervisore snello.** Tra un prompt e l'altro, i risultati voluminosi dei task accettati diventano note di una riga e le letture di file poi modificati da una delega vengono segnate come obsolete (context edit di Pi: la cronologia della sessione resta). I worker nuovi ricevono una mappa dei file grandi (struttura con intervalli di righe, usi dei simboli nominati nella guida), così leggono intervalli invece di file interi.
 - **Consumi trasparenti.** Token e costi per modello e per ruolo, con gli abbonamenti separati dalla spesa a consumo, più un registro di ogni invocazione.
+
+## Quando conviene
+
+Un modello rilegge tutto il suo contesto a ogni turno: quello che costa una sessione è quindi circa *turni × contesto*, non la quantità di codice prodotto. Questo solo fatto decide quando due modelli costano meno di uno.
+
+**Una delega ha un pavimento.** Avviare un worker Claude Code costa nell'ordine di 100k token prima di cambiare una riga: prompt, strumenti e letture propri, riletti a ogni suo turno. Misurato qui: scrivere un file di 27 righe è costato 118k token di worker; cancellare un import inutilizzato è costato più o meno lo stesso.
+
+**Quello che una delega restituisce** è contesto che il supervisore non deve tenersi. Il codice che il supervisore legge resta nel suo contesto e viene rispedito a ogni turno successivo della sessione; il codice che legge un worker muore con il worker. Quindi:
+
+> delega quando *(token di codice che dovresti tenerti) × (i tuoi turni rimanenti)* supera il pavimento della delega.
+
+Con 20k di codice e cinque turni davanti, la delega conviene già. Con due righe di YAML, non converrà mai.
+
+Lo stesso task piccolo — aggiungere un workflow di CI a questo repository — misurato in tre modi, end-to-end:
+
+| | token | costo | tempo |
+|---|---|---|---|
+| delegandolo (prima) | 285k | $0,20 a consumo + un worker su abbonamento | 7,0 min |
+| un modello solo, senza estensione | 218k | $0,33 | 4,2 min |
+| il supervisore che lo fa da sé (ora) | 70k | $0,13 | 2,1 min |
+
+Stesso risultato, e migliore: tutti e tre i controlli del progetto sono stati davvero eseguiti, cosa che la versione delegata non poteva fare.
+
+**Dove conviene chiaramente**
+
+- Sessioni lunghe con molti task nello stesso repository: ogni file che un worker ha letto e buttato via sarebbe altrimenti stato rispedito per tutto il resto della sessione, e il supervisore arriva in fondo senza compattazione — che costa un passaggio intero e perde dettaglio.
+- Lavori grandi, esplorativi o multi-file: refactoring, debug tra moduli, migrazioni.
+- Review e audit di più codice di quanto un contesto debba contenere: `review_changes` e `consult_readonly` tengono diff interi e directory intere completamente fuori dal supervisore. È qui che l'estensione risparmia di più, con o senza delega.
+- Lavori a cavallo di abbonamenti e account a consumo, o con un provider che esaurisce i crediti a metà task.
+
+**Dove non conviene**
+
+- Una modifica piccola e completamente specificata in una sessione breve: due contesti costano più di uno. Ora il supervisore fa da sé una modifica così.
+- Task in cui la qualità richiede la macchina delle review: review indipendente, verifica delle MAJOR e round di correzione **aggiungono** token per costruzione. Comprano rilevamento di difetti, non risparmio, e per questo restano legati al profilo.
+
+**Ciò che fa risparmiare a prescindere dalla delega** è la disciplina di contesto, ed è l'effetto più grande misurato qui: `code_outline` ha dato al supervisore un file di 4.176 righe come 20 KB di dichiarazioni con intervalli di riga invece di 260 KB di sorgente — circa 66k token risparmiati su quel turno *e su ogni turno successivo della sessione*. Letture per intervalli, nessuna rilettura, `consult_readonly` per il materiale voluminoso e il pruning dei risultati dei task accettati funzionano allo stesso modo.
 
 ## Come funziona
 
@@ -316,10 +401,11 @@ Le sue priorità, in ordine:
 
 1. **Esplorazione.** Il supervisore legge solo i file necessari per valutare il task, in parallelo.
 2. **Classificazione.** Sceglie un profilo — `small`, `medium`, `large`, `critical` — e un assessment. L'assessment può solo **alzare** il profilo: sicurezza, concorrenza, migrazioni o rischio alto portano a critical; architettura, portata cross-system o incertezza alta ad almeno large; più file ad almeno medium. I lavori large e critical, o in più passi, vengono prima registrati con `plan_task`.
-3. **Delega.** `delegate_implementation` riceve la guida e i percorsi autorizzati. L'estensione sceglie il worker, esegue i comandi `VERIFY` (baseline), fa implementare, riesegue i comandi e rimanda le regressioni alla stessa sessione del worker.
-4. **Review.** Nei profili large e critical un revisore indipendente riceve il diff di questo passo, più i file modificati quando entrano nel materiale.
-5. **Accettazione.** Il supervisore legge il risultato (il diff è incluso) e chiama `complete_task`. Nei task large o critical svolti in più passi (o il cui ultimo passo non è stato rivisto) questo avvia prima una review del diff complessivo.
-6. **Apprendimento.** L'esito viene registrato per la calibrazione. Le insidie durature diventano lezioni (`record_lesson`), che ogni worker successivo nel repository riceve.
+3. **Decisione se delegare.** Una modifica piccola e completamente determinata, che il supervisore può scrivere da sé, viene fatta direttamente e verificata con `run_verification`; tutto ciò che richiede esplorazione, tocca più file o simboli, è lungo o è rischioso va a un worker. Una singola modifica non viene mai divisa tra i due.
+4. **Delega.** `delegate_implementation` riceve la guida e i percorsi autorizzati. L'estensione sceglie il worker, esegue i comandi `VERIFY` (baseline), fa implementare, riesegue i comandi e rimanda le regressioni alla stessa sessione del worker.
+5. **Review.** Nei profili large e critical un revisore indipendente riceve il diff di questo passo, più i file modificati quando entrano nel materiale.
+6. **Accettazione.** Il supervisore legge il risultato (il diff è incluso) e chiama `complete_task`. Nei task large o critical svolti in più passi (o il cui ultimo passo non è stato rivisto) questo avvia prima una review del diff complessivo.
+7. **Apprendimento.** L'esito viene registrato per la calibrazione. Le insidie durature diventano lezioni (`record_lesson`), che ogni worker successivo nel repository riceve.
 
 ### Come si scelgono modello ed effort
 
@@ -522,6 +608,9 @@ I test non chiamano mai un modello reale: eseguono la vera estensione contro CLI
 | File | Contenuto |
 |---|---|
 | `index.ts` | integrazione con Pi: strumenti, comando, eventi, worker, verifica, review, scelta del supervisore |
+| `process-runner.ts` | avvio dei processi, limiti di output, timeout e interruzione, risoluzione degli eseguibili |
+| `git-safety.ts` | comandi Git, snapshot e fingerprint, confronto dei file modificati, ambito dei percorsi |
+| `verification.ts` | comandi di verifica analizzati senza shell, allowlist, risoluzione dei launcher |
 | `lib.ts` | classificazione degli errori, lettura dei limiti, stato dei provider, ordinamento |
 | `learning.ts` | esiti, calibrazione dell'effort, lezioni, verdetti, estrazione di `VERIFY` |
 | `routing.ts` | assessment del task, escalation, ordinamento basato su evidenze |

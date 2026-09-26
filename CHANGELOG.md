@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+> This release changes what the extension optimizes for: **fewer tokens in total**, not the same amount moved from the
+> supervisor to a worker. Measured on two real tasks, a delegation costs on the order of 100k tokens before it changes a
+> line, so delegating a small, fully specified change lost tokens instead of saving them. Delegation is now a decision,
+> not a default. README has the economics and the cases where it pays off.
+
+### Added
+
+- The supervisor keeps `edit` and `write` (`supervisorTools`), and its policy states when to use them: a change of about twenty lines or fewer, or one short new file, whose exact content it already knows and whose code it has already read, is made directly and verified with `run_verification` instead of starting a worker. Anything that needs exploration, spans several files or symbols, is long or is risky is still delegated, and one change is never split between the two.
+- `npm audit --omit=dev` and `npm pack --dry-run` to the default `verificationCommands`: both are read-only, so the supervisor can run them with `run_verification` and put them in `VERIFY`, and workers are authorized for them like every other check. No mutating form is allowed (`npm audit fix`, or `npm pack` without `--dry-run`, which writes a tarball into the repository).
+
+### Changed
+
+- Workers no longer run the project's checks themselves: the extension runs the `VERIFY` commands on the finished work and hands back any failure, so a worker does not spend turns on them and does not carry their whole output into every one of its later turns. It is still authorized to run them.
+- `workerMaxTurns` defaults drop to 16/32/64/96 per profile (were 40/80/120/160). A worker re-reads its context on every turn, so its cost is turns × context: in a measured refactor one worker used all 80 turns of the medium profile and 3.9M cache-read tokens. Reaching the cap still stops the delegation while keeping the session and the work, so the supervisor continues it.
+- A `VERIFY` line that lists several commands separated by `;` or `&&` now contributes each of them, run one by one and never through a shell: `VERIFY: npm test; npm audit --omit=dev` used to be rejected whole, which silently left a delegation without any automatic verification. Each part is still parsed and allowlisted on its own, so an unknown or dangerous neighbour never runs. A line whose parts would change the working directory or the environment (`cd packages/app && npm test`) is still kept whole and rejected, because running only part of it would check the wrong place; any other shell syntax (a pipe, a redirection, `||`, a single `&`, a substitution) still rejects the line.
+- A full stop ends a bare `VERIFY` command wherever it appears, not only at the end of the line, so the sentence after it stays prose (`VERIFY: npm pack --dry-run --json. Also validate the workflow.`). Dots that belong to a command (`npx tsc -p .`, `go test ./...`, `npx eslint src/.`) are kept.
+- Claude workers now receive the `[WORKER NOTES]`, which only Pi workers without a shell used to get: every worker is now told which commands the extension will run on its work, not to run them itself, and never to claim a check it could not run.
+
+### Fixed
+
+- `complete_task` could not close a change the supervisor made itself: with no `plan_task` and no delegation there is no task packet, so it answered "No supervised task to complete". It now accepts such a change on the evidence of its own checks — at least one `run_verification` of this prompt passed and none failed — and says that nothing was recorded for worker learning, since no worker ran. A failing check of its own blocks acceptance exactly like a regression does.
+- `VERIFY: Run npm test after the extraction` ran no check: the leading verb was read as the executable, so the delegation went unverified and the worker was left to check itself. An imperative introducing a bare command (`Run`, `Then execute`, `Please rerun`, …) is now dropped, one word at a time, only as long as what follows is an allowlisted command. A line that forbids a command (`Do not run npm test`) still yields nothing.
+
 ## [0.3.0] — 2026-09-25
 
 ### Added

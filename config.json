@@ -175,6 +175,8 @@
     "npm run typecheck",
     "npm run check",
     "npm run build",
+    "npm audit --omit=dev",
+    "npm pack --dry-run",
     "npx tsc",
     "npx vitest run",
     "npx eslint",
@@ -272,6 +274,8 @@
   ],
   "supervisorTools": [
     "read",
+    "edit",
+    "write",
     "grep",
     "find",
     "ls",
@@ -312,10 +316,10 @@
   "probeMaxTokens": 128,
   "reviewMaxTokens": 8192,
   "workerMaxTurns": {
-    "small": 40,
-    "medium": 80,
-    "large": 120,
-    "critical": 160
+    "small": 16,
+    "medium": 32,
+    "large": 64,
+    "critical": 96
   },
   "delegationTimeoutMinutes": 120,
   "delegationBudgetUsd": 0,

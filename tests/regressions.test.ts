@@ -51,7 +51,7 @@ function configure(overrides: Record<string, unknown>, plan: Record<string, Step
 	fs.writeFileSync(planFile, JSON.stringify(plan));
 }
 
-function calls(): Array<{ cli: string; model: string; effort?: string; maxTurns?: string; resume?: string; mode?: string; tools?: string; prompt: string }> {
+function calls(): Array<{ cli: string; model: string; effort?: string; maxTurns?: string; resume?: string; mode?: string; tools?: string; allowedTools?: string; prompt: string }> {
 	return fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
@@ -72,6 +72,7 @@ function makeHost(repo: string) {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const notifications: string[] = [];
+	const statuses: Array<string | undefined> = [];
 	const questions: string[] = [];
 	const handlers = new Map<string, any>();
 	let answer = "No";
@@ -107,7 +108,7 @@ function makeHost(repo: string) {
 				questions.push(title);
 				return answer;
 			},
-			setStatus: () => undefined,
+			setStatus: (_type: string, text: string | undefined) => { statuses.push(text); },
 			theme: { fg: (_: string, text: string) => text },
 		},
 		getContextUsage: () => undefined,
@@ -131,14 +132,14 @@ function makeHost(repo: string) {
 	extension(pi);
 	return {
 		ctx,
-		command: (args: string) => commands.get("SupervisedCoding").handler(args, ctx), notifications,
+		command: (args: string) => commands.get("SupervisedCoding").handler(args, ctx), notifications, statuses,
 		apiCalls,
 		setApiReply: (text: string) => { apiReply = text; },
 		setAnswer: (value: string) => { answer = value; },
 		questions,
 		handlers,
 		on: () => commands.get("SupervisedCoding").handler("on", ctx),
-		call: (name: string, params: any) => tools.get(name).execute("t", params, undefined, undefined, ctx),
+		call: (name: string, params: any, signal?: AbortSignal) => tools.get(name).execute("t", params, signal, undefined, ctx),
 	};
 }
 
@@ -411,6 +412,18 @@ test("AUDIT-2 B4: past the time limit, no correction round or review starts, and
 	assert.match(result.content[0].text, /No further correction round/);
 });
 
+test("AUDIT-2 B4: task-start checks that outlast the time limit never keep the first worker from starting", async () => {
+	const slowCheck = `import test from "node:test";\nimport assert from "node:assert";\nimport fs from "node:fs";\ntest("value", async () => { await new Promise((resolve) => setTimeout(resolve, 1000)); assert.equal(fs.readFileSync("value.txt", "utf8"), "ok"); });\n`;
+	configure({ delegationTimeoutMinutes: 0.01, independentReviewProfiles: ["medium"] }, { "claude-sonnet-5": [{ write: { "value.txt": "bad" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "ok", "slow.test.mjs": slowCheck }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ["node --test slow.test.mjs"]) });
+	assert.equal(calls().length, 1, "the worker starts; no correction round follows past the limit");
+	assert.match(result.details.limitReached, /delegation time limit/);
+	assert.equal(result.details.sessionPreserved, true);
+	assert.match(result.content[0].text, /No further correction round/);
+});
+
 test("AUDIT-2 B5: a reviewer stopped at the profile's turn limit hands over to the next reviewer", async () => {
 	// Opus implements; the first independent reviewer is GPT-5.5 through Pi, which keeps working until the extension stops it.
 	configure({ independentReviewProfiles: ["large"], flagshipModels: ["claude-fable-5-1", "gpt-6-astra"] }, { "claude-opus-5-5": [{ write: { "a.txt": "done" } }], "gpt-5.5": [{ action: "turns" }], "claude-sonnet-5": [{ text: "No defect.\nVERDICT: PASS" }] });
@@ -431,6 +444,30 @@ test("AUDIT-2 B6: the default configuration does not switch supervisor models ar
 	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
 	await host.call("complete_task", { decision: "accept", summary: "Reviewed the diff; trivial change." });
 	assert.deepEqual(host.notifications.slice(before).filter((text) => text.startsWith("Supervisor model:")), []);
+});
+
+test("bottom bar tracks the actual supervisor model and thinking effort after extension switches", async () => {
+	configure({
+		supervisorChain: [{ provider: "openai-codex", model: "gpt-5.5" }, { provider: "openai-codex", model: "gpt-6-sol" }],
+		supervisorProfiles: { small: [{ provider: "openai-codex", model: "gpt-6-sol" }] },
+		supervisorEffort: { ...baseConfig.supervisorEffort, default: "medium", small: "high" },
+	}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	assert.match(host.statuses.at(-1) ?? "", /openai-codex\/gpt-5\.5\/medium/);
+	await host.call("delegate_implementation", { task: "change", profile: "small", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	assert.match(host.statuses.at(-1) ?? "", /SupervisedCoding openai-codex\/gpt-6-sol\/high \(auto\) · small/);
+});
+
+test("bottom bar uses model_select and thinking_level_select event values as authoritative", async () => {
+	configure({ supervisorChain: [] }, {});
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	host.ctx.model = { provider: "openai-codex", id: "gpt-5.5" };
+	host.handlers.get("model_select")({ type: "model_select", model: { provider: "openai-codex", id: "gpt-6-sol" }, previousModel: host.ctx.model, source: "set" }, host.ctx);
+	assert.match(host.statuses.at(-1) ?? "", /openai-codex\/gpt-6-sol\/medium/);
+	host.handlers.get("thinking_level_select")({ type: "thinking_level_select", level: "xhigh", previousLevel: "medium" }, host.ctx);
+	assert.match(host.statuses.at(-1) ?? "", /openai-codex\/gpt-5\.5\/xhigh/);
 });
 
 test("AUDIT-2 B6: complete_task never switches the supervisor before the final answer", async () => {
@@ -570,7 +607,7 @@ test("a GPT model implements through Pi: no shell, no extensions, effort as thin
 	assert.deepEqual([call.cli, call.provider, call.model, call.effort], ["pi", "openai-codex", "gpt-5.5", "high"]);
 	assert.equal(call.extensions, false, "the worker must not load SupervisedCoding itself");
 	assert.doesNotMatch(call.tools, /bash/);
-	assert.match(call.prompt, /\[WORKER NOTES\][\s\S]*do not claim checks passed/);
+	assert.match(call.prompt, /\[WORKER NOTES\][\s\S]*Never claim a check passed that you could not run/);
 	const entry = (Object.values(host.ctx.auditState.metrics.byModel) as Array<{ worker: string; model: string; input: number; billing?: string }>).find((item) => item.worker === "pi");
 	assert.deepEqual([entry?.model, entry?.input, entry?.billing], ["gpt-5.5", 200, "subscription"]);
 });
@@ -1003,4 +1040,392 @@ test("OUTLINE: code_outline references list the uses of a symbol with their encl
 	assert.match(scoped, /^Store: 2 references in 1 file$/m);
 	await assert.rejects(host.call("code_outline", { references: ["--open-files-in-pager"] }), /Not a symbol name/);
 	await assert.rejects(host.call("code_outline", {}), /needs paths/);
+});
+
+// ── Verification without a shell ───────────────────────────────────────────────────────────────────
+
+const SENTINEL = `import fs from "node:fs";\nfs.writeFileSync("ran.txt", JSON.stringify(process.argv.slice(2)));\n`;
+
+test("SHELL-LESS: run_verification passes a quoted argument with spaces as one argument", async () => {
+	configure({}, {});
+	const host = makeHost(makeRepo({ "value.txt": "ok", "spaced name.test.mjs": PASSING_CHECK }));
+	await host.on();
+	for (const command of ['node --test "spaced name.test.mjs"', "node   --test   'spaced name.test.mjs'"]) {
+		const result = await host.call("run_verification", { command });
+		assert.equal(result.isError, false, result.content[0].text);
+		assert.equal(result.details.command, 'node --test "spaced name.test.mjs"', "one canonical spelling keys baselines and reuse");
+		assert.match(result.content[0].text, /^\$ node --test "spaced name\.test\.mjs"\nexit code 0/);
+	}
+});
+
+test("SHELL-LESS: npm and npx start without a shell on every platform, arguments intact", async () => {
+	configure({ verificationCommands: ["npm test", "npx --version"] }, {});
+	const repo = makeRepo({ "args.mjs": SENTINEL, "package.json": JSON.stringify({ scripts: { test: "node args.mjs" } }) });
+	const host = makeHost(repo);
+	await host.on();
+	const npm = await host.call("run_verification", { command: 'npm test -- "a b" c' });
+	assert.equal(npm.isError, false, npm.content[0].text);
+	assert.deepEqual(JSON.parse(fs.readFileSync(path.join(repo, "ran.txt"), "utf8")), ["a b", "c"]);
+	const npx = await host.call("run_verification", { command: "npx --version" });
+	assert.equal(npx.isError, false, npx.content[0].text);
+	assert.match(npx.content[0].text, /exit code 0[\s\S]*\d+\.\d+\.\d+/);
+});
+
+test("SHELL-LESS: malformed, shell and lookalike commands are rejected before anything runs", async () => {
+	configure({}, {});
+	const repo = makeRepo({ "args.mjs": SENTINEL, "package.json": JSON.stringify({ scripts: { test: "node args.mjs", tester: "node args.mjs" } }) });
+	const host = makeHost(repo);
+	await host.on();
+	await assert.rejects(host.call("run_verification", { command: 'npm test -- --grep "a b' }), /unterminated double quote/);
+	await assert.rejects(host.call("run_verification", { command: "npm test; node args.mjs" }), /shell operators/);
+	await assert.rejects(host.call("run_verification", { command: "npm test\nnode args.mjs" }), /line breaks/);
+	await assert.rejects(host.call("run_verification", { command: "npm tester" }), /Command not allowlisted: npm tester/);
+	await assert.rejects(host.call("run_verification", { command: "npm-test" }), /Command not allowlisted/);
+	await assert.rejects(host.call("run_verification", { command: "node --testx args.mjs" }), /Command not allowlisted/);
+	assert.equal(fs.existsSync(path.join(repo, "ran.txt")), false);
+});
+
+test("SHELL-LESS: VERIFY runs quoted arguments whole and reports a malformed command instead of running it", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }] });
+	const repo = makeRepo({ "value.txt": "bad", "spaced name.test.mjs": PASSING_CHECK, "args.mjs": SENTINEL, "package.json": JSON.stringify({ scripts: { test: "node args.mjs" } }) });
+	const host = makeHost(repo);
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["value.txt"], implementationGuide: guide(["value.txt"], ['node --test "spaced name.test.mjs"', 'npm test -- --grep "a b']) });
+	assert.equal(result.details.verification, "passed", result.content[0].text);
+	assert.deepEqual(result.details.verificationCommandsRun, ['node --test "spaced name.test.mjs"']);
+	assert.match(result.content[0].text, /VERIFY commands rejected, not run[^\n]*npm test -- --grep "a b \(unterminated double quote\)/);
+	assert.equal(fs.existsSync(path.join(repo, "ran.txt")), false, "the malformed command never ran in any shape");
+});
+
+test("SHELL-LESS: a VERIFY line listing commands runs the allowlisted ones, and only those", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old", "keep.txt": "keep", "args.mjs": SENTINEL, "package.json": JSON.stringify({ scripts: { test: "node args.mjs" } }) });
+	const host = makeHost(repo);
+	await host.on();
+	const implementationGuide = guide(["a.txt"]).replace("- Read the files back.", "- npm test; rm -rf keep.txt");
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide });
+	assert.deepEqual(result.details.verificationCommandsRun, ["npm test"], result.content[0].text);
+	assert.equal(result.details.verification, "passed");
+	assert.ok(fs.existsSync(path.join(repo, "ran.txt")), "the allowlisted command ran, without a shell");
+	assert.ok(fs.existsSync(path.join(repo, "keep.txt")), "the command beside it is not allowlisted and never ran");
+});
+
+test("SHELL-LESS: every other shell operator still rejects the whole VERIFY line, nothing is cleaned into a command", async () => {
+	for (const line of ["npm test | tee log.txt", "npm test > out.txt", "npm test & node args.mjs", "npm test $(node args.mjs)"]) {
+		configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+		const repo = makeRepo({ "a.txt": "old", "args.mjs": SENTINEL, "package.json": JSON.stringify({ scripts: { test: "node args.mjs" } }) });
+		const host = makeHost(repo);
+		await host.on();
+		const implementationGuide = guide(["a.txt"]).replace("- Read the files back.", `- ${line}`);
+		const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide });
+		assert.equal(result.details.verification, "unverified", line);
+		assert.deepEqual(result.details.verificationCommandsRun, [], line);
+		assert.match(result.content[0].text, /VERIFY commands rejected, not run/, line);
+		assert.equal(fs.existsSync(path.join(repo, "ran.txt")), false, `nothing ran for: ${line}`);
+	}
+});
+
+/**
+ * A VERIFY tool on PATH that the scripted worker deletes (action "remove"): on Windows a yarn cmd-shim whose Node
+ * script goes away, elsewhere an executable script. `write` puts the script back with another body.
+ */
+function removableTool(body: string) {
+	const windows = process.platform === "win32";
+	const tool = windows ? "yarn" : "sc-verify-tool";
+	const script = windows ? "bin/yarn.js" : `bin/${tool}`;
+	const content = (text: string) => (windows ? text : `#!/usr/bin/env node\n${text}`);
+	const files: Record<string, string> = windows ? { "bin/yarn.cmd": '@echo off\r\nnode "%~dp0\\yarn.js" %*\r\n', [script]: content(body) } : { [script]: content(body) };
+	const write = (repo: string, text: string) => {
+		fs.writeFileSync(path.join(repo, script), content(text));
+		if (!windows) fs.chmodSync(path.join(repo, script), 0o755);
+	};
+	const remove = `if (step.action === "remove") fs.rmSync(path.join(process.cwd(), ${JSON.stringify(script)}));`;
+	const overrides = { workerCommandArgs: [scriptedClaude("remove-claude", remove)], verificationCommands: [...baseConfig.verificationCommands, "sc-verify-tool"] };
+	/** Runs `use` with the repository's bin directory first on PATH. */
+	const onPath = async (repo: string, use: () => Promise<void>) => {
+		if (!windows) fs.chmodSync(path.join(repo, script), 0o755);
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${path.join(repo, "bin")}${path.delimiter}${savedPath}`;
+		try {
+			await use();
+		} finally {
+			process.env.PATH = savedPath;
+		}
+	};
+	return { tool, script, command: `${tool} test`, files, write, overrides, onPath };
+}
+
+test("SHELL-LESS: a check that stops starting after the worker fails the delegation, with no correction round", async () => {
+	const { tool, script, command, files, overrides, onPath } = removableTool("process.exit(0);\n");
+	configure(overrides, { "claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.equal(calls().length, 1, "no correction round for a check that cannot start");
+		assert.equal(result.isError, true);
+		assert.equal(result.details.verification, "failed");
+		assert.equal(result.details.correctionRounds, 0);
+		assert.match(result.content[0].text, new RegExp(`^- ${tool} test: FAIL \\(could not start\\)`, "m"));
+		assert.match(result.content[0].text, /VERIFICATION NOT STARTED/);
+		const packet = host.ctx.auditState.taskPacket;
+		assert.deepEqual([packet.phase, packet.verification, packet.failedChecks, packet.launchFailedChecks], ["failed", "failed", [command], [command]], "only a passing run of the same check clears it");
+		assert.equal(result.details.sessionPreserved, true, "the check changed nothing in Git: the session stays resumable");
+		await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The change itself is fine and reviewed." }), /cannot be accepted/);
+	});
+});
+
+test("SHELL-LESS: a check that could not start is cleared only by passing, never by failing as it did at the task start", async () => {
+	const knownFailure = 'console.log("known failure");\nprocess.exit(1);\n';
+	const { script, command, files, write, overrides, onPath } = removableTool(knownFailure);
+	configure(overrides, { "claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.equal(result.details.verification, "failed", result.content[0].text);
+		const packet = () => host.ctx.auditState.taskPacket;
+		assert.equal(packet().baseline[command], false, "red at the task start");
+		assert.deepEqual(packet().launchFailedChecks, [command]);
+		// It starts again and fails exactly as at the task start: that proves nothing about the worker's change.
+		write(repo, knownFailure);
+		const unchanged = await host.call("run_verification", { command });
+		assert.equal(unchanged.details.state, "unchanged");
+		assert.match(unchanged.content[0].text, /only a passing run clears it/);
+		assert.deepEqual([packet().phase, packet().verification, packet().failedChecks, packet().launchFailedChecks], ["failed", "failed", [command], [command]]);
+		await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The check fails as it did before the task." }), /cannot be accepted/);
+		write(repo, "process.exit(0);\n");
+		const passing = await host.call("run_verification", { command });
+		assert.equal(passing.details.state, "pass");
+		assert.deepEqual([packet().phase, packet().verification, packet().failedChecks, packet().launchFailedChecks], ["implemented", "passed", undefined, undefined]);
+	});
+});
+
+test("SHELL-LESS: follow-up delegations keep a check that could not start as a blocker until it passes", async () => {
+	const knownFailure = 'console.log("known failure");\nprocess.exit(1);\n';
+	const { script, command, files, write, overrides, onPath } = removableTool(knownFailure);
+	configure(overrides, { "claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }, { write: { "b.txt": "follow-up" } }, { write: { "a.txt": "again" } }] });
+	const repo = makeRepo({ "a.txt": "old", "b.txt": "", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const packet = () => host.ctx.auditState.taskPacket;
+		const blocked = () => [packet().phase, packet().verification, packet().failedChecks, packet().launchFailedChecks];
+		const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.deepEqual(blocked(), ["failed", "failed", [command], [command]], first.content[0].text);
+		const accept = () => host.call("complete_task", { decision: "accept", summary: "The follow-up is done and reviewed." });
+
+		// A follow-up without VERIFY neither clears the blocker nor marks the task implemented.
+		const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]) });
+		assert.equal(second.details.taskPacketId, first.details.taskPacketId);
+		assert.equal(second.details.verification, "unverified", "the delegation's own outcome is unchanged");
+		assert.equal(second.isError, true);
+		assert.match(second.content[0].text, new RegExp(`TASK STILL FAILED: ${command} could not start after an earlier delegation`));
+		assert.deepEqual(blocked(), ["failed", "failed", [command], [command]]);
+		await assert.rejects(accept(), /cannot be accepted/);
+
+		// Nor does one whose automatic checks see it fail only as it did at the task start.
+		write(repo, knownFailure);
+		const third = await host.call("delegate_implementation", { task: "again", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], [command]) });
+		assert.equal(third.details.verification, "unchanged_failures", third.content[0].text);
+		assert.deepEqual(blocked(), ["failed", "failed", [command], [command]]);
+		await assert.rejects(accept(), /cannot be accepted/);
+
+		// A passing run of the same command clears it.
+		write(repo, "process.exit(0);\n");
+		await host.call("run_verification", { command });
+		assert.deepEqual(blocked(), ["implemented", "passed", undefined, undefined]);
+	});
+});
+
+test("SHELL-LESS: a delegation blocked before worker start keeps a checks-only task's earlier blockers instead of dropping them", async () => {
+	const { script, command, files, write, overrides, onPath } = removableTool("process.exit(0);\n");
+	configure(overrides, { "claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old", "b.txt": "", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const packet = () => host.ctx.auditState.taskPacket;
+		// The worker removes the tool while doing its job: the task is failed only by a check that could not start.
+		const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks], ["failed", [command], [command]], first.content[0].text);
+
+		// A follow-up delegation declares the same command again; it still cannot start, so it is blocked before any worker runs.
+		const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"], [command]) });
+		assert.equal(second.isError, true);
+		assert.equal(second.details.workerStarted, false);
+		assert.match(second.content[0].text, /DELEGATION BLOCKED before any worker started/);
+		// The earlier blocker is preserved, not replaced by undefined: the task stays checks-only failed.
+		assert.deepEqual([packet().phase, packet().verification, packet().failedChecks, packet().launchFailedChecks], ["failed", "failed", [command], [command]]);
+		await assert.rejects(host.call("complete_task", { decision: "accept", summary: "Not actually done." }), /cannot be accepted/);
+
+		// Once the executable is back, a passing run_verification clears the task to implemented.
+		write(repo, "process.exit(0);\n");
+		const passing = await host.call("run_verification", { command });
+		assert.equal(passing.details.state, "pass");
+		assert.deepEqual([packet().phase, packet().verification, packet().failedChecks, packet().launchFailedChecks], ["implemented", "passed", undefined, undefined]);
+	});
+});
+
+test("SHELL-LESS: pre-worker launch failure retains earlier blockers of a non-check-failed task", async () => {
+	const { script, command, files, overrides, onPath } = removableTool("process.exit(0);\n");
+	const missing = "missing-verifier-xyz --check";
+	configure({ ...overrides, verificationCommands: [...overrides.verificationCommands, "missing-verifier-xyz"], independentReviewProfiles: ["medium"], reviewApi: baseConfig.reviewApi }, {
+		"claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }, { write: { "b.txt": "follow-up" } }, { write: { "b.txt": "final" } }],
+	});
+	const repo = makeRepo({ "a.txt": "old", "b.txt": "", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const packet = () => host.ctx.auditState.taskPacket;
+		const first = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.deepEqual([packet().failedChecks, packet().launchFailedChecks], [[command], [command]], first.content[0].text);
+		host.setApiReply("Material defect in follow-up.\nVERDICT: MAJOR");
+		const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]) });
+		assert.equal(second.details.reviewVerdict, "major", second.content[0].text);
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks], ["failed", undefined, [command]]);
+		const workerCount = calls().filter((call) => call.cli === "claude" && call.model === "claude-sonnet-5").length;
+		const blocked = await host.call("delegate_implementation", { task: "blocked", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"], [missing]) });
+		assert.equal(blocked.details.workerStarted, false);
+		assert.equal(calls().filter((call) => call.cli === "claude" && call.model === "claude-sonnet-5").length, workerCount);
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks], ["failed", undefined, [command]], blocked.content[0].text);
+		host.setApiReply("No material defect.\nVERDICT: PASS");
+		const later = await host.call("delegate_implementation", { task: "final", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]) });
+		assert.equal(later.isError, true, later.content[0].text);
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks], ["failed", [command], [command]]);
+		await assert.rejects(host.call("complete_task", { decision: "accept", summary: "Not yet verified." }), /cannot be accepted/);
+	});
+});
+
+test("SHELL-LESS: aborting a later delegation does not carry checks-only failedChecks into its failed packet", async () => {
+	const { script, command, files, write, overrides, onPath } = removableTool("process.exit(0);\n");
+	configure(overrides, { "claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }] });
+	const repo = makeRepo({ "a.txt": "old", "b.txt": "", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const packet = () => host.ctx.auditState.taskPacket;
+		await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.deepEqual([packet().failedChecks, packet().launchFailedChecks], [[command], [command]]);
+		const abort = new AbortController();
+		abort.abort();
+		await assert.rejects(host.call("delegate_implementation", { task: "aborted follow-up", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]), continuePrevious: true }, abort.signal), /aborted/i);
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks], ["failed", undefined, [command]]);
+		write(repo, "process.exit(0);\n");
+		const passing = await host.call("run_verification", { command });
+		assert.equal(passing.details.state, "pass");
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks], ["failed", undefined, undefined], "passing a former check cannot restore an aborted delegation");
+	});
+});
+
+test("SHELL-LESS: a MAJOR review keeps the task failed after the check that could not start passes", async () => {
+	const { script, command, files, write, overrides, onPath } = removableTool("process.exit(0);\n");
+	configure({ ...overrides, independentReviewProfiles: ["medium"], reviewApi: baseConfig.reviewApi }, { "claude-sonnet-5": [{ action: "remove", write: { "a.txt": "done" } }, { write: { "b.txt": "follow-up" } }] });
+	const repo = makeRepo({ "a.txt": "old", "b.txt": "", ...files });
+	await onPath(repo, async () => {
+		const host = makeHost(repo);
+		await host.on();
+		const packet = () => host.ctx.auditState.taskPacket;
+		await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt", script], implementationGuide: guide(["a.txt", script], [command]) });
+		assert.deepEqual(packet().launchFailedChecks, [command]);
+		// The follow-up's own delegation succeeds, so its review runs, and finds a material defect.
+		host.setApiReply("The follow-up breaks the file's contract.\nVERDICT: MAJOR");
+		const second = await host.call("delegate_implementation", { task: "follow-up", profile: "medium", allowedPaths: ["b.txt"], implementationGuide: guide(["b.txt"]) });
+		assert.equal(second.details.reviewVerdict, "major", second.content[0].text);
+		assert.deepEqual([packet().phase, packet().failedChecks, packet().launchFailedChecks, packet().reviewVerdict], ["failed", undefined, [command], "major"], "no longer restorable by checks alone");
+		write(repo, "process.exit(0);\n");
+		const passing = await host.call("run_verification", { command });
+		assert.equal(passing.details.state, "pass");
+		assert.deepEqual([packet().phase, packet().verification, packet().failedChecks, packet().launchFailedChecks, packet().reviewVerdict], ["failed", "failed", undefined, undefined, "major"], "the blocker is gone, the review failure is not");
+		await assert.rejects(host.call("complete_task", { decision: "accept", summary: "The check passes now." }), /cannot be accepted/);
+	});
+});
+
+test("SHELL-LESS: a verification command that cannot start blocks the delegation and is never a baseline", async () => {
+	configure({ verificationCommands: ["node --test", "missing-verifier-xyz"] }, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	const result = await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"], ["missing-verifier-xyz --check"]) });
+	assert.equal(result.isError, true);
+	assert.deepEqual(calls(), [], "no worker starts");
+	assert.match(result.content[0].text, /DELEGATION BLOCKED before any worker started[\s\S]*VERIFICATION NOT STARTED: missing-verifier-xyz --check: /);
+	assert.deepEqual(result.details.verificationLaunchFailures.length, 1);
+	const packet = host.ctx.auditState.taskPacket;
+	assert.equal(packet.baseline?.["missing-verifier-xyz --check"], undefined, "no baseline from a command that never ran");
+	assert.equal(packet.baselineSignatures?.["missing-verifier-xyz --check"], undefined);
+	assert.deepEqual([packet.phase, packet.verification], ["failed", "failed"]);
+	for (let run = 0; run < 2; run++) {
+		// Never cached: every attempt tries to start it again, and fails the same clear way.
+		await assert.rejects(host.call("run_verification", { command: "missing-verifier-xyz --check" }), /could not start missing-verifier-xyz --check: [\s\S]*Nothing was recorded/);
+	}
+	assert.deepEqual([host.ctx.auditState.taskPacket.phase, host.ctx.auditState.taskPacket.failedChecks], ["failed", undefined]);
+});
+
+test("SHELL-LESS: verificationCommands are validated when the configuration loads", () => {
+	for (const bad of ["npm test && curl evil", 'npm test "x', "", "npm test\nrm"]) {
+		configure({ verificationCommands: ["npm test", bad] }, {});
+		assert.throws(() => makeHost(makeRepo({ "a.txt": "old" })), /Invalid verificationCommands entry/, JSON.stringify(bad));
+	}
+});
+
+test("WORKER CHECKS: the worker is told the extension runs the checks, and is authorized for them anyway", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "value.txt": "ok" } }] });
+	const host = makeHost(makeRepo({ "value.txt": "bad", "check.test.mjs": PASSING_CHECK }));
+	await host.on();
+	await host.call("delegate_implementation", {
+		task: "change",
+		profile: "medium",
+		allowedPaths: ["value.txt"],
+		implementationGuide: guide(["value.txt"], ["node --test check.test.mjs"]),
+	});
+	const worker = calls().find((call) => call.cli === "claude" && call.mode === "dontAsk" && call.tools?.includes("Edit"));
+	assert.ok(worker, "the implementing worker ran");
+	const rules = worker!.allowedTools!.split(",");
+	assert.ok(rules.includes("Bash(node --test *)"), `the check is authorized: ${worker!.allowedTools}`);
+	assert.ok(rules.includes("Bash(npm audit --omit=dev)"), "the shipped audit check is authorized too");
+	assert.ok(rules.includes("Bash(git status *)"), "the configured rules are kept");
+	assert.match(worker!.prompt, /Do not run the project's checks yourself: the extension runs them on your finished work \(node --test check\.test\.mjs\)/, "a worker that runs the checks too pays for their output on every later turn");
+	assert.match(worker!.prompt, /Never claim a check passed that you could not run/);
+});
+
+test("WORKER CHECKS: a delegation without any allowlisted check authorizes no command and says so", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "a.txt": "done" } }] });
+	const host = makeHost(makeRepo({ "a.txt": "old" }));
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["a.txt"], implementationGuide: guide(["a.txt"]) });
+	const worker = calls().find((call) => call.cli === "claude" && call.tools?.includes("Edit"));
+	assert.match(worker!.prompt, /Any shell command other than reading Git state may be denied\./, "with no check to run, the worker is told not to expect one");
+	assert.match(worker!.prompt, /Never claim a check passed that you could not run/);
+});
+
+test("DIRECT CHANGE: a change the supervisor makes itself is accepted on its own checks, and only on them", async () => {
+	configure({}, {});
+	const repo = makeRepo({ "value.txt": "ok", "check.test.mjs": PASSING_CHECK });
+	const host = makeHost(repo);
+	await host.on();
+	// No plan_task and no delegation: nothing to accept until a check of this prompt passes.
+	await assert.rejects(host.call("complete_task", { decision: "accept", summary: "Wrote the file myself." }), /Nothing to accept: no task is open and no check of yours ran/);
+	await assert.rejects(host.call("complete_task", { decision: "pause", summary: "Nothing is open here." }), /No supervised task to pause/);
+	await host.call("run_verification", { command: "node --test check.test.mjs" });
+	const accepted = await host.call("complete_task", { decision: "accept", summary: "Wrote the file myself and ran the check." });
+	assert.equal(accepted.details.accepted, true);
+	assert.equal(accepted.details.direct, true);
+	assert.deepEqual(accepted.details.checks, ["node --test check.test.mjs"]);
+	assert.match(accepted.content[0].text, /accepted on its checks[\s\S]*nothing was recorded for worker learning/);
+	const learned = fs.existsSync(dataFile) ? JSON.parse(fs.readFileSync(dataFile, "utf8")) : { outcomes: [] };
+	assert.deepEqual(learned.outcomes ?? [], [], "a change with no worker records no worker outcome");
+});
+
+test("DIRECT CHANGE: a failing check of its own blocks acceptance", async () => {
+	configure({}, {});
+	const failing = `import test from "node:test";\nimport assert from "node:assert";\ntest("no", () => assert.equal(1, 2));\n`;
+	const host = makeHost(makeRepo({ "value.txt": "ok", "check.test.mjs": failing }));
+	await host.on();
+	await host.call("run_verification", { command: "node --test check.test.mjs" }).catch(() => undefined);
+	await assert.rejects(
+		host.call("complete_task", { decision: "accept", summary: "Accepting although the check is red." }),
+		/Cannot accept a change of your own while node --test check\.test\.mjs fails/,
+	);
 });
