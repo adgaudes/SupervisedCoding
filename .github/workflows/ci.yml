@@ -14,13 +14,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # engines.node is >= 22.16 for running the extension inside Pi, but the suite runs TypeScript files directly,
+        # which Node executes without a flag only from 22.18. Test the lowest version that can run it, and a current one.
+        node-version: ['22.18.0', '24.x']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22.16.0'
+          node-version: ${{ matrix.node-version }}
 
       - run: npm ci
       - run: npm test
