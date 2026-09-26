@@ -72,6 +72,8 @@ Same result, and a better one: all three of the project's checks actually ran, w
 - One small, fully specified change in a short session: two contexts cost more than one. The supervisor now makes such a change itself instead.
 - Tasks where quality needs the review machinery: independent review, MAJOR-finding verification and correction rounds **add** tokens by design. They buy defect detection, not savings, and stay gated by profile for that reason.
 
+**What a turn cap does not do.** Cutting `workerMaxTurns` was tried on a real refactor and measured: the worker stopped mid-extraction and the continuation, resuming a session whose prefix had only grown, cost 5.3M tokens against 1.58M for the comparable extraction done without the cut. A cap stops a runaway loop; it does not bound tokens. What bounds a worker's cost is how much of a file it must hold, which is why the guide's code map and narrow ranges matter more than any limit.
+
 **What saves tokens regardless of delegation** is context discipline, and it is the largest effect measured here: `code_outline` gave the supervisor a 4,176-line file as 20 KB of declarations with line ranges instead of 260 KB of source — about 66k tokens saved on that turn *and on every later turn of the session*. Ranged reads, no re-reads, `consult_readonly` for bulk, and pruning of accepted tasks' results work the same way.
 
 ## How it works
@@ -268,6 +270,7 @@ If you pick a model by hand, supervisor selection becomes `manual` (credit failo
 | `reviewConcurrency`, `reviewMaxShards`, `auditShardBytes`, `auditMaxShards` | parallel reviewers; parts of a `review_changes` diff (each up to `maxDiffBytes`); source per audit consultant and number of consultants |
 | `reviewWholeFilesBytes`, `reviewContextBytes` | whole changed files for the API reviewer up to this size (above it, up to 250 KB, the code around the changes and outlines of large files); code around the changes and uses of changed declarations given to every reviewer |
 | `workerCodeMapBytes` | map of large authorized files given to fresh workers (0 disables it) |
+| `sensitivePaths` | path segments and extensions that read as consequential work, per task kind (migrations, security by default). A delegation that declares low risk on such a path is questioned once, with the reason; the supervisor then states the assessment it stands behind, or repeats the call. It never raises the profile on its own. `{}` disables it |
 | `tinyDelegationBytes` | a delegation whose single authorized file is at most this size (8 KB by default), for a mechanical or documentation change at the `small` profile with no symbols named, is refused once as costing more than the change; `delegateAnyway: true` overrides it and 0 disables the check |
 | `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `contextWarningPercent` | supervisor behavior |
 | `supervisorTools` | what the supervisor keeps while the extension is on. `edit` and `write` are included so a small, fully specified change costs no worker; removing them makes every change go through a delegation again |
@@ -299,6 +302,7 @@ Running the suite needs **Node ≥ 22.18**, above the ≥ 22.16 the extension it
 | File | Contents |
 |---|---|
 | `index.ts` | Pi integration: tools, command, events, workers, verification, review, supervisor selection |
+| `config.ts` | configuration types and defaults, loading, merging and validation, profile and model helpers |
 | `process-runner.ts` | process invocation, output limits, timeout and abort handling, executable resolution |
 | `git-safety.ts` | Git commands, snapshots and fingerprints, changed-file comparison, path scope |
 | `verification.ts` | verification commands parsed without a shell, allowlist, launcher resolution |
@@ -389,6 +393,8 @@ Stesso risultato, e migliore: tutti e tre i controlli del progetto sono stati da
 
 - Una modifica piccola e completamente specificata in una sessione breve: due contesti costano più di uno. Ora il supervisore fa da sé una modifica così.
 - Task in cui la qualità richiede la macchina delle review: review indipendente, verifica delle MAJOR e round di correzione **aggiungono** token per costruzione. Comprano rilevamento di difetti, non risparmio, e per questo restano legati al profilo.
+
+**Cosa non fa un limite di turni.** Abbassare `workerMaxTurns` è stato provato su un refactor reale e misurato: il worker si è fermato a metà estrazione e la continuazione, riprendendo una sessione il cui prefisso era solo cresciuto, è costata 5,3 M token contro 1,58 M dell'estrazione comparabile fatta senza il taglio. Un limite ferma un ciclo impazzito; non limita i token. Ciò che limita il costo di un worker è quanto di un file deve tenersi, ed è per questo che la mappa del codice nella guida e le letture per intervalli contano più di qualsiasi limite.
 
 **Ciò che fa risparmiare a prescindere dalla delega** è la disciplina di contesto, ed è l'effetto più grande misurato qui: `code_outline` ha dato al supervisore un file di 4.176 righe come 20 KB di dichiarazioni con intervalli di riga invece di 260 KB di sorgente — circa 66k token risparmiati su quel turno *e su ogni turno successivo della sessione*. Letture per intervalli, nessuna rilettura, `consult_readonly` per il materiale voluminoso e il pruning dei risultati dei task accettati funzionano allo stesso modo.
 
@@ -586,6 +592,7 @@ Se scegli un modello a mano, la selezione del supervisore diventa `manual` (il f
 | `reviewConcurrency`, `reviewMaxShards`, `auditShardBytes`, `auditMaxShards` | revisori in parallelo; parti di un diff di `review_changes` (ciascuna fino a `maxDiffBytes`); sorgente per consulente di audit e numero di consulenti |
 | `reviewWholeFilesBytes`, `reviewContextBytes` | file modificati interi per il revisore API fino a questa dimensione (oltre, fino a 250 KB, il codice attorno alle modifiche e la struttura dei file grandi); codice attorno alle modifiche e usi delle dichiarazioni modificate dati a ogni revisore |
 | `workerCodeMapBytes` | mappa dei file autorizzati grandi data ai worker nuovi (0 la disattiva) |
+| `sensitivePaths` | segmenti di percorso ed estensioni che indicano lavoro delicato, per tipo di task (migrazioni e sicurezza per default). Una delega che dichiara rischio basso su un percorso così viene messa in dubbio una volta, con la ragione; il supervisore dichiara poi l'assessment che sostiene, o ripete la chiamata. Non alza mai il profilo da sé. `{}` lo disattiva |
 | `tinyDelegationBytes` | una delega il cui unico file autorizzato non supera questa dimensione (8 KB per default), per una modifica meccanica o di documentazione al profilo `small` e senza simboli nominati, viene rifiutata una volta perché costa più della modifica; `delegateAnyway: true` la scavalca e 0 disattiva il controllo |
 | `supervisorAutoSelect`, `supervisorFailover`, `probeOnActivate`, `claudeProbeModel`, `automaticSupervisorRecovery`, `recoveryMaxAgeMinutes`, `allowedSupervisorProviders`, `supervisorTools`, `contextWarningPercent` | comportamento del supervisore |
 
@@ -616,6 +623,7 @@ Per eseguire la suite serve **Node ≥ 22.18**, più del ≥ 22.16 richiesto dal
 | File | Contenuto |
 |---|---|
 | `index.ts` | integrazione con Pi: strumenti, comando, eventi, worker, verifica, review, scelta del supervisore |
+| `config.ts` | tipi e default della configurazione, caricamento, merge e validazione, helper di profili e modelli |
 | `process-runner.ts` | avvio dei processi, limiti di output, timeout e interruzione, risoluzione degli eseguibili |
 | `git-safety.ts` | comandi Git, snapshot e fingerprint, confronto dei file modificati, ambito dei percorsi |
 | `verification.ts` | comandi di verifica analizzati senza shell, allowlist, risoluzione dei launcher |

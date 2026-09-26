@@ -1504,3 +1504,52 @@ test("ASSESSMENT: several authorized paths are multi-file work, whatever the gui
 	});
 	assert.equal(result.details.profile, "medium", "the declared local scope cannot walk under the multi-file floor");
 });
+
+test("ASSESSMENT: a consequential path declared as low risk is questioned once, then the supervisor decides", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "src/auth/login.ts": "new" } }, { write: { "src/auth/login.ts": "new" } }] });
+	const host = makeHost(makeRepo({ "src/auth/login.ts": "old" }));
+	await host.on();
+	const optimistic = { kind: "feature" as const, risk: "low" as const, uncertainty: "low" as const, scope: "local" as const };
+	const args = { task: "change the login flow", profile: "medium", allowedPaths: ["src/auth/login.ts"], implementationGuide: guide(["src/auth/login.ts"]) };
+	const questioned = await host.call("delegate_implementation", { ...args, assessment: optimistic });
+	assert.equal(questioned.isError, true);
+	assert.equal(questioned.details.delegated, false);
+	assert.equal(questioned.details.suspectedKind, "security");
+	assert.deepEqual(calls(), [], "nothing is spent while the assessment is in doubt");
+	assert.match(questioned.content[0].text, /reads as security work[\s\S]*declares risk low/);
+	// Questioned once only: the same call again runs, so no supervisor can be trapped in a loop.
+	const second = await host.call("delegate_implementation", { ...args, assessment: optimistic });
+	assert.notEqual(second.isError, true, second.content[0].text);
+	assert.ok(calls().some((call) => call.cli === "claude"));
+});
+
+test("ASSESSMENT: a declared risk, or a path that only looks sensitive, delegates straight away", async () => {
+	for (const [name, files, params] of [
+		["the risk is declared", { "src/auth/login.ts": "old" }, { allowedPaths: ["src/auth/login.ts"], assessment: { kind: "feature", risk: "medium", uncertainty: "low", scope: "local" } }],
+		["the kind is declared", { "src/auth/login.ts": "old" }, { allowedPaths: ["src/auth/login.ts"], assessment: { kind: "security", risk: "low", uncertainty: "low", scope: "local" } }],
+		["author.ts is not authentication", { "src/author.ts": "old" }, { allowedPaths: ["src/author.ts"], assessment: { kind: "feature", risk: "low", uncertainty: "low", scope: "local" } }],
+	] as Array<[string, Record<string, string>, any]>) {
+		const target = params.allowedPaths[0];
+		configure({}, { "claude-sonnet-5": [{ write: { [target]: "new" } }] });
+		const host = makeHost(makeRepo(files));
+		await host.on();
+		const result = await host.call("delegate_implementation", { task: "change", profile: "medium", implementationGuide: guide([target]), ...params });
+		assert.doesNotMatch(result.content[0].text, /assessment looks optimistic/, name);
+		assert.ok(calls().some((call) => call.cli === "claude"), `${name}: a worker must start`);
+	}
+});
+
+test("REPO RULES: a nested instruction file is found whatever spelling of the path Pi was started from", async () => {
+	configure({}, { "claude-sonnet-5": [{ write: { "pkg/lib/x.txt": "new" } }] });
+	const repo = makeRepo({ "AGENTS.md": "Root rule.\n", "pkg/AGENTS.md": "Package rule: keep exports sorted.\n", "pkg/lib/x.txt": "old" });
+	// Pi is given a spelling of the same directory that Git will not echo back: on Windows the short 8.3 name, elsewhere
+	// a path through a symlink. Rule discovery must not depend on which of the two it received.
+	const host = makeHost(repo);
+	host.ctx.cwd = process.platform === "win32" ? repo : path.join(path.dirname(repo), "link-" + path.basename(repo));
+	if (process.platform !== "win32") fs.symlinkSync(repo, host.ctx.cwd, "dir");
+	await host.on();
+	await host.call("delegate_implementation", { task: "change", profile: "medium", allowedPaths: ["pkg/lib/x.txt"], implementationGuide: guide(["pkg/lib/x.txt"]) });
+	const prompt = calls()[0].prompt;
+	assert.match(prompt, /REPOSITORY RULES[\s\S]*Root rule[\s\S]*Package rule: keep exports sorted/);
+	assert.doesNotMatch(prompt, /\.\.[\\/]\.\./, "no rule is labelled through a detour out of the repository");
+});

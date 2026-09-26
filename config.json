@@ -312,15 +312,19 @@
   "reviewContextBytes": 24000,
   "workerCodeMapBytes": 10000,
   "tinyDelegationBytes": 8192,
+  "sensitivePaths": {
+    "migration": { "segments": ["migration", "migrations", "migrate"], "extensions": [".sql"] },
+    "security": { "segments": ["auth", "authn", "authz", "oauth", "crypto", "secrets", "credentials", "permissions", "acl", "security"], "extensions": [".pem"] }
+  },
   "supervisorProfiles": {},
   "probeTtlMinutes": 15,
   "probeMaxTokens": 128,
   "reviewMaxTokens": 8192,
   "workerMaxTurns": {
-    "small": 16,
-    "medium": 32,
-    "large": 64,
-    "critical": 96
+    "small": 40,
+    "medium": 80,
+    "large": 120,
+    "critical": 160
   },
   "delegationTimeoutMinutes": 120,
   "delegationBudgetUsd": 0,

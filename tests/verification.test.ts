@@ -152,9 +152,7 @@ test("the shipped defaults keep the supervisor able to edit and a worker's turns
 	for (const tool of ["edit", "write", "read", "delegate_implementation", "run_verification"]) {
 		assert.ok(config.supervisorTools.includes(tool), `the supervisor needs ${tool}: a small, fully specified change must not cost a whole worker`);
 	}
-	// A worker re-reads its context on every turn, so its cost is turns x context: the caps are what bounds it.
-	assert.deepEqual(config.workerMaxTurns, { small: 16, medium: 32, large: 64, critical: 96 });
-	for (const profile of Object.keys(config.workerMaxTurns)) {
-		assert.ok(config.workerMaxTurns[profile] <= 96, profile);
-	}
+	// A cap is a runaway guard, not a token lever: measured, cutting it made a large refactor stop mid-way and cost
+	// three times as much, because the resumed session pays an even longer prefix on every one of its turns.
+	assert.deepEqual(config.workerMaxTurns, { small: 40, medium: 80, large: 120, critical: 160 });
 });
