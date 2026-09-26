@@ -8,7 +8,10 @@ import * as path from "node:path";
 import { after, test } from "node:test";
 import { changesSince, checkpoint } from "../changes.ts";
 
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-changes-"));
+// The extension compares paths as text (Git root against cwd and the authorized paths), and Git always reports
+// the real path. A temp root that is a short name or a symlink (C:\Users\RUNNER~1 on the Windows CI runners,
+// /tmp on macOS) would therefore not match, so the harness resolves it once here, as Pi gives a real cwd.
+const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-changes-")));
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 function repo(files: Record<string, string>): string {
