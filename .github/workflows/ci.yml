@@ -25,7 +25,21 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      # The integration harness and the typecheck resolve Pi's own packages from a Pi installation (PI_INSTALL_ROOT),
+      # exactly as Pi does when it loads the extension. A runner has none, so build the same layout from the published
+      # packages, outside the workspace so it stays out of the packaging check.
+      - name: Provide Pi's packages to the test harness
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pi-install/releases/ci"
+          cd "$RUNNER_TEMP/pi-install/releases/ci"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund @earendil-works/pi-coding-agent @earendil-works/pi-ai typebox
+          echo ci > "$RUNNER_TEMP/pi-install/current-version"
+
       - run: npm ci
       - run: npm test
+        env:
+          PI_INSTALL_ROOT: ${{ runner.temp }}/pi-install
       - run: npm audit --omit=dev
       - run: npm pack --dry-run --json

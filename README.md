@@ -292,7 +292,7 @@ npm test        # unit, integration and regression tests, then typecheck
 
 The tests never call a real model: they run the real extension against fake Claude Code and Pi CLIs, a fake Pi host and real Git repositories. `tests/resolve-pi.mjs` resolves Pi's packages from your local Pi installation.
 
-Running the suite needs **Node ≥ 22.18**, above the ≥ 22.16 the extension itself requires: the tests run TypeScript files directly, which Node executes without a flag only from 22.18. CI runs them on 22.18 and on a current release, on Linux and Windows.
+Running the suite needs **Node ≥ 22.18**, above the ≥ 22.16 the extension itself requires: the tests run TypeScript files directly, which Node executes without a flag only from 22.18. CI runs them on 22.18 and on a current release, on Linux and Windows, resolving Pi's packages from the published ones (`PI_INSTALL_ROOT`) since a runner has no Pi installation.
 
 | File | Contents |
 |---|---|
@@ -607,7 +607,7 @@ npm test        # test unitari, d'integrazione e di regressione, poi typecheck
 
 I test non chiamano mai un modello reale: eseguono la vera estensione contro CLI simulate di Claude Code e Pi, un host Pi simulato e repository Git reali. `tests/resolve-pi.mjs` risolve i pacchetti di Pi dalla tua installazione locale.
 
-Per eseguire la suite serve **Node ≥ 22.18**, più del ≥ 22.16 richiesto dall'estensione stessa: i test eseguono direttamente file TypeScript, cosa che Node fa senza flag solo dalla 22.18. La CI li esegue su 22.18 e su una release attuale, su Linux e Windows.
+Per eseguire la suite serve **Node ≥ 22.18**, più del ≥ 22.16 richiesto dall'estensione stessa: i test eseguono direttamente file TypeScript, cosa che Node fa senza flag solo dalla 22.18. La CI li esegue su 22.18 e su una release attuale, su Linux e Windows, risolvendo i pacchetti di Pi da quelli pubblicati (`PI_INSTALL_ROOT`) dato che un runner non ha un'installazione di Pi.
 
 | File | Contenuto |
 |---|---|
