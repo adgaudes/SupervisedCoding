@@ -8,10 +8,7 @@ import * as path from "node:path";
 import { after, test } from "node:test";
 import { changesSince, checkpoint } from "../changes.ts";
 
-// The extension compares paths as text (Git root against cwd and the authorized paths), and Git always reports
-// the real path. A temp root that is a short name or a symlink (C:\Users\RUNNER~1 on the Windows CI runners,
-// /tmp on macOS) would therefore not match, so the harness resolves it once here, as Pi gives a real cwd.
-const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-changes-")));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-changes-"));
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 function repo(files: Record<string, string>): string {
@@ -24,7 +21,11 @@ function repo(files: Record<string, string>): string {
 	git("init", "-q");
 	git("add", "-A");
 	git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "core.autocrlf=false", "commit", "-q", "-m", "init", "--allow-empty");
-	return dir;
+	// Hand back the path Git reports, not the one just created: the extension compares the Git root with cwd and
+	// with the authorized paths as text, and Git answers with the real, long-form path. A temp root that is an 8.3
+	// short name (the Windows CI runners) or a symlink (/tmp on macOS) would otherwise make the two differ, and the
+	// walk from the root down to an authorized path would stop before reaching any nested AGENTS.md.
+	return path.resolve(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8" }).trim());
 }
 
 test("the diff shows only what changed after the checkpoint, including new and deleted files", async () => {

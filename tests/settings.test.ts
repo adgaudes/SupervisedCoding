@@ -10,10 +10,7 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-// The extension compares paths as text (Git root against cwd and the authorized paths), and Git always reports
-// the real path. A temp root that is a short name or a symlink (C:\Users\RUNNER~1 on the Windows CI runners,
-// /tmp on macOS) would therefore not match, so the harness resolves it once here, as Pi gives a real cwd.
-const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-settings-")));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-coding-settings-"));
 const agentDir = path.join(root, "agent");
 const userDir = path.join(agentDir, "supervised-coding");
 const planFile = path.join(root, "plan.json");
@@ -49,7 +46,11 @@ function makeRepo(): string {
 	git("init", "-q");
 	git("add", "-A");
 	git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init");
-	return repo;
+	// Hand back the path Git reports, not the one just created: the extension compares the Git root with cwd and
+	// with the authorized paths as text, and Git answers with the real, long-form path. A temp root that is an 8.3
+	// short name (the Windows CI runners) or a symlink (/tmp on macOS) would otherwise make the two differ, and the
+	// walk from the root down to an authorized path would stop before reaching any nested AGENTS.md.
+	return path.resolve(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: repo, encoding: "utf8" }).trim());
 }
 
 test("personal settings override the defaults one level deep, and data stays outside the package", async () => {
